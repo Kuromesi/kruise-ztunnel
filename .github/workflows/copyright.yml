@@ -41,7 +41,7 @@ jobs:
 
       - name: Fetch and verify upstream baseline
         run: |
-          git fetch --no-tags --depth=1 \
+          git fetch --no-tags \
             https://github.com/istio/ztunnel.git \
             refs/tags/1.29.5
           test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$UPSTREAM_BASE"
