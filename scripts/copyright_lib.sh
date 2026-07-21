@@ -15,7 +15,7 @@
 # limitations under the License.
 
 copyright_base_ref() {
-    printf '%s\n' "${1:-${COPYRIGHT_BASE:-1.29.3}}"
+    printf '%s\n' "${1:-${COPYRIGHT_BASE:-1.29.5}}"
 }
 
 copyright_validate_base() {

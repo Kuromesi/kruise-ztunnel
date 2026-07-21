@@ -36,7 +36,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify upstream baseline
-        run: git rev-parse --verify "1.29.3^{commit}"
+        run: git rev-parse --verify "1.29.5^{commit}"
 
       - name: Check copyright headers
-        run: make BUILD_WITH_CONTAINER=0 lint-copyright-kruise COPYRIGHT_BASE=1.29.3
+        run: make BUILD_WITH_CONTAINER=0 lint-copyright-kruise COPYRIGHT_BASE=1.29.5

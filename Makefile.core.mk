@@ -35,7 +35,7 @@ lint-copyright:
 	@${FINDFILES} \( -name '*.go' -o -name '*.rs' \) \( ! \( -name '*.gen.go' -o -name '*.pb.go' -o -name '*_pb2.py' \) \) -print0 |\
 		${XARGS} common/scripts/lint_copyright_banner.sh
 
-COPYRIGHT_BASE ?= 1.29.3
+COPYRIGHT_BASE ?= 1.29.5
 
 lint-copyright-kruise:
 	@./scripts/lint_copyright_kruise.sh "${COPYRIGHT_BASE}"

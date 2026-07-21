@@ -1,1 +1,7 @@
-* @Kuromesi
+# List of usernames who may use /lgtm
+reviewers:
+  - Kuromesi
+
+# List of usernames who may use /approve
+approvers:
+  - Kuromesi
