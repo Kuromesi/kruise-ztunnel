@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 
@@ -47,6 +47,11 @@ jobs:
             --profile minimal \
             --component clippy,rustfmt
           rustup default 1.90.0
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends protobuf-compiler
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -69,7 +74,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 
@@ -78,10 +83,10 @@ jobs:
           rustup toolchain install 1.90.0 --profile minimal
           rustup default 1.90.0
 
-      - name: Install iptables
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends iptables
+          sudo apt-get install --yes --no-install-recommends iptables protobuf-compiler
 
       - name: Run firewall integration tests
         run: |

@@ -8,6 +8,13 @@ features = ["tls-boring", "tls-ring", "tls-aws-lc", "tls-openssl" ]
 
 [advisories]
 version = 2
+ignore = [
+    { id = "RUSTSEC-2025-0012", reason = "backoff 0.4 has no maintained compatible release; migration is tracked separately" },
+    { id = "RUSTSEC-2024-0384", reason = "instant is pulled in by backoff 0.4 and has no compatible maintained release" },
+    { id = "RUSTSEC-2024-0436", reason = "paste is a transitive dependency with no security vulnerability" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is a transitive dependency with no security vulnerability" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile remains API-compatible and has no security vulnerability; migrate separately" },
+]
 
 
 [licenses]
@@ -24,6 +31,7 @@ allow = ["Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "0BSD",
+    "CC0-1.0",
     "FTL",
     "LPL-1.02",
     "MS-PL",

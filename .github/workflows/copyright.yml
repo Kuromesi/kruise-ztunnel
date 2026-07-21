@@ -24,19 +24,23 @@ on:
 permissions:
   contents: read
 
+env:
+  # Immutable commit for the upstream istio/ztunnel 1.29.5 tag.
+  UPSTREAM_BASE: 69a847b7b75d3b5d61bf66d81039cc911bbfac04
+
 jobs:
   copyright:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Verify upstream baseline
-        run: git rev-parse --verify "1.29.5^{commit}"
+        run: git merge-base --is-ancestor "$UPSTREAM_BASE" HEAD
 
       - name: Check copyright headers
-        run: make BUILD_WITH_CONTAINER=0 lint-copyright-kruise COPYRIGHT_BASE=1.29.5
+        run: make BUILD_WITH_CONTAINER=0 lint-copyright-kruise COPYRIGHT_BASE="$UPSTREAM_BASE"
