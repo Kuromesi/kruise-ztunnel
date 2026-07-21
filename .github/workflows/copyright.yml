@@ -39,8 +39,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify upstream baseline
-        run: git merge-base --is-ancestor "$UPSTREAM_BASE" HEAD
+      - name: Fetch and verify upstream baseline
+        run: |
+          git fetch --no-tags --depth=1 \
+            https://github.com/istio/ztunnel.git \
+            refs/tags/1.29.5
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$UPSTREAM_BASE"
+          git merge-base --is-ancestor "$UPSTREAM_BASE" HEAD
 
       - name: Check copyright headers
         run: make BUILD_WITH_CONTAINER=0 lint-copyright-kruise COPYRIGHT_BASE="$UPSTREAM_BASE"
