@@ -66,8 +66,13 @@ jobs:
         # The certificate multi-root test opens a local TLS connection and is
         # timing-sensitive on shared CI runners. Running the remaining tests
         # serially also isolates tests that temporarily change global tracing
-        # state.
-        run: cargo test --locked --lib -- --test-threads=1 --skip tls::certificate::test::multi_root
+        # state. Linux in-pod tests require root to exercise network namespaces.
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            cargo test --locked --lib -- --test-threads=1 --skip tls::certificate::test::multi_root
 
   firewall-integration:
     runs-on: ubuntu-latest
