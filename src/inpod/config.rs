@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -116,6 +117,14 @@ impl crate::proxy::SocketFactory for InPodSocketFactory {
         tokio::net::UdpSocket::from_std(std_sock)
     }
 
+    fn new_udp_v4(&self) -> std::io::Result<socket2::Socket> {
+        self.configure(|| self.inner.new_udp_v4())
+    }
+
+    fn new_udp_v6(&self) -> std::io::Result<socket2::Socket> {
+        self.configure(|| self.inner.new_udp_v6())
+    }
+
     fn ipv6_enabled_localhost(&self) -> std::io::Result<bool> {
         self.run_in_ns(|| self.inner.ipv6_enabled_localhost())
     }
@@ -187,6 +196,14 @@ impl crate::proxy::SocketFactory for InPodSocketPortReuseFactory {
 
         std_sock.set_nonblocking(true)?;
         tokio::net::UdpSocket::from_std(std_sock)
+    }
+
+    fn new_udp_v4(&self) -> std::io::Result<socket2::Socket> {
+        self.sf.new_udp_v4()
+    }
+
+    fn new_udp_v6(&self) -> std::io::Result<socket2::Socket> {
+        self.sf.new_udp_v6()
     }
 
     fn ipv6_enabled_localhost(&self) -> std::io::Result<bool> {

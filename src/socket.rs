@@ -127,7 +127,7 @@ pub fn set_mark<S: std::os::unix::io::AsFd>(socket: &S, mark: u32) -> io::Result
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_mark(_socket: &TcpSocket, _mark: u32) -> io::Result<()> {
+pub fn set_mark<S: std::os::unix::io::AsFd>(_socket: &S, _mark: u32) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Other,
         "SO_MARK not supported on this operating system",

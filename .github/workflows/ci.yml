@@ -67,6 +67,8 @@ jobs:
           env -u RUST_LOG cargo test --locked --lib --test direct --bins -- \
             --test-threads=1 \
             --skip inpod:: \
+            --skip proxy::outbound_udp::tests::recvmmsg_reads_multiple_datagrams_with_original_destination \
+            --skip proxy::outbound_udp::tests::response_socket_is_bound_in_the_workload_netns \
             --skip tls::certificate::test::multi_root
 
       - name: Run multi-root certificate test
@@ -107,6 +109,14 @@ jobs:
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             cargo test --locked --lib inpod:: -- --test-threads=1
+          # UDP original-destination reception uses IP_TRANSPARENT, and the response
+          # socket test creates workload network namespaces. Run both with privileges;
+          # the unprivileged job excludes these two tests above.
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            cargo test --locked --lib proxy::outbound_udp::tests:: -- --test-threads=1
           sudo env \
             "PATH=$PATH" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \

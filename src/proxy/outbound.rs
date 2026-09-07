@@ -163,6 +163,61 @@ pub(super) struct OutboundConnection {
 }
 
 impl OutboundConnection {
+    pub(super) async fn connect_udp(
+        &mut self,
+        source_addr: SocketAddr,
+        dest_addr: SocketAddr,
+        gateway: &mut Option<SocketAddr>,
+    ) -> Result<H2Stream, Error> {
+        let source = self.pi.local_workload_information.get_workload().await?;
+        let req = self
+            .build_request(source, source_addr.ip(), dest_addr)
+            .await?;
+        if req.protocol != OutboundProtocol::HBONE {
+            return Err(Error::UnsupportedFeature(
+                "CONNECT-UDP PoC requires an HBONE gateway route".to_string(),
+            ));
+        }
+        // Record the selected peer before opening the stream so failed or cancelled
+        // handshakes still identify the attempted gateway in the UDP session log.
+        *gateway = Some(req.actual_destination);
+        let path = connect_udp_masque_path(
+            req.intended_destination_service.as_ref(),
+            req.hbone_target_destination.as_ref(),
+            dest_addr,
+        )?;
+        let uri = format!("https://{}{}", req.actual_destination, path);
+        let mut request = http::Request::builder()
+            .uri(uri)
+            .method(hyper::Method::CONNECT)
+            .version(hyper::Version::HTTP_2)
+            .header("capsule-protocol", "?1")
+            .header(BAGGAGE_HEADER, baggage(&req))
+            .header(
+                FORWARDED,
+                build_forwarded(source_addr, &req.intended_destination_service),
+            )
+            .header(TRACEPARENT_HEADER, self.id.header())
+            .body(())
+            .expect("CONNECT-UDP request uses validated addresses");
+        request
+            .extensions_mut()
+            .insert(h2::ext::Protocol::from_static("connect-udp"));
+
+        let pool_key = WorkloadKey {
+            src_id: req.source.identity(),
+            dst_id: req.upstream_sans.clone(),
+            src: source_addr.ip(),
+            dst: req.actual_destination,
+        };
+        let (stream, _) = self
+            .pool
+            .send_request_pooled(&pool_key, request)
+            .instrument(trace_span!("outbound connect-udp"))
+            .await?;
+        Ok(stream)
+    }
+
     async fn proxy(&mut self, source_stream: TcpStream) {
         let source_addr =
             socket::to_canonical(source_stream.peer_addr().expect("must receive peer addr"));
@@ -882,6 +937,29 @@ impl OutboundConnection {
                 }))
             }
         }
+    }
+}
+
+fn connect_udp_masque_path(
+    intended_destination_service: Option<&ServiceDescription>,
+    hbone_target_destination: Option<&HboneAddress>,
+    captured_destination: SocketAddr,
+) -> Result<String, Error> {
+    if let Some(service) = intended_destination_service {
+        return Ok(format!(
+            "/.well-known/masque/udp/{}/{}/",
+            service.hostname,
+            captured_destination.port(),
+        ));
+    }
+
+    match hbone_target_destination {
+        Some(HboneAddress::SocketAddr(SocketAddr::V4(target))) if target.port() != 0 => Ok(
+            format!("/.well-known/masque/udp/{}/{}/", target.ip(), target.port(),),
+        ),
+        _ => Err(Error::UnsupportedFeature(
+            "CONNECT-UDP egress policy requires a numeric IPv4 target".to_string(),
+        )),
     }
 }
 
@@ -2132,6 +2210,51 @@ mod tests {
             ),
             r#"for="127.0.0.1:80";host=example.com"#,
         );
+    }
+
+    #[test]
+    fn connect_udp_masque_path_uses_egress_policy_ipv4_target_without_service() {
+        let target = HboneAddress::SocketAddr("10.0.0.8:9000".parse().unwrap());
+
+        let path =
+            connect_udp_masque_path(None, Some(&target), "10.0.0.8:9000".parse().unwrap()).unwrap();
+
+        assert_eq!(path, "/.well-known/masque/udp/10.0.0.8/9000/");
+    }
+
+    #[test]
+    fn connect_udp_masque_path_preserves_service_hostname() {
+        let service = ServiceDescription {
+            hostname: "udp-echo.example.svc.cluster.local".into(),
+            name: Default::default(),
+            namespace: Default::default(),
+        };
+        let target = HboneAddress::SocketAddr("10.0.0.9:9000".parse().unwrap());
+
+        let path = connect_udp_masque_path(
+            Some(&service),
+            Some(&target),
+            "10.0.0.9:9000".parse().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            path,
+            "/.well-known/masque/udp/udp-echo.example.svc.cluster.local/9000/"
+        );
+    }
+
+    #[test]
+    fn connect_udp_masque_path_rejects_unsupported_numeric_targets() {
+        let ipv6 = HboneAddress::SocketAddr("[2001:db8::1]:9000".parse().unwrap());
+        let zero_port = HboneAddress::SocketAddr("10.0.0.8:0".parse().unwrap());
+
+        for target in [None, Some(&ipv6), Some(&zero_port)] {
+            assert!(matches!(
+                connect_udp_masque_path(None, target, "10.0.0.8:9000".parse().unwrap(),),
+                Err(Error::UnsupportedFeature(_))
+            ));
+        }
     }
 
     #[tokio::test]

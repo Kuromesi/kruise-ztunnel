@@ -44,6 +44,7 @@ use crate::firewall::{FirewallController, detect_backend};
 use crate::proxy::connection_manager::{ConnectionManager, PolicyWatcher};
 use crate::proxy::inbound_passthrough::InboundPassthrough;
 use crate::proxy::outbound::Outbound;
+use crate::proxy::outbound_udp::OutboundUdp;
 use crate::proxy::socks5::Socks5;
 use crate::rbac::Connection;
 use crate::state::service::{Service, ServiceDescription};
@@ -60,6 +61,7 @@ mod inbound_passthrough;
 #[allow(non_camel_case_types)]
 pub mod metrics;
 mod outbound;
+mod outbound_udp;
 pub mod pool;
 mod socks5;
 pub mod util;
@@ -73,7 +75,22 @@ pub trait SocketFactory {
 
     fn udp_bind(&self, addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket>;
 
+    /// Creates an unbound UDP socket, the datagram counterpart to `new_tcp_v4`/`new_tcp_v6`.
+    ///
+    /// Callers that must set options before binding (IP_TRANSPARENT, SO_REUSEADDR) start here
+    /// instead of at `socket2::Socket::new`, for the same reason they start at `new_tcp_v4`: the
+    /// factory is the only thing that enters the workload's network namespace, and in in-pod mode
+    /// it does so only for the duration of this call. The returned fd already belongs to that
+    /// namespace, so the caller can bind it whenever it likes.
+    fn new_udp_v4(&self) -> std::io::Result<socket2::Socket>;
+
+    fn new_udp_v6(&self) -> std::io::Result<socket2::Socket>;
+
     fn ipv6_enabled_localhost(&self) -> std::io::Result<bool>;
+}
+
+fn new_udp(domain: socket2::Domain) -> io::Result<socket2::Socket> {
+    socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -104,6 +121,14 @@ impl SocketFactory for DefaultSocketFactory {
         let std_sock = std::net::UdpSocket::bind(addr)?;
         std_sock.set_nonblocking(true)?;
         tokio::net::UdpSocket::from_std(std_sock)
+    }
+
+    fn new_udp_v4(&self) -> io::Result<socket2::Socket> {
+        new_udp(socket2::Domain::IPV4)
+    }
+
+    fn new_udp_v6(&self) -> io::Result<socket2::Socket> {
+        new_udp(socket2::Domain::IPV6)
     }
 
     fn ipv6_enabled_localhost(&self) -> io::Result<bool> {
@@ -160,7 +185,24 @@ impl SocketFactory for MarkSocketFactory {
     }
 
     fn udp_bind(&self, addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
+        // UDP listeners are not outbound connections. Marking them here also marks unrelated
+        // consumers such as the DNS proxy; sockets we send from come from new_udp_v4/new_udp_v6,
+        // which do mark.
         self.inner.udp_bind(addr)
+    }
+
+    fn new_udp_v4(&self) -> io::Result<socket2::Socket> {
+        self.inner.new_udp_v4().and_then(|s| {
+            socket::set_mark(&s, self.mark)?;
+            Ok(s)
+        })
+    }
+
+    fn new_udp_v6(&self) -> io::Result<socket2::Socket> {
+        self.inner.new_udp_v6().and_then(|s| {
+            socket::set_mark(&s, self.mark)?;
+            Ok(s)
+        })
     }
 
     fn ipv6_enabled_localhost(&self) -> io::Result<bool> {
@@ -172,6 +214,7 @@ pub struct Proxy {
     inbound: Inbound,
     inbound_passthrough: InboundPassthrough,
     outbound: Outbound,
+    outbound_udp: Option<OutboundUdp>,
     socks5: Option<Socks5>,
     policy_watcher: PolicyWatcher,
     firewall_controller: Option<FirewallController>,
@@ -324,6 +367,11 @@ impl Proxy {
 
         let inbound_passthrough = InboundPassthrough::new(pi.clone(), drain.clone()).await?;
         let outbound = Outbound::new(pi.clone(), drain.clone()).await?;
+        let outbound_udp = if pi.cfg.udp_proxy {
+            Some(OutboundUdp::new(pi.clone(), drain.clone()).await?)
+        } else {
+            None
+        };
         let socks5 = if pi.cfg.socks5_addr.is_some() {
             let socks5 = Socks5::new(pi.clone(), drain.clone()).await?;
             Some(socks5)
@@ -371,6 +419,7 @@ impl Proxy {
             inbound,
             inbound_passthrough,
             outbound,
+            outbound_udp,
             socks5,
             policy_watcher,
             firewall_controller,
@@ -392,6 +441,10 @@ impl Proxy {
         if let Some(socks5) = self.socks5 {
             tasks.push(tokio::spawn(socks5.run().in_current_span()));
         };
+
+        if let Some(outbound_udp) = self.outbound_udp {
+            tasks.push(tokio::spawn(outbound_udp.run().in_current_span()));
+        }
 
         futures::future::join_all(tasks).await;
     }
@@ -951,6 +1004,21 @@ impl TryFrom<&http::Uri> for HboneAddress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_udp_v4_is_unbound_so_the_caller_can_set_pre_bind_options() {
+        let factory = DefaultSocketFactory::default();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let socket = factory.new_udp_v4().unwrap();
+        socket.set_reuse_address(true).unwrap();
+        socket.bind(&socket2::SockAddr::from(addr)).unwrap();
+
+        assert!(socket.reuse_address().unwrap());
+        let bound = socket.local_addr().unwrap().as_socket().unwrap();
+        assert!(bound.ip().is_loopback());
+        assert_ne!(bound.port(), 0);
+    }
 
     #[test]
     fn test_parse_forwarded_host() {

@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -48,6 +49,200 @@ pub struct Metrics {
 
     // on-demand DNS is not a part of DNS proxy, but part of ztunnel proxy itself
     pub on_demand_dns: Family<OnDemandDnsLabels, Counter>,
+
+    pub udp: UdpMetrics,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum UdpDirection {
+    outbound,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum UdpDropReason {
+    kernel_rx_queue,
+    truncated,
+    missing_original_destination,
+    session_queue,
+    session_limit,
+    draining,
+    self_redirect,
+    oversized_datagram,
+    session_establishment,
+    session_end,
+    hbone_write,
+    application_send,
+    response_send,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct UdpLabels {
+    direction: UdpDirection,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct UdpDropLabels {
+    direction: UdpDirection,
+    reason: UdpDropReason,
+}
+
+#[derive(Clone, Debug)]
+pub struct UdpMetrics {
+    datagrams_received: Family<UdpLabels, Counter>,
+    received_bytes: Family<UdpLabels, Counter>,
+    datagrams_sent: Family<UdpLabels, Counter>,
+    sent_bytes: Family<UdpLabels, Counter>,
+    datagrams_dropped: Family<UdpDropLabels, Counter>,
+    sessions: Family<UdpLabels, Counter>,
+    sessions_active: Family<UdpLabels, Gauge>,
+    capsule_batches: Family<UdpLabels, Counter>,
+    capsule_datagrams: Family<UdpLabels, Counter>,
+    capsule_bytes: Family<UdpLabels, Counter>,
+    socket_receive_buffer_bytes: Family<UdpLabels, Gauge>,
+}
+
+impl UdpMetrics {
+    fn new(registry: &mut Registry) -> Self {
+        let datagrams_received = Family::default();
+        registry.register(
+            "udp_datagrams_received",
+            "The total number of UDP datagrams received by ztunnel (unstable)",
+            datagrams_received.clone(),
+        );
+        let received_bytes = Family::default();
+        registry.register(
+            "udp_received_bytes",
+            "The total UDP payload bytes received by ztunnel (unstable)",
+            received_bytes.clone(),
+        );
+        let datagrams_sent = Family::default();
+        registry.register(
+            "udp_datagrams_sent",
+            "The total number of UDP datagrams sent by ztunnel (unstable)",
+            datagrams_sent.clone(),
+        );
+        let sent_bytes = Family::default();
+        registry.register(
+            "udp_sent_bytes",
+            "The total UDP payload bytes sent by ztunnel (unstable)",
+            sent_bytes.clone(),
+        );
+        let datagrams_dropped = Family::default();
+        registry.register(
+            "udp_datagrams_dropped",
+            "The total number of UDP datagrams dropped by stage and reason (unstable)",
+            datagrams_dropped.clone(),
+        );
+        let sessions = Family::default();
+        registry.register(
+            "udp_sessions",
+            "The total number of UDP sessions opened (unstable)",
+            sessions.clone(),
+        );
+        let sessions_active = Family::default();
+        registry.register(
+            "udp_sessions_active",
+            "The current number of active UDP sessions (unstable)",
+            sessions_active.clone(),
+        );
+        let capsule_batches = Family::default();
+        registry.register(
+            "udp_capsule_batches",
+            "The total number of UDP Capsule batches written to HBONE (unstable)",
+            capsule_batches.clone(),
+        );
+        let capsule_datagrams = Family::default();
+        registry.register(
+            "udp_capsule_datagrams",
+            "The total number of UDP datagrams written in Capsule batches (unstable)",
+            capsule_datagrams.clone(),
+        );
+        let capsule_bytes = Family::default();
+        registry.register(
+            "udp_capsule_bytes",
+            "The total number of encoded UDP Capsule bytes written to HBONE (unstable)",
+            capsule_bytes.clone(),
+        );
+        let socket_receive_buffer_bytes = Family::default();
+        registry.register(
+            "udp_socket_receive_buffer_bytes",
+            "The effective UDP listener SO_RCVBUF size in bytes (unstable)",
+            socket_receive_buffer_bytes.clone(),
+        );
+        Self {
+            datagrams_received,
+            received_bytes,
+            datagrams_sent,
+            sent_bytes,
+            datagrams_dropped,
+            sessions,
+            sessions_active,
+            capsule_batches,
+            capsule_datagrams,
+            capsule_bytes,
+            socket_receive_buffer_bytes,
+        }
+    }
+
+    fn labels(direction: UdpDirection) -> UdpLabels {
+        UdpLabels { direction }
+    }
+
+    pub fn record_received(&self, direction: UdpDirection, datagrams: u64, bytes: u64) {
+        let labels = Self::labels(direction);
+        self.datagrams_received
+            .get_or_create(&labels)
+            .inc_by(datagrams);
+        self.received_bytes.get_or_create(&labels).inc_by(bytes);
+    }
+
+    pub fn record_sent(&self, direction: UdpDirection, datagrams: u64, bytes: u64) {
+        let labels = Self::labels(direction);
+        self.datagrams_sent.get_or_create(&labels).inc_by(datagrams);
+        self.sent_bytes.get_or_create(&labels).inc_by(bytes);
+    }
+
+    pub fn record_drop(&self, direction: UdpDirection, reason: UdpDropReason, count: u64) {
+        self.datagrams_dropped
+            .get_or_create(&UdpDropLabels { direction, reason })
+            .inc_by(count);
+    }
+
+    pub fn record_capsule_batch(&self, direction: UdpDirection, datagrams: u64, bytes: u64) {
+        let labels = Self::labels(direction);
+        self.capsule_batches.get_or_create(&labels).inc();
+        self.capsule_datagrams
+            .get_or_create(&labels)
+            .inc_by(datagrams);
+        self.capsule_bytes.get_or_create(&labels).inc_by(bytes);
+    }
+
+    pub fn set_socket_receive_buffer(&self, direction: UdpDirection, bytes: usize) {
+        let value = i64::try_from(bytes).unwrap_or(i64::MAX);
+        self.socket_receive_buffer_bytes
+            .get_or_create(&Self::labels(direction))
+            .set(value);
+    }
+
+    pub fn session_opened(&self, direction: UdpDirection) -> UdpSessionGuard {
+        let labels = Self::labels(direction);
+        self.sessions.get_or_create(&labels).inc();
+        let active = self.sessions_active.get_or_create(&labels).clone();
+        active.inc();
+        UdpSessionGuard { active }
+    }
+}
+
+pub struct UdpSessionGuard {
+    active: Gauge,
+}
+
+impl Drop for UdpSessionGuard {
+    fn drop(&mut self) {
+        self.active.dec();
+    }
 }
 
 #[derive(Clone, Copy, Default, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
@@ -385,6 +580,8 @@ impl Metrics {
             open_sockets.clone(),
         );
 
+        let udp = UdpMetrics::new(registry);
+
         Self {
             connection_opens,
             connection_close,
@@ -393,6 +590,7 @@ impl Metrics {
             on_demand_dns,
             connection_failures,
             open_sockets,
+            udp,
         }
     }
 
@@ -757,4 +955,62 @@ fn to_value_owned<T: ToString>(t: T) -> impl Value {
 fn to_value<T: AsRef<str>>(t: &T) -> impl Value + '_ {
     let v: &str = t.as_ref();
     v
+}
+
+#[cfg(test)]
+mod udp_tests {
+    use prometheus_client::encoding::text::encode;
+    use prometheus_client::registry::Registry;
+
+    use super::{Metrics, UdpDirection, UdpDropReason};
+
+    #[test]
+    fn udp_metrics_expose_stage_counters_with_bounded_labels() {
+        let mut registry = Registry::default();
+        let metrics = Metrics::new(&mut registry);
+
+        metrics.udp.record_received(UdpDirection::outbound, 2, 128);
+        metrics.udp.record_sent(UdpDirection::outbound, 1, 64);
+        metrics
+            .udp
+            .record_drop(UdpDirection::outbound, UdpDropReason::session_queue, 3);
+        metrics
+            .udp
+            .record_capsule_batch(UdpDirection::outbound, 2, 140);
+        metrics
+            .udp
+            .set_socket_receive_buffer(UdpDirection::outbound, 4_194_304);
+
+        let mut output = String::new();
+        encode(&mut output, &registry).unwrap();
+
+        assert!(output.contains("udp_datagrams_received_total{direction=\"outbound\"} 2"));
+        assert!(output.contains("udp_received_bytes_total{direction=\"outbound\"} 128"));
+        assert!(output.contains("udp_datagrams_sent_total{direction=\"outbound\"} 1"));
+        assert!(output.contains("udp_sent_bytes_total{direction=\"outbound\"} 64"));
+        assert!(output.contains(
+            "udp_datagrams_dropped_total{direction=\"outbound\",reason=\"session_queue\"} 3"
+        ));
+        assert!(output.contains("udp_capsule_batches_total{direction=\"outbound\"} 1"));
+        assert!(output.contains("udp_capsule_datagrams_total{direction=\"outbound\"} 2"));
+        assert!(output.contains("udp_capsule_bytes_total{direction=\"outbound\"} 140"));
+        assert!(output.contains("udp_socket_receive_buffer_bytes{direction=\"outbound\"} 4194304"));
+    }
+
+    #[test]
+    fn udp_session_guard_tracks_active_and_total_sessions() {
+        let mut registry = Registry::default();
+        let metrics = Metrics::new(&mut registry);
+
+        let guard = metrics.udp.session_opened(UdpDirection::outbound);
+        let mut output = String::new();
+        encode(&mut output, &registry).unwrap();
+        assert!(output.contains("udp_sessions_total{direction=\"outbound\"} 1"));
+        assert!(output.contains("udp_sessions_active{direction=\"outbound\"} 1"));
+
+        drop(guard);
+        output.clear();
+        encode(&mut output, &registry).unwrap();
+        assert!(output.contains("udp_sessions_active{direction=\"outbound\"} 0"));
+    }
 }

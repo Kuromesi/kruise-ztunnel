@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -105,16 +106,11 @@ impl H2ConnectClient {
     ) -> Result<(crate::proxy::h2::H2Stream, Option<Baggage>), Error> {
         let cur = self.stream_count.fetch_add(1, Ordering::SeqCst);
         trace!(current_streams = cur, "sending request");
-        let (send, recv, baggage) = match self.internal_send(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                // Request failed, so drop the stream now
-                self.stream_count.fetch_sub(1, Ordering::SeqCst);
-                return Err(e);
-            }
-        };
-
+        // Install the guards before awaiting response headers: timeout/drain can cancel this
+        // future without returning an error. The same guards transfer to the successful stream.
         let (dropped1, dropped2) = crate::proxy::h2::DropCounter::new(self.stream_count.clone());
+        let (send, recv, baggage) = self.internal_send(req).await?;
+
         let read = crate::proxy::h2::H2StreamReadHalf {
             recv_stream: recv,
             _dropped: dropped1,
@@ -230,4 +226,80 @@ where
     }
     // Signal to the ping_pong it should also stop.
     dropped.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_and_failed_requests_release_stream_capacity() {
+        let (client_io, server_io) = tokio::io::duplex(65_536);
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let first = connection.accept().await.unwrap().unwrap();
+            accepted_tx.send(()).unwrap();
+            // Retain the first response handle without replying until the client cancels it.
+            let _first = first;
+            let mut number = 0;
+            while let Some(request) = connection.accept().await {
+                let (_, mut response) = request.unwrap();
+                number += 1;
+                let status = if number == 1 { 503 } else { 200 };
+                let _stream = response
+                    .send_response(
+                        http::Response::builder().status(status).body(()).unwrap(),
+                        true,
+                    )
+                    .unwrap();
+            }
+        });
+        let cfg = Arc::new(config::Config {
+            pool_max_streams_per_conn: 2,
+            ..config::parse_config().unwrap()
+        });
+        let (_drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+        let mut client = spawn_connection(
+            cfg,
+            client_io,
+            drain_rx,
+            WorkloadKey {
+                src_id: Identity::default(),
+                dst_id: vec![Identity::default()],
+                src: "127.0.0.1".parse().unwrap(),
+                dst: "127.0.0.1:15008".parse().unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+        let request = || {
+            http::Request::builder()
+                .method("CONNECT")
+                .uri("example.org:443")
+                .body(())
+                .unwrap()
+        };
+        {
+            let pending = client.send_request(request());
+            tokio::pin!(pending);
+            tokio::select! {
+                result = &mut pending => panic!("unexpected response: {}", result.is_ok()),
+                _ = accepted_rx => {},
+            }
+            // A timeout or forced shutdown drops the same future without returning Err.
+        }
+        assert_eq!(client.stream_count.load(Ordering::SeqCst), 0);
+        assert!(!client.will_be_at_max_streamcount());
+        assert!(matches!(
+            client.send_request(request()).await,
+            Err(Error::HttpStatus(_))
+        ));
+        assert_eq!(client.stream_count.load(Ordering::SeqCst), 0);
+        let stream = client.send_request(request()).await.unwrap();
+        assert_eq!(client.stream_count.load(Ordering::SeqCst), 1);
+        drop(stream);
+        assert_eq!(client.stream_count.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
 }
