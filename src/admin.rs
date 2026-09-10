@@ -98,24 +98,24 @@ impl Service {
         drain_rx: DrainWatcher,
         cert_manager: Arc<SecretManager>,
     ) -> anyhow::Result<Self> {
-        Server::<State>::bind(
-            "admin",
-            config.admin_addr,
-            drain_rx,
-            State {
-                config,
-                proxy_state,
-                shutdown_trigger,
-                cert_manager,
-                handlers: vec![],
-            },
-        )
-        .await
-        .map(|s| Service { s })
+        let state = State {
+            config,
+            proxy_state,
+            shutdown_trigger,
+            cert_manager,
+            handlers: vec![],
+        };
+        let s = if state.config.enable_admin_unix_socket {
+            let path = state.config.admin_unix_socket_path.clone();
+            Server::bind_unix("admin", &path, drain_rx, state).await?
+        } else {
+            Server::bind("admin", state.config.admin_addr, drain_rx, state).await?
+        };
+        Ok(Service { s })
     }
 
-    pub fn address(&self) -> SocketAddr {
-        self.s.address()
+    pub fn address(&self) -> Option<SocketAddr> {
+        self.s.tcp_address()
     }
 
     pub fn add_handler(&mut self, handler: Arc<dyn AdminHandler>) {
@@ -478,6 +478,74 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn unix_socket_admin_routes_and_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin.sock");
+        // Occupy the configured TCP port: Unix mode must never attempt to bind it.
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = crate::test_helpers::test_config();
+        config.admin_addr = crate::config::Address::SocketAddr(tcp.local_addr().unwrap());
+        config.enable_admin_unix_socket = true;
+        config.admin_unix_socket_path = path.clone();
+        let shutdown = crate::signal::Shutdown::new();
+        let (trigger, drain) = crate::drain::new();
+        let manager = identity::mock::new_secret_manager(Duration::from_secs(3600));
+        let service = super::Service::new(
+            Arc::new(config),
+            new_proxy_state(&[], &[], &[]),
+            shutdown.trigger(),
+            drain,
+            manager,
+        )
+        .await
+        .unwrap();
+        assert!(service.address().is_none());
+        service.spawn();
+        let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (mut client, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .unwrap();
+        let connection = tokio::spawn(connection);
+        for (method, uri, status) in [
+            ("GET", "/config_dump", 200),
+            ("GET", "/", 200),
+            ("GET", "/quitquitquit", 405),
+            ("POST", "/quitquitquit", 200),
+        ] {
+            let request = hyper::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("host", "localhost")
+                .body(http_body_util::Empty::<Bytes>::new())
+                .unwrap();
+            let response =
+                tokio::time::timeout(Duration::from_secs(5), client.send_request(request))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            if uri == "/config_dump" {
+                let dump: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert!(dump.get("config").is_some());
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), shutdown.wait())
+            .await
+            .unwrap();
+        drop(client);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            trigger.start_drain_and_wait(crate::drain::DrainMode::Graceful),
+        )
+        .await
+        .unwrap();
+        connection.await.unwrap().unwrap();
+        assert!(!path.exists());
+    }
 
     fn diff_json<'a>(a: &'a serde_json::Value, b: &'a serde_json::Value) -> String {
         let mut ret = String::new();

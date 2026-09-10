@@ -264,7 +264,10 @@ impl WorkloadManager {
 
                 let ta = TestApp {
                     // Not actually accessible
-                    admin_address: helpers::with_ip(app.admin_address, ip),
+                    admin_address: helpers::with_ip(
+                        app.admin_address.expect("test uses TCP admin"),
+                        ip,
+                    ),
                     metrics_address: helpers::with_ip(app.metrics_address, ip),
                     readiness_address: helpers::with_ip(app.readiness_address, ip),
                     proxy_addresses: proxy::Addresses {

@@ -59,7 +59,7 @@ pub struct TestApp {
 impl From<(&Bound, Arc<SecretManager>)> for TestApp {
     fn from((app, cert_manager): (&Bound, Arc<SecretManager>)) -> Self {
         Self {
-            admin_address: app.admin_address,
+            admin_address: app.admin_address.expect("test uses TCP admin"),
             metrics_address: app.metrics_address,
             proxy_addresses: app.proxy_addresses.unwrap(),
             readiness_address: app.readiness_address,

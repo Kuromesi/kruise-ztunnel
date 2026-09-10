@@ -188,7 +188,7 @@ async fn test_quit_lifecycle() {
     helpers::initialize_telemetry();
 
     let app = ztunnel::app::build(Arc::new(test_config())).await.unwrap();
-    let addr = app.admin_address;
+    let addr = app.admin_address.expect("test uses TCP admin");
 
     let (app, _shutdown) = tokio::join!(
         time::timeout(Duration::from_secs(5), app.wait_termination()),

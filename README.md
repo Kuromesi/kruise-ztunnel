@@ -8,6 +8,44 @@ ztunnel is the Layer 4 traffic enforcement data plane for [Agentio](https://gith
 - **Non-TCP firewall enforcement** — translates priority authorization policies into inbound and outbound iptables or nftables rules for UDP, ICMP, and other supported non-TCP traffic, with automatic backend detection and live rule updates.
 - **Per-workload sidecar deployment** — runs a dedicated ztunnel alongside each sandbox workload instead of as a node-level proxy, enforcing traffic policy at the workload boundary.
 
+## Sidecar admin socket
+
+By default, the admin API listens on localhost TCP port 15000. Containers in the
+same Pod can access this listener. To use a filesystem Unix socket instead, set
+these environment variables on the ztunnel container:
+
+```yaml
+env:
+  - name: ENABLE_ADMIN_UNIX_SOCKET
+    value: "true"
+  - name: ADMIN_UNIX_SOCKET_PATH
+    value: /var/run/ztunnel/admin.sock
+```
+
+`ENABLE_ADMIN_UNIX_SOCKET` defaults to `false`. `ADMIN_UNIX_SOCKET_PATH` defaults
+to `/var/run/ztunnel/admin.sock` and must be an absolute file path when enabled.
+In Unix socket mode, the TCP admin listener is disabled entirely; readiness and
+metrics keep their existing listeners.
+
+The parent directory must be writable by ztunnel and private to its container.
+For a read-only root filesystem, mount a writable volume there **only in the
+ztunnel container**, not in application containers. Newly created directories
+use mode `0700`; the socket uses mode `0600`. Existing directory permissions are
+not changed. Run admin clients as the ztunnel user (or an appropriately privileged
+operator) inside the sidecar:
+
+```shell
+curl --unix-socket /var/run/ztunnel/admin.sock http://localhost/config_dump
+curl --unix-socket /var/run/ztunnel/admin.sock -X POST http://localhost/quitquitquit
+```
+
+Update lifecycle hooks and diagnostic tools that call the TCP admin API to use
+the socket; TCP port-forwarding cannot reach it. Normal shutdown removes the
+socket, and startup reclaims stale socket files left by a crashed process.
+An active socket, regular file, or symlink at the configured path causes startup
+to fail instead of being replaced. Keep the parent directory under the sidecar's
+control so other processes cannot replace files there.
+
 ## Building
 
 Please use the same Rust version as the [`build-tools`](https://github.com/istio/tools/tree/master/docker/build-tools) image.
