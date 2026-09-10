@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod unix;
+
 use crate::config::Config;
 use crate::hyper_util::{Server, empty_response, plaintext_response};
 use crate::identity::SecretManager;
@@ -57,7 +59,12 @@ struct State {
 }
 
 pub struct Service {
-    s: Server<State>,
+    s: AdminServer,
+}
+
+enum AdminServer {
+    Tcp(Server<State>),
+    Unix(unix::UnixServer<State>),
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -107,23 +114,30 @@ impl Service {
         };
         let s = if state.config.enable_admin_unix_socket {
             let path = state.config.admin_unix_socket_path.clone();
-            Server::bind_unix("admin", &path, drain_rx, state).await?
+            AdminServer::Unix(unix::UnixServer::bind("admin", &path, drain_rx, state).await?)
         } else {
-            Server::bind("admin", state.config.admin_addr, drain_rx, state).await?
+            AdminServer::Tcp(Server::bind("admin", state.config.admin_addr, drain_rx, state).await?)
         };
         Ok(Service { s })
     }
 
     pub fn address(&self) -> Option<SocketAddr> {
-        self.s.tcp_address()
+        match &self.s {
+            AdminServer::Tcp(server) => Some(server.address()),
+            AdminServer::Unix(_) => None,
+        }
     }
 
     pub fn add_handler(&mut self, handler: Arc<dyn AdminHandler>) {
-        self.s.state_mut().handlers.push(handler);
+        let state = match &mut self.s {
+            AdminServer::Tcp(server) => server.state_mut(),
+            AdminServer::Unix(server) => server.state_mut(),
+        };
+        state.handlers.push(handler);
     }
 
     pub fn spawn(self) {
-        self.s.spawn(|state, req| async move {
+        let handler = |state: Arc<State>, req: Request<Incoming>| async move {
             match req.uri().path() {
                 #[cfg(target_os = "linux")]
                 "/debug/pprof/profile" => handle_pprof(req).await,
@@ -152,7 +166,11 @@ impl Service {
                 "/" => Ok(handle_dashboard(req).await),
                 _ => Ok(empty_response(hyper::StatusCode::NOT_FOUND)),
             }
-        })
+        };
+        match self.s {
+            AdminServer::Tcp(server) => server.spawn(handler),
+            AdminServer::Unix(server) => server.spawn(handler),
+        }
     }
 }
 

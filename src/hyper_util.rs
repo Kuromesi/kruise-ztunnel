@@ -1,5 +1,4 @@
 // Copyright Istio Authors
-// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +14,6 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{
@@ -24,8 +21,6 @@ use std::{
     pin::Pin,
     time::{Duration, Instant},
 };
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{UnixListener, UnixStream};
 
 use crate::drain::DrainWatcher;
 use crate::{config, proxy};
@@ -169,53 +164,12 @@ pub fn plaintext_response(code: hyper::StatusCode, body: String) -> Response<Ful
         .unwrap()
 }
 
-trait HttpIo: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> HttpIo for T {}
-
-enum Listener {
-    Tcp(TcpListener),
-    Unix(UnixListener, SocketCleanup),
-}
-
-impl Listener {
-    async fn accept(&self) -> std::io::Result<Box<dyn HttpIo>> {
-        match self {
-            Self::Tcp(listener) => {
-                let (socket, _) = listener.accept().await?;
-                socket.set_nodelay(true)?;
-                Ok(Box::new(socket))
-            }
-            Self::Unix(listener, _) => {
-                let (socket, _) = listener.accept().await?;
-                Ok(Box::new(socket))
-            }
-        }
-    }
-}
-
-struct SocketCleanup {
-    path: PathBuf,
-    dev: u64,
-    ino: u64,
-}
-
-impl Drop for SocketCleanup {
-    fn drop(&mut self) {
-        // Never unlink a replacement created by another process.
-        if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
-            if metadata.dev() == self.dev && metadata.ino() == self.ino {
-                let _ = std::fs::remove_file(&self.path);
-            }
-        }
-    }
-}
-
 /// Server implements a generic HTTP server with the follow behavior:
 /// * HTTP/1.1 plaintext only
 /// * Draining
 pub struct Server<S> {
     name: String,
-    binds: Vec<Listener>,
+    binds: Vec<TcpListener>,
     drain_rx: DrainWatcher,
     state: S,
 }
@@ -229,7 +183,7 @@ impl<S> Server<S> {
     ) -> anyhow::Result<Self> {
         let mut binds = vec![];
         for addr in addrs.into_iter() {
-            binds.push(Listener::Tcp(TcpListener::bind(&addr).await?))
+            binds.push(TcpListener::bind(&addr).await?)
         }
         Ok(Server {
             name: name.to_string(),
@@ -239,69 +193,12 @@ impl<S> Server<S> {
         })
     }
 
-    /// Bind only a filesystem socket. The parent directory must be private to the
-    /// sidecar; do not share it with application containers.
-    pub async fn bind_unix(
-        name: &str,
-        path: &Path,
-        drain_rx: DrainWatcher,
-        state: S,
-    ) -> anyhow::Result<Self> {
-        anyhow::ensure!(path.is_absolute(), "Unix socket path must be absolute");
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("socket has no parent"))?;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                anyhow::ensure!(
-                    metadata.file_type().is_socket(),
-                    "refusing to replace non-socket {}",
-                    path.display()
-                );
-                match tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(path))
-                    .await?
-                {
-                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                        std::fs::remove_file(path)?;
-                    }
-                    Err(e) => return Err(e.into()),
-                    Ok(_) => anyhow::bail!("Unix socket {} is already in use", path.display()),
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        let listener = UnixListener::bind(path)?;
-        let metadata = std::fs::symlink_metadata(path)?;
-        let cleanup = SocketCleanup {
-            path: path.to_path_buf(),
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        };
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(Self {
-            name: name.to_string(),
-            binds: vec![Listener::Unix(listener, cleanup)],
-            drain_rx,
-            state,
-        })
-    }
-
-    pub fn tcp_address(&self) -> Option<SocketAddr> {
-        match self.binds.first().expect("must have at least one listener") {
-            Listener::Tcp(listener) => {
-                Some(listener.local_addr().expect("local address must be ready"))
-            }
-            Listener::Unix(..) => None,
-        }
-    }
-
     pub fn address(&self) -> SocketAddr {
-        self.tcp_address().expect("server uses TCP")
+        self.binds
+            .first()
+            .expect("must have at least one address")
+            .local_addr()
+            .expect("local address must be ready")
     }
 
     pub fn state_mut(&mut self) -> &mut S {
@@ -314,10 +211,8 @@ impl<S> Server<S> {
         F: Fn(Arc<S>, Request<hyper::body::Incoming>) -> R + Send + Sync + 'static,
         R: Future<Output = Result<Response<Full<Bytes>>, anyhow::Error>> + Send + Sync + 'static,
     {
-        let address = match self.binds.first().expect("must have at least one listener") {
-            Listener::Tcp(listener) => listener.local_addr().unwrap().to_string(),
-            Listener::Unix(_, cleanup) => cleanup.path.display().to_string(),
-        };
+        use futures_util::StreamExt as OtherStreamExt;
+        let address = self.address();
         let drain = self.drain_rx;
         let state = Arc::new(self.state);
         let f = Arc::new(f);
@@ -327,27 +222,16 @@ impl<S> Server<S> {
             "listener established",
         );
         for bind in self.binds {
-            let address = address.clone();
             let drain_stream = drain.clone();
             let drain_connections = drain.clone();
             let state = state.clone();
             let name = self.name.clone();
             let f = f.clone();
             tokio::spawn(async move {
-                let drained = drain_stream.wait_for_drain();
-                tokio::pin!(drained);
-                loop {
-                    let socket = tokio::select! {
-                        biased;
-                        _ = &mut drained => break,
-                        accepted = bind.accept() => match accepted {
-                            Ok(socket) => socket,
-                            Err(err) => {
-                                warn!(component = name, %err, "listener accept failed");
-                                break;
-                            }
-                        },
-                    };
+                let stream = tokio_stream::wrappers::TcpListenerStream::new(bind);
+                let mut stream = stream.take_until(Box::pin(drain_stream.wait_for_drain()));
+                while let Some(Ok(socket)) = stream.next().await {
+                    socket.set_nodelay(true).unwrap();
                     let drain = drain_connections.clone();
                     let f = f.clone();
                     let state = state.clone();
@@ -386,7 +270,6 @@ impl<S> Server<S> {
                         }
                     });
                 }
-                drop(bind);
                 info!(
                     %address,
                     component=name,
@@ -394,81 +277,5 @@ impl<S> Server<S> {
                 );
             });
         }
-    }
-}
-
-#[cfg(test)]
-mod unix_socket_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn socket_permissions_cleanup_and_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("private/admin.sock");
-        let (_trigger, drain) = crate::drain::new();
-        let server = Server::bind_unix("test", &path, drain.clone(), ())
-            .await
-            .unwrap();
-        assert!(server.tcp_address().is_none());
-        assert_eq!(
-            std::fs::metadata(path.parent().unwrap())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(
-            Server::bind_unix("test", &path, drain.clone(), ())
-                .await
-                .is_err()
-        );
-        assert!(UnixStream::connect(&path).await.is_ok());
-        drop(server);
-        assert!(!path.exists());
-        // Simulate the file left after a process exits without cleanup.
-        drop(UnixListener::bind(&path).unwrap());
-        let restarted = Server::bind_unix("test", &path, drain, ()).await.unwrap();
-        assert!(UnixStream::connect(&path).await.is_ok());
-        drop(restarted);
-        assert!(!path.exists());
-    }
-
-    #[tokio::test]
-    async fn preserves_files_symlinks_and_replacements() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("admin.sock");
-        let (_trigger, drain) = crate::drain::new();
-        std::fs::write(&path, "keep").unwrap();
-        assert!(
-            Server::bind_unix("test", &path, drain.clone(), ())
-                .await
-                .is_err()
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep");
-        std::fs::remove_file(&path).unwrap();
-        std::os::unix::fs::symlink(dir.path().join("missing"), &path).unwrap();
-        assert!(
-            Server::bind_unix("test", &path, drain.clone(), ())
-                .await
-                .is_err()
-        );
-        assert!(
-            std::fs::symlink_metadata(&path)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        std::fs::remove_file(&path).unwrap();
-        let server = Server::bind_unix("test", &path, drain, ()).await.unwrap();
-        std::fs::remove_file(&path).unwrap();
-        let replacement = UnixListener::bind(&path).unwrap();
-        drop(server);
-        assert!(path.exists());
-        drop(replacement);
     }
 }
