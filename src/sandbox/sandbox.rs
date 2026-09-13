@@ -34,8 +34,8 @@ struct SandboxTokenFile {
     access_token: String,
 }
 
-/// Validate a runtime-issued token file and encode its original JSON bytes for
-/// the CONNECT header. Watcher updates and read-through use the same validation,
+/// Validate a runtime-issued token file and encode its original JSON bytes.
+/// Watcher updates and read-through use the same validation,
 /// so a partial write cannot publish an unusable credential into the cache.
 pub(crate) fn sandbox_token_transform(s: String) -> anyhow::Result<String> {
     anyhow::ensure!(
@@ -54,8 +54,8 @@ pub(crate) fn sandbox_token_transform(s: String) -> anyhow::Result<String> {
 }
 
 /// Read the runtime's single-token directory without waiting for future writes.
-/// The release-0.1 workload contract does not supply a per-connection token key;
-/// ambiguous directories cannot safely identify the current sandbox.
+/// The manager has no active sandbox key, so ambiguous directories cannot
+/// safely identify the current sandbox.
 fn read_sandbox_token(directory: &Path) -> io::Result<Option<(PathBuf, String)>> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -156,9 +156,9 @@ impl SandboxManager {
         self.store.as_ref().map_or(vec![], |s| s.values())
     }
 
-    /// Resolve the token once for a new CONNECT. Never retry, sleep, or cache
-    /// an absent token: pre-activation system traffic must continue to work.
-    pub async fn token_for_connect(&self) -> Option<Arc<String>> {
+    /// Return a cached token, or make one attempt to load it from disk.
+    /// Missing tokens are not cached, so the next lookup can observe a new file.
+    pub async fn get_or_load_token(&self) -> Option<Arc<String>> {
         if let Some(token) = self.store.as_ref().and_then(|store| store.first()) {
             return Some(token);
         }
@@ -168,7 +168,7 @@ impl SandboxManager {
                 .get_or_load(move || read_sandbox_token(&token_dir))
                 .await
         } else {
-            // If the watcher could not start, read on each connection without
+            // If the watcher could not start, read on each lookup without
             // caching: no watcher would invalidate a credential on rotation.
             tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Arc<String>>> {
                 read_sandbox_token(&token_dir)?
@@ -212,15 +212,15 @@ mod tests {
     async fn read_through_loads_token_after_a_miss_without_watcher() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = unwatched_manager(dir.path().to_path_buf());
-        assert!(mgr.token_for_connect().await.is_none());
+        assert!(mgr.get_or_load_token().await.is_none());
         let raw = r#"{"accessToken":"test-only-placeholder"}"#;
         std::fs::write(dir.path().join("sandbox.token"), raw).unwrap();
-        let token = mgr.token_for_connect().await.unwrap();
+        let token = mgr.get_or_load_token().await.unwrap();
         assert_eq!(*token, sandbox_token_transform(raw.to_string()).unwrap());
         assert!(mgr.get_sandbox_token("sandbox".to_string()).is_some());
         // Cache hit must not touch the filesystem.
         std::fs::remove_file(dir.path().join("sandbox.token")).unwrap();
-        assert_eq!(mgr.token_for_connect().await, Some(token));
+        assert_eq!(mgr.get_or_load_token().await, Some(token));
     }
 
     #[tokio::test]
@@ -228,18 +228,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("not-created-yet");
         let mgr = unwatched_manager(path.clone());
-        assert!(mgr.token_for_connect().await.is_none());
+        assert!(mgr.get_or_load_token().await.is_none());
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("sandbox.token"), r#"{"accessToken":""}"#).unwrap();
-        assert!(mgr.token_for_connect().await.is_none());
+        assert!(mgr.get_or_load_token().await.is_none());
         std::fs::write(path.join("sandbox.token"), "{").unwrap();
-        assert!(mgr.token_for_connect().await.is_none());
+        assert!(mgr.get_or_load_token().await.is_none());
         std::fs::write(
             path.join("sandbox.token"),
             r#"{"accessToken":"test-token"}"#,
         )
         .unwrap();
-        assert!(mgr.token_for_connect().await.is_some());
+        assert!(mgr.get_or_load_token().await.is_some());
     }
 
     #[test]
@@ -288,13 +288,13 @@ mod tests {
         let raw = r#"{"accessToken":"test-token"}"#;
         std::fs::write(&first, raw).unwrap();
         std::fs::write(&second, raw).unwrap();
-        assert!(mgr.token_for_connect().await.is_none());
+        assert!(mgr.get_or_load_token().await.is_none());
         std::fs::remove_file(&second).unwrap();
         std::fs::write(&first, "x".repeat(MAX_TOKEN_FILE_SIZE as usize + 1)).unwrap();
-        assert!(mgr.token_for_connect().await.is_none());
+        assert!(mgr.get_or_load_token().await.is_none());
         std::fs::remove_file(&first).unwrap();
         std::fs::create_dir(&first).unwrap();
-        assert!(mgr.token_for_connect().await.is_none());
+        assert!(mgr.get_or_load_token().await.is_none());
     }
 
     #[cfg(unix)]
@@ -305,7 +305,7 @@ mod tests {
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR).unwrap();
         let mgr = unwatched_manager(dir.path().to_path_buf());
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), mgr.token_for_connect())
+            tokio::time::timeout(std::time::Duration::from_secs(1), mgr.get_or_load_token())
                 .await
                 .unwrap()
                 .is_none()
@@ -322,12 +322,12 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("sandbox.token");
         std::fs::write(&path, r#"{"accessToken":"first-test-token"}"#).unwrap();
-        let first = mgr.token_for_connect().await.unwrap();
+        let first = mgr.get_or_load_token().await.unwrap();
         std::fs::write(&path, r#"{"accessToken":"second-test-token"}"#).unwrap();
-        let second = mgr.token_for_connect().await.unwrap();
+        let second = mgr.get_or_load_token().await.unwrap();
         assert_ne!(first, second);
         std::fs::remove_file(&path).unwrap();
-        assert!(mgr.token_for_connect().await.is_none());
+        assert!(mgr.get_or_load_token().await.is_none());
     }
 
     #[test]

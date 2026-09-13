@@ -418,7 +418,7 @@ impl OutboundConnection {
         }
 
         if let Some(sandbox_manager) = &self.pi.sandbox_manager {
-            if let Some(token) = sandbox_manager.token_for_connect().await {
+            if let Some(token) = sandbox_manager.get_or_load_token().await {
                 builder = builder.header(sandbox::SANDBOX_TOKEN_HEADER, token.as_str());
             }
             // if let Some(sandbox_id) = sandbox_manager.get_sandbox_id() {
