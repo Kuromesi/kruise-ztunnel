@@ -109,11 +109,11 @@ where
             let _guard = self.write_lock.lock().await;
             let current_map = self.store.load();
 
-            if let Some(tracker) = current_map.get(&key) {
-                if tracker.hash == hash {
-                    debug!("File unchanged: {:?}", canonical);
-                    return Ok(());
-                }
+            if let Some(tracker) = current_map.get(&key)
+                && tracker.hash == hash
+            {
+                debug!("File unchanged: {:?}", canonical);
+                return Ok(());
             }
 
             let mut new_map = (**current_map).clone();
@@ -132,6 +132,57 @@ where
         Ok(())
     }
 
+    /// Return a cached value, or make one blocking read attempt on an empty store.
+    /// Never overwrite a store update that happened while the read was in flight.
+    /// An absent file is not cached, so the next caller can observe its creation.
+    pub async fn get_or_load<F>(&self, load: F) -> anyhow::Result<Option<Arc<V>>>
+    where
+        F: FnOnce() -> std::io::Result<Option<(PathBuf, String)>> + Send + 'static,
+    {
+        let snapshot = self.store.load_full();
+        if let Some(tracker) = snapshot.values().next() {
+            return Ok(Some(tracker.transformed.clone()));
+        }
+
+        let loaded = tokio::task::spawn_blocking(load)
+            .await
+            .context("file read task failed")??;
+        let Some((path, content)) = loaded else {
+            return Ok(self.first());
+        };
+        let Some(key) = (self.key_func)(&path) else {
+            return Ok(self.first());
+        };
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let hash = hasher.finish();
+        let transformed = Arc::new((self.transform)(content)?);
+
+        let _guard = self.write_lock.lock().await;
+        let current = self.store.load();
+        if !Arc::ptr_eq(&snapshot, &current) {
+            return Ok(current.values().next().map(|v| v.transformed.clone()));
+        }
+        self.store.store(Arc::new(HashMap::from([(
+            key,
+            FileTracker {
+                path,
+                hash,
+                transformed: transformed.clone(),
+            },
+        )])));
+        Ok(Some(transformed))
+    }
+
+    /// Return the first value in the store's unspecified iteration order.
+    pub fn first(&self) -> Option<Arc<V>> {
+        self.store
+            .load()
+            .values()
+            .next()
+            .map(|v| v.transformed.clone())
+    }
+
     /// Removes a file entry from the store.
     pub async fn handle_remove(&self, path: &PathBuf) {
         let Some(key) = (self.key_func)(path) else {
@@ -140,13 +191,12 @@ where
 
         let _guard = self.write_lock.lock().await;
         let current_map = self.store.load();
-        if !current_map.contains_key(&key) {
-            return;
-        }
-
         let mut new_map = (**current_map).clone();
-        if new_map.remove(&key).is_some() {
-            self.store.store(Arc::new(new_map));
+        let removed = new_map.remove(&key).is_some();
+        // Publish even when the key was not cached: a concurrent read-through
+        // may have read this file before its deletion and must not restore it.
+        self.store.store(Arc::new(new_map));
+        if removed {
             info!("Removed {:?} from store (key={:?})", path, key);
         }
     }
@@ -415,5 +465,106 @@ where
 
         debug!("file watcher started successfully");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod read_through_tests {
+    use super::*;
+
+    fn store() -> Arc<FileStore<String, String>> {
+        Arc::new(FileStore::new(Ok, |path| {
+            path.file_stem().map(|s| s.to_string_lossy().into_owned())
+        }))
+    }
+
+    #[tokio::test]
+    async fn cache_hit_skips_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "cached").unwrap();
+        let store = store();
+        store.handle_change(&path).await.unwrap();
+        assert_eq!(
+            store
+                .get_or_load(|| panic!("cache hit must not read files"))
+                .await
+                .unwrap(),
+            Some(Arc::new("cached".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_read_does_not_overwrite_watcher_update() {
+        concurrent_update(false).await;
+    }
+
+    #[tokio::test]
+    async fn stale_read_does_not_restore_a_removed_token() {
+        concurrent_update(true).await;
+    }
+
+    #[tokio::test]
+    async fn stale_read_does_not_cache_a_file_removed_before_its_first_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "stale").unwrap();
+        let store = store();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = {
+            let store = store.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                store
+                    .get_or_load(move || {
+                        let content = std::fs::read_to_string(&path)?;
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(Some((path, content)))
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        started_rx.await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        store.handle_remove(&path).await;
+        release_tx.send(()).unwrap();
+        assert!(reader.await.unwrap().is_none());
+        assert!(store.first().is_none());
+    }
+
+    async fn concurrent_update(remove: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let store = store();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = {
+            let store = store.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                store
+                    .get_or_load(move || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(Some((path, "stale".to_string())))
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        started_rx.await.unwrap();
+        std::fs::write(&path, "newer").unwrap();
+        store.handle_change(&path).await.unwrap();
+        if remove {
+            std::fs::remove_file(&path).unwrap();
+            store.handle_remove(&path).await;
+        }
+        release_tx.send(()).unwrap();
+        let expected = (!remove).then(|| Arc::new("newer".to_string()));
+        assert_eq!(reader.await.unwrap(), expected);
+        assert_eq!(store.first(), expected);
     }
 }

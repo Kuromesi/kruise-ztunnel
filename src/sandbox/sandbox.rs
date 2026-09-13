@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::PathBuf;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine;
@@ -23,12 +24,87 @@ pub static SANDBOX_TOKEN_HEADER: &str = "x-agentio-sandbox-token";
 pub static SANDBOX_ID_HEADER: &str = "x-agentio-sandbox-id";
 pub static SANDBOX_LABELS_HEADER: &str = "x-agentio-sandbox-labels";
 
-/// Transform a raw token file content into the value stored in [`FileStore`].
-/// Wraps the bytes in standard base64 so downstream consumers can ship them
-/// in HTTP headers (`x-agentio-sandbox-token`) without worrying about binary or
-/// CRLF content.
+// Runtime-issued token files are normally a few KiB. Bound a cache-miss read
+// even if a file is accidentally replaced by a large file or grows mid-read.
+const MAX_TOKEN_FILE_SIZE: u64 = 64 * 1024;
+
+#[derive(serde::Deserialize)]
+struct SandboxTokenFile {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+}
+
+/// Validate a runtime-issued token file and encode its original JSON bytes for
+/// the CONNECT header. Watcher updates and read-through use the same validation,
+/// so a partial write cannot publish an unusable credential into the cache.
 pub(crate) fn sandbox_token_transform(s: String) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        s.len() as u64 <= MAX_TOKEN_FILE_SIZE,
+        "sandbox token file exceeds size limit"
+    );
+    let token: SandboxTokenFile = serde_json::from_str(&s).map_err(|_| {
+        // Do not include serde's unexpected value in logs: it can be a credential.
+        anyhow::anyhow!("sandbox token file must contain a string accessToken")
+    })?;
+    anyhow::ensure!(
+        !token.access_token.is_empty(),
+        "sandbox accessToken is empty"
+    );
     Ok(base64::engine::general_purpose::STANDARD.encode(s))
+}
+
+/// Read the runtime's single-token directory without waiting for future writes.
+/// The release-0.1 workload contract does not supply a per-connection token key;
+/// ambiguous directories cannot safely identify the current sandbox.
+fn read_sandbox_token(directory: &Path) -> io::Result<Option<(PathBuf, String)>> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let mut candidate = None;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "token") {
+            continue;
+        }
+        if candidate.replace(path).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "multiple sandbox token files",
+            ));
+        }
+    }
+    let Some(path) = candidate else {
+        return Ok(None);
+    };
+    let path = path.canonicalize()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A misplaced FIFO must not occupy a blocking-pool thread indefinitely.
+        // O_NONBLOCK does not change regular-file reads.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(&path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sandbox token is not a regular file",
+        ));
+    }
+    let mut content = String::new();
+    file.take(MAX_TOKEN_FILE_SIZE + 1)
+        .read_to_string(&mut content)?;
+    if content.len() as u64 > MAX_TOKEN_FILE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sandbox token file exceeds size limit",
+        ));
+    }
+    Ok(Some((path, content)))
 }
 
 /// Derive the [`FileStore`] key from a token file path.
@@ -40,17 +116,16 @@ pub(crate) fn sandbox_token_key(path: &PathBuf) -> Option<String> {
 }
 
 /// Manages sandbox tokens by watching all files in the token directory.
+#[derive(Default)]
 pub struct SandboxManager {
     store: Option<Arc<FileStore<String, String>>>,
+    token_dir: Option<PathBuf>,
     _watcher_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SandboxManager {
     pub fn new() -> Self {
-        SandboxManager {
-            store: None,
-            _watcher_handle: None,
-        }
+        Self::default()
     }
 
     pub async fn run(&mut self, token_dir: PathBuf, debounce_ms: u64) {
@@ -61,6 +136,7 @@ impl SandboxManager {
         );
 
         let store = Arc::new(FileStore::new(sandbox_token_transform, sandbox_token_key));
+        self.token_dir = Some(token_dir.clone());
 
         let watcher = AsyncFileWatcher::new(store.clone(), token_dir).with_debounce_ms(debounce_ms);
 
@@ -71,9 +147,6 @@ impl SandboxManager {
                 self.store = Some(store);
             }
             Err(e) => {
-                // Failing here leaves `store` as None; all token lookups will
-                // return empty/None, which surfaces as 401/empty header upstream
-                // rather than a crash.
                 tracing::error!("failed to start sandbox token watcher: {}", e);
             }
         }
@@ -83,11 +156,40 @@ impl SandboxManager {
         self.store.as_ref().map_or(vec![], |s| s.values())
     }
 
-    pub fn get_sandbox_token(&self, sandbox_id: String) -> Option<Arc<String>> {
-        match self.store {
-            None => None,
-            Some(ref store) => store.get(&sandbox_id).map(|v| v),
+    /// Resolve the token once for a new CONNECT. Never retry, sleep, or cache
+    /// an absent token: pre-activation system traffic must continue to work.
+    pub async fn token_for_connect(&self) -> Option<Arc<String>> {
+        if let Some(token) = self.store.as_ref().and_then(|store| store.first()) {
+            return Some(token);
         }
+        let token_dir = self.token_dir.clone()?;
+        let result = if let Some(store) = &self.store {
+            store
+                .get_or_load(move || read_sandbox_token(&token_dir))
+                .await
+        } else {
+            // If the watcher could not start, read on each connection without
+            // caching: no watcher would invalidate a credential on rotation.
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Arc<String>>> {
+                read_sandbox_token(&token_dir)?
+                    .map(|(_, content)| sandbox_token_transform(content).map(Arc::new))
+                    .transpose()
+            })
+            .await
+            .unwrap_or_else(|err| Err(err.into()))
+        };
+        match result {
+            Ok(token) => token,
+            Err(err) => {
+                tracing::debug!(directory = ?self.token_dir, error = %err, "sandbox token read-through unavailable");
+                // A watcher update can become visible while the read fails.
+                self.store.as_ref().and_then(|store| store.first())
+            }
+        }
+    }
+
+    pub fn get_sandbox_token(&self, sandbox_id: String) -> Option<Arc<String>> {
+        self.store.as_ref().and_then(|store| store.get(&sandbox_id))
     }
 }
 
@@ -95,30 +197,137 @@ impl SandboxManager {
 mod tests {
     use super::*;
 
-    #[test]
-    fn token_transform_base64_encodes_bytes() {
-        // "hello" -> "aGVsbG8=" (standard alphabet, with padding)
-        let got = sandbox_token_transform("hello".to_string()).expect("transform");
-        assert_eq!(got, "aGVsbG8=");
+    fn unwatched_manager(path: PathBuf) -> SandboxManager {
+        SandboxManager {
+            store: Some(Arc::new(FileStore::new(
+                sandbox_token_transform,
+                sandbox_token_key,
+            ))),
+            token_dir: Some(path),
+            _watcher_handle: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_through_loads_token_after_a_miss_without_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = unwatched_manager(dir.path().to_path_buf());
+        assert!(mgr.token_for_connect().await.is_none());
+        let raw = r#"{"accessToken":"test-only-placeholder"}"#;
+        std::fs::write(dir.path().join("sandbox.token"), raw).unwrap();
+        let token = mgr.token_for_connect().await.unwrap();
+        assert_eq!(*token, sandbox_token_transform(raw.to_string()).unwrap());
+        assert!(mgr.get_sandbox_token("sandbox".to_string()).is_some());
+        // Cache hit must not touch the filesystem.
+        std::fs::remove_file(dir.path().join("sandbox.token")).unwrap();
+        assert_eq!(mgr.token_for_connect().await, Some(token));
+    }
+
+    #[tokio::test]
+    async fn read_through_tolerates_missing_directory_and_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-created-yet");
+        let mgr = unwatched_manager(path.clone());
+        assert!(mgr.token_for_connect().await.is_none());
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sandbox.token"), r#"{"accessToken":""}"#).unwrap();
+        assert!(mgr.token_for_connect().await.is_none());
+        std::fs::write(path.join("sandbox.token"), "{").unwrap();
+        assert!(mgr.token_for_connect().await.is_none());
+        std::fs::write(
+            path.join("sandbox.token"),
+            r#"{"accessToken":"test-token"}"#,
+        )
+        .unwrap();
+        assert!(mgr.token_for_connect().await.is_some());
     }
 
     #[test]
-    fn token_transform_handles_empty_input() {
-        // Empty input must produce empty output (not error); K8s briefly writes
-        // empty files during atomic remount.
-        let got = sandbox_token_transform(String::new()).expect("transform");
-        assert_eq!(got, "");
+    fn token_transform_base64_encodes_original_json() {
+        let raw = r#"{"accessToken":"test-token","requestId":"test-request"}"#;
+        let got = sandbox_token_transform(raw.to_string()).expect("transform");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(got)
+                .unwrap(),
+            raw.as_bytes()
+        );
     }
 
     #[test]
-    fn token_transform_preserves_binary_content_via_base64() {
-        // Round-trip through base64 to make sure non-ASCII bytes survive.
-        let raw = "tok\nwith\rweird\x00bytes";
+    fn token_transform_rejects_incomplete_credentials_without_disclosing_content() {
+        for raw in [
+            "",
+            "{",
+            "{}",
+            r#"{"accessToken":""}"#,
+            r#"{"accessToken":123}"#,
+            "\"sensitive-placeholder\"",
+        ] {
+            let err = sandbox_token_transform(raw.to_string()).unwrap_err();
+            assert!(!err.to_string().contains("sensitive-placeholder"));
+        }
+    }
+
+    #[test]
+    fn token_transform_preserves_json_escaping_via_base64() {
+        let raw = r#"{"accessToken":"tok\nwith\rweird\u0000bytes"}"#;
         let encoded = sandbox_token_transform(raw.to_string()).expect("transform");
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&encoded)
             .expect("decode");
         assert_eq!(decoded.as_slice(), raw.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn read_through_rejects_ambiguous_oversized_and_nonregular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = unwatched_manager(dir.path().to_path_buf());
+        let first = dir.path().join("first.token");
+        let second = dir.path().join("second.token");
+        let raw = r#"{"accessToken":"test-token"}"#;
+        std::fs::write(&first, raw).unwrap();
+        std::fs::write(&second, raw).unwrap();
+        assert!(mgr.token_for_connect().await.is_none());
+        std::fs::remove_file(&second).unwrap();
+        std::fs::write(&first, "x".repeat(MAX_TOKEN_FILE_SIZE as usize + 1)).unwrap();
+        assert!(mgr.token_for_connect().await.is_none());
+        std::fs::remove_file(&first).unwrap();
+        std::fs::create_dir(&first).unwrap();
+        assert!(mgr.token_for_connect().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_through_does_not_wait_for_a_fifo_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo.token");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        let mgr = unwatched_manager(dir.path().to_path_buf());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), mgr.token_for_connect())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_watcher_does_not_cache_credentials_without_invalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("not-created-yet");
+        let mut mgr = SandboxManager::new();
+        mgr.run(directory.clone(), 100).await;
+        assert!(mgr.store.is_none());
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("sandbox.token");
+        std::fs::write(&path, r#"{"accessToken":"first-test-token"}"#).unwrap();
+        let first = mgr.token_for_connect().await.unwrap();
+        std::fs::write(&path, r#"{"accessToken":"second-test-token"}"#).unwrap();
+        let second = mgr.token_for_connect().await.unwrap();
+        assert_ne!(first, second);
+        std::fs::remove_file(&path).unwrap();
+        assert!(mgr.token_for_connect().await.is_none());
     }
 
     #[test]
