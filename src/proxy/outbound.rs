@@ -328,7 +328,9 @@ impl OutboundConnection {
             )
             .await?;
             let origin_network = &self.pi.cfg.network;
-            let http_request = self.create_hbone_request(remote_addr, req, Some(origin_network));
+            let http_request = self
+                .create_hbone_request(remote_addr, req, Some(origin_network))
+                .await;
             let (inner_upgraded, baggage) = sender.send_request(http_request).await?;
 
             // Proxy
@@ -388,7 +390,7 @@ impl OutboundConnection {
         connection_stats.record(res);
     }
 
-    fn create_hbone_request(
+    async fn create_hbone_request(
         &self,
         remote_addr: SocketAddr,
         req: &Request,
@@ -416,7 +418,7 @@ impl OutboundConnection {
         }
 
         if let Some(sandbox_manager) = &self.pi.sandbox_manager {
-            if let Some(token) = sandbox_manager.list_sandbox_tokens().first() {
+            if let Some(token) = sandbox_manager.get_or_load_token().await {
                 builder = builder.header(sandbox::SANDBOX_TOKEN_HEADER, token.as_str());
             }
             // if let Some(sandbox_id) = sandbox_manager.get_sandbox_id() {
@@ -442,7 +444,7 @@ impl OutboundConnection {
         // for double HBONE). We don't need the x-istio-origin-network header here because:
         // - For single HBONE: both source and destination are in the same network
         // - For double HBONE outer: the gateway doesn't need origin network info
-        let request = self.create_hbone_request(remote_addr, req, None);
+        let request = self.create_hbone_request(remote_addr, req, None).await;
         let pool_key = Box::new(WorkloadKey {
             src_id: req.source.identity(),
             // Clone here shouldn't be needed ideally, we could just take ownership of Request.
@@ -2197,7 +2199,7 @@ mod tests {
         let remote_addr = "127.0.0.1:12345".parse().unwrap();
 
         // Test the single HBONE case - header should NOT be added when origin_network is None
-        let http_request_no_header = outbound.create_hbone_request(remote_addr, &req, None);
+        let http_request_no_header = outbound.create_hbone_request(remote_addr, &req, None).await;
         assert!(
             http_request_no_header
                 .headers()
@@ -2208,8 +2210,9 @@ mod tests {
 
         // Test the double HBONE inner request case - header should be added when network is specified
         let network = crate::strng::Strng::from("test-network");
-        let http_request_with_header =
-            outbound.create_hbone_request(remote_addr, &req, Some(&network));
+        let http_request_with_header = outbound
+            .create_hbone_request(remote_addr, &req, Some(&network))
+            .await;
         assert_eq!(
             http_request_with_header
                 .headers()

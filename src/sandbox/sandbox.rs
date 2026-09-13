@@ -42,6 +42,7 @@ pub(crate) fn sandbox_token_key(path: &PathBuf) -> Option<String> {
 /// Manages sandbox tokens by watching all files in the token directory.
 pub struct SandboxManager {
     store: Option<Arc<FileStore<String, String>>>,
+    token_dir: Option<PathBuf>,
     _watcher_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -49,6 +50,7 @@ impl SandboxManager {
     pub fn new() -> Self {
         SandboxManager {
             store: None,
+            token_dir: None,
             _watcher_handle: None,
         }
     }
@@ -62,13 +64,15 @@ impl SandboxManager {
 
         let store = Arc::new(FileStore::new(sandbox_token_transform, sandbox_token_key));
 
-        let watcher = AsyncFileWatcher::new(store.clone(), token_dir).with_debounce_ms(debounce_ms);
+        let watcher =
+            AsyncFileWatcher::new(store.clone(), token_dir.clone()).with_debounce_ms(debounce_ms);
 
         match watcher.start().await {
             Ok(handle) => {
                 tracing::info!("sandbox token watcher started");
                 self._watcher_handle = Some(handle);
                 self.store = Some(store);
+                self.token_dir = Some(token_dir);
             }
             Err(e) => {
                 // Failing here leaves `store` as None; all token lookups will
@@ -83,6 +87,39 @@ impl SandboxManager {
         self.store.as_ref().map_or(vec![], |s| s.values())
     }
 
+    /// Return a cached token, or read a file if the watcher has not loaded one yet.
+    /// An absent token is not cached, so the next lookup can observe its creation.
+    pub async fn get_or_load_token(&self) -> Option<Arc<String>> {
+        let store = self.store.as_ref()?;
+        if let Some(token) = store.first() {
+            return Some(token);
+        }
+        let token_dir = self.token_dir.clone()?;
+        let result = store
+            .get_or_load(move || {
+                // Use the same file discovery rules as the watcher's initial scan.
+                let file = walkdir::WalkDir::new(token_dir)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .find(|entry| entry.file_type().is_file());
+                let Some(file) = file else {
+                    return Ok(None);
+                };
+                let path = file.path().canonicalize()?;
+                let content = std::fs::read_to_string(&path)?;
+                Ok(Some((path, content)))
+            })
+            .await;
+        match result {
+            Ok(token) => token,
+            Err(err) => {
+                tracing::debug!(error = %err, "sandbox token read-through unavailable");
+                // The watcher may have populated the cache while the read failed.
+                store.first()
+            }
+        }
+    }
+
     pub fn get_sandbox_token(&self, sandbox_id: String) -> Option<Arc<String>> {
         match self.store {
             None => None,
@@ -94,6 +131,63 @@ impl SandboxManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unwatched_manager(token_dir: PathBuf) -> SandboxManager {
+        SandboxManager {
+            store: Some(Arc::new(FileStore::new(
+                sandbox_token_transform,
+                sandbox_token_key,
+            ))),
+            token_dir: Some(token_dir),
+            _watcher_handle: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_through_loads_a_new_file_and_reuses_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("tokens");
+        let mgr = unwatched_manager(directory.clone());
+        assert!(mgr.get_or_load_token().await.is_none());
+
+        // Preserve the watcher's recursive discovery and opaque-content contract.
+        std::fs::create_dir_all(directory.join("nested")).unwrap();
+        let path = directory.join("nested/sandbox");
+        let raw = "opaque-token".repeat(7000);
+        std::fs::write(&path, &raw).unwrap();
+        let token = mgr.get_or_load_token().await.unwrap();
+        assert_eq!(*token, sandbox_token_transform(raw).unwrap());
+        assert_eq!(
+            mgr.get_sandbox_token("sandbox".to_string()),
+            Some(token.clone())
+        );
+
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(mgr.get_or_load_token().await, Some(token));
+    }
+
+    #[tokio::test]
+    async fn read_through_preserves_empty_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = unwatched_manager(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("sandbox.token"), "").unwrap();
+        assert_eq!(mgr.get_or_load_token().await, Some(Arc::new(String::new())));
+    }
+
+    #[tokio::test]
+    async fn read_through_does_not_require_a_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = unwatched_manager(dir.path().to_path_buf());
+        std::fs::write(dir.path().join("first.token"), "first").unwrap();
+        std::fs::write(dir.path().join("second.token"), "second").unwrap();
+        let token = mgr.get_or_load_token().await.unwrap();
+        assert!(
+            ["first", "second"]
+                .into_iter()
+                .map(|raw| sandbox_token_transform(raw.to_string()).unwrap())
+                .any(|encoded| encoded == *token)
+        );
+    }
 
     #[test]
     fn token_transform_base64_encodes_bytes() {
