@@ -35,7 +35,7 @@ use crate::strng::Strng;
 use crate::proxy::metrics::Reporter;
 use crate::proxy::{
     BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER, TraceParent,
-    X_FORWARDED_NETWORK_HEADER, util,
+    WORKLOAD_NAME_HEADER, WORKLOAD_NAMESPACE_HEADER, X_FORWARDED_NETWORK_HEADER, util,
 };
 use crate::proxy::{ConnectionOpen, ConnectionResultBuilder, DerivedWorkload, metrics};
 
@@ -410,7 +410,11 @@ impl OutboundConnection {
                 FORWARDED,
                 build_forwarded(remote_addr, &req.intended_destination_service),
             )
-            .header(TRACEPARENT_HEADER, self.id.header());
+            .header(TRACEPARENT_HEADER, self.id.header())
+            // Identify the source pod, rather than its owning deployment.
+            // This context also applies when sandbox mode is disabled.
+            .header(WORKLOAD_NAME_HEADER, req.source.name.as_str())
+            .header(WORKLOAD_NAMESPACE_HEADER, req.source.namespace.as_str());
 
         // Add x-istio-origin-network header for inner CONNECT requests in double HBONE
         if let Some(network) = origin_network {
@@ -2132,6 +2136,7 @@ mod tests {
             uid: "cluster1//v1/Pod/ns/source-workload".to_string(),
             name: "source-workload".to_string(),
             namespace: "ns".to_string(),
+            workload_name: "source-deployment".to_string(),
             addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 1])],
             node: "local-node".to_string(),
             ..Default::default()
@@ -2221,6 +2226,12 @@ mod tests {
             "test-network",
             "x-istio-origin-network header should contain the network name for double HBONE inner request"
         );
+        // Both CONNECT forms carry pod identity without a sandbox manager.
+        // The pod name must win over the owning deployment's workload_name.
+        for request in [&http_request_no_header, &http_request_with_header] {
+            assert_eq!(request.headers()[WORKLOAD_NAME_HEADER], "source-workload");
+            assert_eq!(request.headers()[WORKLOAD_NAMESPACE_HEADER], "ns");
+        }
     }
 
     #[derive(PartialEq, Debug)]
