@@ -614,6 +614,8 @@ pub struct TraceParent {
 pub const BAGGAGE_HEADER: &str = "baggage";
 pub const TRACEPARENT_HEADER: &str = "traceparent";
 pub const X_FORWARDED_NETWORK_HEADER: &str = "x-forwarded-network";
+pub const WORKLOAD_NAME_HEADER: &str = "x-agentio-workload-name";
+pub const WORKLOAD_NAMESPACE_HEADER: &str = "x-agentio-workload-namespace";
 
 impl TraceParent {
     pub fn header(&self) -> hyper::header::HeaderValue {
