@@ -55,6 +55,11 @@ copyright_is_supported() {
 # Files that moved or were adapted from an upstream source need an explicit
 # provenance mapping when Git cannot infer their origin from the base tree.
 copyright_provenance_path() {
+    # The admin-only Unix transport adapts the upstream HTTP serving loop.
+    if [[ "$1" == "src/admin/unix.rs" ]]; then
+        printf '%s\n' 'src/hyper_util.rs'
+        return
+    fi
     local detected_path=$2
     printf '%s\n' "${detected_path}"
 }

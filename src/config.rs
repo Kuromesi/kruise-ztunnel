@@ -36,6 +36,10 @@ use crate::{identity, state};
 #[cfg(any(test, feature = "testing"))]
 use {crate::test_helpers::MpscAckReceiver, crate::xds::LocalConfig, tokio::sync::Mutex};
 
+const ENABLE_ADMIN_UNIX_SOCKET: &str = "ENABLE_ADMIN_UNIX_SOCKET";
+const ADMIN_UNIX_SOCKET_PATH: &str = "ADMIN_UNIX_SOCKET_PATH";
+const DEFAULT_ADMIN_UNIX_SOCKET_PATH: &str = "/var/run/ztunnel/admin.sock";
+
 const ENABLE_PROXY: &str = "ENABLE_PROXY";
 const KUBERNETES_SERVICE_HOST: &str = "KUBERNETES_SERVICE_HOST";
 const NETWORK: &str = "NETWORK";
@@ -245,6 +249,9 @@ pub struct Config {
 
     pub socks5_addr: Option<SocketAddr>,
     pub admin_addr: Address,
+    /// Use a filesystem Unix socket instead of the TCP admin listener.
+    pub enable_admin_unix_socket: bool,
+    pub admin_unix_socket_path: PathBuf,
     pub stats_addr: Address,
     pub readiness_addr: Address,
     pub inbound_addr: SocketAddr,
@@ -847,6 +854,11 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             },
         },
 
+        enable_admin_unix_socket: parse_default(ENABLE_ADMIN_UNIX_SOCKET, false)?,
+        admin_unix_socket_path: PathBuf::from(
+            env::var(ADMIN_UNIX_SOCKET_PATH)
+                .unwrap_or_else(|_| DEFAULT_ADMIN_UNIX_SOCKET_PATH.to_string()),
+        ),
         // admin API should only be accessible over localhost
         admin_addr: Address::Localhost(
             ipv6_localhost_enabled,
@@ -993,6 +1005,15 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
 }
 
 fn validate_config(cfg: Config) -> Result<Config, Error> {
+    if cfg.enable_admin_unix_socket
+        && (!cfg.admin_unix_socket_path.is_absolute()
+            || cfg.admin_unix_socket_path.file_name().is_none())
+    {
+        return Err(Error::InvalidState(format!(
+            "{ADMIN_UNIX_SOCKET_PATH} must be an absolute file path"
+        )));
+    }
+
     if cfg.sandbox_watcher_debounce_ms == 0 {
         return Err(Error::InvalidState(format!(
             "{SANDBOX_WATCHER_DEBOUNCE_MS} must be greater than zero"
@@ -1201,6 +1222,73 @@ pub mod tests {
     use super::*;
 
     static SANDBOX_WATCHER_DEBOUNCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn admin_unix_socket_environment() {
+        // Each case runs in a subprocess so environment changes cannot race
+        // other tests that construct Config.
+        const CASE: &str = "ZTUNNEL_TEST_ADMIN_SOCKET_CASE";
+        if let Ok(case) = env::var(CASE) {
+            let result = construct_config(ProxyConfig::default());
+            match case.as_str() {
+                "default" | "disabled" => {
+                    assert!(!result.unwrap().enable_admin_unix_socket);
+                }
+                "enabled" => {
+                    let config = result.unwrap();
+                    assert!(config.enable_admin_unix_socket);
+                    assert_eq!(
+                        config.admin_unix_socket_path,
+                        PathBuf::from(DEFAULT_ADMIN_UNIX_SOCKET_PATH)
+                    );
+                }
+                "custom" => {
+                    let config = result.unwrap();
+                    assert!(config.enable_admin_unix_socket);
+                    assert_eq!(
+                        config.admin_unix_socket_path,
+                        PathBuf::from("/tmp/custom-admin.sock")
+                    );
+                }
+                _ => assert!(result.is_err()),
+            }
+            return;
+        }
+        for (case, enabled, path) in [
+            ("default", None, None),
+            ("disabled", Some("false"), Some("ignored-relative-path")),
+            ("enabled", Some("true"), None),
+            ("custom", Some("true"), Some("/tmp/custom-admin.sock")),
+            ("relative", Some("true"), Some("relative.sock")),
+            ("empty", Some("true"), Some("")),
+            ("root", Some("true"), Some("/")),
+            ("invalid-flag", Some("invalid"), None),
+        ] {
+            let mut command = std::process::Command::new(env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "config::tests::admin_unix_socket_environment",
+                    "--nocapture",
+                ])
+                .env(CASE, case)
+                .env_remove(ENABLE_ADMIN_UNIX_SOCKET)
+                .env_remove(ADMIN_UNIX_SOCKET_PATH);
+            if let Some(enabled) = enabled {
+                command.env(ENABLE_ADMIN_UNIX_SOCKET, enabled);
+            }
+            if let Some(path) = path {
+                command.env(ADMIN_UNIX_SOCKET_PATH, path);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "case {case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn parses_firewall_backend_mode() {

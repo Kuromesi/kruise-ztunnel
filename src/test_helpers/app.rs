@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -59,7 +60,7 @@ pub struct TestApp {
 impl From<(&Bound, Arc<SecretManager>)> for TestApp {
     fn from((app, cert_manager): (&Bound, Arc<SecretManager>)) -> Self {
         Self {
-            admin_address: app.admin_address,
+            admin_address: app.admin_address.expect("test uses TCP admin"),
             metrics_address: app.metrics_address,
             proxy_addresses: app.proxy_addresses.unwrap(),
             readiness_address: app.readiness_address,

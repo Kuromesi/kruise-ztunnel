@@ -407,7 +407,8 @@ fn init_inpod_proxy_mgr(
 }
 
 pub struct Bound {
-    pub admin_address: SocketAddr,
+    /// None when the admin API uses a Unix socket.
+    pub admin_address: Option<SocketAddr>,
     pub metrics_address: SocketAddr,
     pub readiness_address: SocketAddr,
 

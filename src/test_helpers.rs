@@ -117,6 +117,8 @@ pub fn test_config_with_port_xds_addr_and_root_cert(
         inbound_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         socks5_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
         admin_addr: config::Address::Localhost(true, 0),
+        enable_admin_unix_socket: false,
+        admin_unix_socket_path: "/var/run/ztunnel/admin.sock".into(),
         readiness_addr: config::Address::Localhost(true, 0),
         stats_addr: config::Address::Localhost(true, 0),
         outbound_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
