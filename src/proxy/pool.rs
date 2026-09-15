@@ -654,6 +654,34 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sandbox_connections_are_isolated_and_reused_within_each_sandbox() {
+        let (pool, mut srv) = setup_test(8).await;
+        let unassigned = key(&srv, 1);
+        let a = WorkloadKey {
+            sandbox_id: Some("sandbox-a".into()),
+            ..unassigned.clone()
+        };
+        let b = WorkloadKey {
+            sandbox_id: Some("sandbox-b".into()),
+            ..unassigned.clone()
+        };
+        // Same IP, SPIFFE identities and destination. None, A and B still need
+        // separate physical TLS/H2 connections, including concurrent creation.
+        spawn_clients_concurrently(pool.clone(), unassigned.clone(), srv.addr, 2).await;
+        tokio::join!(
+            spawn_clients_concurrently(pool.clone(), a.clone(), srv.addr, 2),
+            spawn_clients_concurrently(pool.clone(), b.clone(), srv.addr, 2),
+        );
+        assert_opens_drops!(srv, 3, 0);
+        for key in [unassigned, a, b] {
+            spawn_clients_concurrently(pool.clone(), key, srv.addr, 2).await;
+        }
+        assert_opens_drops!(srv, 3, 0);
+        drop(pool);
+        assert_opens_drops!(srv, 3, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connection_limits() {
         let (pool, mut srv) = setup_test(2).await;
 
@@ -1049,6 +1077,7 @@ mod test {
         WorkloadKey {
             src_id: Identity::default(),
             dst_id: vec![Identity::default()],
+            sandbox_id: None,
             src: IpAddr::from([127, 0, 0, ip]),
             dst: srv.addr,
         }

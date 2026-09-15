@@ -16,6 +16,7 @@ use crate::baggage::{Baggage, parse_baggage_header};
 use crate::config;
 use crate::identity::Identity;
 use crate::proxy::{BAGGAGE_HEADER, Error};
+use crate::strng::Strng;
 use bytes::{Buf, Bytes};
 use h2::SendStream;
 use h2::client::{Connection, SendRequest};
@@ -45,6 +46,8 @@ pub struct H2ConnectClient {
 pub struct WorkloadKey {
     pub src_id: Identity,
     pub dst_id: Vec<Identity>,
+    /// Separate pool entries for each Sandbox label; None is its own partition.
+    pub sandbox_id: Option<Strng>,
     // In theory we can just use src,dst,node. However, the dst has a check that
     // the L3 destination IP matches the HBONE IP. This could be loosened to just assert they are the same identity maybe.
     pub dst: SocketAddr,
@@ -59,7 +62,11 @@ impl Display for WorkloadKey {
         for i in &self.dst_id {
             write!(f, "{i}")?;
         }
-        write!(f, "]")
+        write!(f, "]")?;
+        if let Some(sandbox_id) = &self.sandbox_id {
+            write!(f, " sandbox={sandbox_id}")?;
+        }
+        Ok(())
     }
 }
 

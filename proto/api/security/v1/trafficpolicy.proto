@@ -1,0 +1,107 @@
+// Copyright 2026 The Kruise Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package agentio.security;
+
+option go_package = "github.com/openkruise/agentio/api/security/v1;securityv1";
+
+// One compiled TrafficPolicy/GlobalTrafficPolicy, retaining both directions.
+// Selection and explicit attachment are resolved before publication.
+message TrafficPolicy {
+  // Stable identity, e.g. trafficpolicy/demo/internet or
+  // globaltrafficpolicy/platform-baseline.
+  string name = 1;
+  // Source namespace; required for NAMESPACE scope.
+  // Empty for a cluster-scoped GlobalTrafficPolicy.
+  string namespace = 2;
+  // Nonnegative; higher values are evaluated first, following the source API.
+  // The compiler materializes the source default (1000).
+  int32 priority = 3;
+  // Absent = direction not configured; present with no rules = no rule matches.
+  PolicyRule ingress = 4;
+  PolicyRule egress = 5;
+  // GLOBAL: applies to all workloads; NAMESPACE: applies within namespace.
+  // WORKLOAD_SELECTOR: applies through control-plane-generated workload refs,
+  // including selector-based GlobalTrafficPolicies. Do not infer scope from name.
+  Scope scope = 6;
+
+  // An IPv4 or IPv6 network prefix.
+  message Address {
+    // Network address in 4-byte IPv4 or 16-byte IPv6 form, with host bits zero.
+    bytes address = 1;
+    // Prefix length: 0..32 for IPv4, 0..128 for IPv6.
+    uint32 length = 2;
+  }
+
+  enum Scope {
+    GLOBAL = 0;
+    NAMESPACE = 1;
+    WORKLOAD_SELECTOR = 2;
+  }
+
+  enum Action {
+    ALLOW = 0;
+    DENY = 1;
+  }
+
+  enum Protocol {
+    ALL = 0;
+    TCP = 1;
+    UDP = 2;
+    ICMP = 3;
+    SCTP = 4;
+  }
+
+  message PolicyRule {
+    // First matching rule wins, in declaration order.
+    // No match continues to the next policy; no per-policy default.
+    repeated Rule rules = 1;
+  }
+
+  message Rule {
+    // ALLOW/DENY correspond to source allow/reject; the compiler sets the action.
+    // The protobuf default is ALLOW. Unknown values are invalid.
+    Action action = 1;
+    // Required presence. Explicit {} matches all traffic.
+    Match match = 2;
+  }
+
+  message Match {
+    // Dimensions are ANDed; values within each dimension are ORed.
+    // Empty address list = unconstrained.
+    // Resolve peers in the control plane. If an explicitly configured source
+    // or destination peer list resolves to no addresses, omit the entire Rule
+    // while retaining the configured direction, even if no rules remain.
+    // Validate Address byte/prefix lengths and normalize host bits.
+    repeated Address source_ips = 1;
+    repeated Address destination_ips = 2;
+    // Empty = any protocol/port. Entries are ORed.
+    repeated PortMatch ports = 3;
+  }
+
+  message PortMatch {
+    // Unknown protocol values are invalid.
+    // ALL with a port constraint only matches protocols with destination ports.
+    Protocol protocol = 1;
+    // Inclusive destination port bounds, when present, must be in 1..65535.
+    // Only port: match that single port.
+    // Only end_port: match 1..end_port.
+    // Both: match port..end_port, requiring port <= end_port.
+    // Neither: any port (no port test). ICMP requires both fields absent.
+    optional uint32 port = 2;
+    optional uint32 end_port = 3;
+  }
+}

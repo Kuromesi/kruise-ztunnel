@@ -329,6 +329,27 @@ impl Handler<XdsAddress> for ProxyStateUpdater {
     }
 }
 
+impl Handler<agentio::sandbox::Sandbox> for ProxyStateUpdater {
+    fn no_on_demand(&self) -> bool {
+        // Sandbox resources use pushes even when Workload discovery is on-demand.
+        true
+    }
+
+    fn handle(
+        &self,
+        updates: Box<&mut dyn Iterator<Item = XdsUpdate<agentio::sandbox::Sandbox>>>,
+    ) -> Result<(), Vec<RejectedConfig>> {
+        let mut state = self.state.write().unwrap();
+        handle_single_resource(updates, |update| {
+            match update {
+                XdsUpdate::Update(resource) => state.sandboxes.update(resource)?,
+                XdsUpdate::Remove(name) => state.sandboxes.remove(&name),
+            }
+            Ok(())
+        })
+    }
+}
+
 fn insert_service_endpoints(
     workload: &Workload,
     services: &HashMap<String, PortList>,

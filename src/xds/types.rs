@@ -52,6 +52,16 @@ pub mod istio {
     }
 }
 
+pub mod agentio {
+    pub mod sandbox {
+        tonic::include_proto!("agentio.sandbox");
+    }
+    pub mod security {
+        tonic::include_proto!("agentio.security");
+    }
+}
+
 pub const ADDRESS_TYPE: Strng = strng::literal!("type.googleapis.com/istio.workload.Address");
 pub const AUTHORIZATION_TYPE: Strng =
     strng::literal!("type.googleapis.com/istio.security.Authorization");
+pub const SANDBOX_TYPE: Strng = strng::literal!("type.googleapis.com/agentio.sandbox.Sandbox");

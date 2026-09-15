@@ -29,6 +29,9 @@ fn main() -> Result<(), anyhow::Error> {
         "proto/citadel.proto",
         "proto/zds.proto",
         "proto/extensions.proto",
+        "proto/api/sandbox/v1/sandbox.proto",
+        "proto/api/sandbox/v1/egressrouting.proto",
+        "proto/api/security/v1/trafficpolicy.proto",
     ]
     .iter()
     .map(|name| std::env::current_dir().unwrap().join(name))

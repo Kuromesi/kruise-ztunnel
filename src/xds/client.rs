@@ -40,6 +40,9 @@ use crate::{identity, strng, tls};
 
 use super::Error;
 
+#[cfg(test)]
+mod sandbox_tests;
+
 const INSTANCE_IP: &str = "INSTANCE_IP";
 const INSTANCE_IPS: &str = "INSTANCE_IPS";
 const DEFAULT_IP: &str = "1.1.1.1";

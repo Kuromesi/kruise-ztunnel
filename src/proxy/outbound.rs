@@ -29,6 +29,7 @@ use crate::extensions::extensions::{EgressPolicies, EgressPolicy, EgressPolicyAc
 use crate::identity::Identity;
 use crate::proxy::connection_manager::{ConnectionAttributes, ConnectionContext};
 use crate::rbac::{Connection, Direction};
+use crate::sandbox::discovery::Sandbox;
 use crate::sandbox::sandbox;
 use crate::strng::Strng;
 
@@ -190,7 +191,15 @@ impl OutboundConnection {
             .pi
             .local_workload_information
             .get_workload()
-            .and_then(|source| self.build_request(source, source_addr.ip(), dest_addr));
+            .and_then(|source| {
+                // Select once before routing; policy, headers and pooling use this snapshot.
+                let sandbox = self
+                    .pi
+                    .sandbox_manager
+                    .as_ref()
+                    .and_then(|manager| manager.fetch_attested_sandbox(&source));
+                self.build_request(source, sandbox, source_addr.ip(), dest_addr)
+            });
         let req = match Box::pin(build).await {
             Ok(req) => Box::new(req),
             Err(err) => {
@@ -303,6 +312,7 @@ impl OutboundConnection {
             let wl_key = WorkloadKey {
                 src_id: req.source.identity(),
                 dst_id: req.final_sans.clone(),
+                sandbox_id: req.sandbox.as_ref().map(|sandbox| sandbox.uid.clone()),
                 src: remote_addr.ip(),
                 dst: req.actual_destination,
             };
@@ -421,13 +431,13 @@ impl OutboundConnection {
             builder = builder.header(X_FORWARDED_NETWORK_HEADER, network.as_str());
         }
 
+        if let Some(sandbox) = &req.sandbox {
+            builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox.uid.as_str());
+        }
         if let Some(sandbox_manager) = &self.pi.sandbox_manager {
             if let Some(token) = sandbox_manager.get_or_load_token().await {
                 builder = builder.header(sandbox::SANDBOX_TOKEN_HEADER, token.as_str());
             }
-            // if let Some(sandbox_id) = sandbox_manager.get_sandbox_id() {
-            //     builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox_id.as_str());
-            // }
             if let Some(encoded_labels) = &req.source.encoded_labels {
                 builder = builder.header(sandbox::SANDBOX_LABELS_HEADER, encoded_labels.as_str());
             }
@@ -451,8 +461,8 @@ impl OutboundConnection {
         let request = self.create_hbone_request(remote_addr, req, None).await;
         let pool_key = Box::new(WorkloadKey {
             src_id: req.source.identity(),
-            // Clone here shouldn't be needed ideally, we could just take ownership of Request.
             dst_id: req.upstream_sans.clone(),
+            sandbox_id: req.sandbox.as_ref().map(|sandbox| sandbox.uid.clone()),
             src: remote_addr.ip(),
             dst: req.actual_destination,
         });
@@ -538,6 +548,7 @@ impl OutboundConnection {
     async fn build_request_through_gateway(
         &self,
         source: Arc<Workload>,
+        sandbox: Option<Arc<Sandbox>>,
         // next hop on the remote network that we picked as our destination.
         // It may be a local view of a Waypoint workload on remote network or
         // a local view of the service workload (when waypoint is not
@@ -565,6 +576,7 @@ impl OutboundConnection {
             Ok(Request {
                 protocol: OutboundProtocol::DOUBLEHBONE,
                 source,
+                sandbox,
                 hbone_target_destination,
                 actual_destination_workload: Some(gateway_upstream.workload.clone()),
                 intended_destination_service: Some(ServiceDescription::from(service)),
@@ -594,13 +606,17 @@ impl OutboundConnection {
     async fn build_request(
         &self,
         source_workload: Arc<Workload>,
+        sandbox: Option<Arc<Sandbox>>,
         downstream: IpAddr,
         target: SocketAddr,
     ) -> Result<Request, Error> {
         let state = &self.pi.state;
 
         if source_workload.mesh_internal_traffic_policy == MeshInternalPassthrough {
-            if let Some(result) = self.apply_egress_policy(&source_workload, &target).await {
+            if let Some(result) = self
+                .apply_egress_policy(&source_workload, &sandbox, &target)
+                .await
+            {
                 return result;
             }
 
@@ -608,6 +624,7 @@ impl OutboundConnection {
             return Ok(Request {
                 protocol: OutboundProtocol::TCP,
                 source: source_workload,
+                sandbox,
                 hbone_target_destination: None,
                 actual_destination_workload: None,
                 intended_destination_service: None,
@@ -636,6 +653,7 @@ impl OutboundConnection {
                     return self
                         .build_request_through_gateway(
                             source_workload.clone(),
+                            sandbox,
                             waypoint,
                             &target_service,
                             target,
@@ -654,6 +672,7 @@ impl OutboundConnection {
                 return Ok(Request {
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload,
+                    sandbox,
                     hbone_target_destination: Some(HboneAddress::SocketAddr(target)),
                     actual_destination_workload: Some(waypoint.workload),
                     intended_destination_service: Some(ServiceDescription::from(&*target_service)),
@@ -690,7 +709,10 @@ impl OutboundConnection {
                 return Err(Error::NoHealthyUpstream(target));
             }
 
-            if let Some(result) = self.apply_egress_policy(&source_workload, &target).await {
+            if let Some(result) = self
+                .apply_egress_policy(&source_workload, &sandbox, &target)
+                .await
+            {
                 return result;
             }
 
@@ -698,6 +720,7 @@ impl OutboundConnection {
             return Ok(Request {
                 protocol: OutboundProtocol::TCP,
                 source: source_workload,
+                sandbox,
                 hbone_target_destination: None,
                 actual_destination_workload: None,
                 intended_destination_service: None,
@@ -727,7 +750,13 @@ impl OutboundConnection {
             debug!("picked a workload on remote network");
             let service = service.as_ref().ok_or(Error::NoService(target))?;
             return self
-                .build_request_through_gateway(source_workload.clone(), us, service, target)
+                .build_request_through_gateway(
+                    source_workload.clone(),
+                    sandbox,
+                    us,
+                    service,
+                    target,
+                )
                 .await;
         }
 
@@ -761,6 +790,7 @@ impl OutboundConnection {
                     // Always use HBONE here
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload,
+                    sandbox,
                     // Use the original VIP, not translated
                     hbone_target_destination: Some(HboneAddress::SocketAddr(target)),
                     actual_destination_workload: Some(waypoint.workload),
@@ -798,6 +828,7 @@ impl OutboundConnection {
         Ok(Request {
             protocol: OutboundProtocol::from(us.workload.protocol),
             source: source_workload,
+            sandbox,
             hbone_target_destination,
             actual_destination_workload: Some(us.workload.clone()),
             intended_destination_service: us.destination_service.clone(),
@@ -810,9 +841,10 @@ impl OutboundConnection {
     async fn apply_egress_policy(
         &self,
         source_workload: &Arc<Workload>,
+        sandbox: &Option<Arc<Sandbox>>,
         target: &SocketAddr,
     ) -> Option<Result<Request, Error>> {
-        let matched = match_workload_egress_policy(source_workload, target)
+        let matched = match_source_egress_policy(source_workload, sandbox.as_deref(), target)
             .map(|policy| (policy.policy, policy.gateway.clone()));
         let (action, gateway) = matched?;
         match action {
@@ -848,6 +880,7 @@ impl OutboundConnection {
                 Some(Ok(Request {
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload.clone(),
+                    sandbox: sandbox.clone(),
                     hbone_target_destination: Some(HboneAddress::SocketAddr(*target)),
                     actual_destination_workload: Some(waypoint.workload),
                     intended_destination_service: None,
@@ -880,6 +913,8 @@ struct Request {
     protocol: OutboundProtocol,
     // Source workload sending the request
     source: Arc<Workload>,
+    // Selected before routing; shared by egress policy, CONNECT headers and the pool key.
+    sandbox: Option<Arc<Sandbox>>,
     // The actual destination workload we are targeting. When proxying through a waypoint, this is the waypoint,
     // not the original.
     // May be unset in case of passthrough.
@@ -905,15 +940,17 @@ struct Request {
     final_sans: Vec<Identity>,
 }
 
-fn match_workload_egress_policy<'a>(
+fn match_source_egress_policy<'a>(
     source_workload: &'a Workload,
+    sandbox: Option<&'a Sandbox>,
     target: &SocketAddr,
 ) -> Option<&'a EgressPolicy> {
-    match_egress_policy(
-        source_workload.egress_policies.as_ref()?,
-        source_workload.namespace.as_ref(),
-        target,
-    )
+    // A selected Sandbox owns routing, including absent routes and no-match passthrough.
+    let policies = match sandbox {
+        Some(sandbox) => sandbox.egress_routing.as_ref(),
+        None => source_workload.egress_policies.as_ref(),
+    }?;
+    match_egress_policy(policies, source_workload.namespace.as_ref(), target)
 }
 
 /// Find the first egress policy that applies to a connection from
@@ -1076,7 +1113,7 @@ mod tests {
             .await
             .unwrap();
         let req = outbound
-            .build_request(local, from.parse().unwrap(), to.parse().unwrap())
+            .build_request(local, None, from.parse().unwrap(), to.parse().unwrap())
             .await
             .ok();
         if let Some(ref r) = req {
@@ -2191,6 +2228,7 @@ mod tests {
         let req = Request {
             protocol: OutboundProtocol::HBONE,
             source: source_workload,
+            sandbox: None,
             hbone_target_destination: Some(HboneAddress::SocketAddr(
                 "10.0.0.1:8080".parse().unwrap(),
             )),
@@ -2242,7 +2280,7 @@ mod tests {
     }
 
     mod match_egress_policy_tests {
-        use super::super::{match_egress_policy, match_workload_egress_policy};
+        use super::super::{match_egress_policy, match_source_egress_policy};
         use crate::extensions::extensions::{EgressPolicies, EgressPolicy, EgressPolicyAction};
         use crate::test_helpers::test_default_workload;
         use ipnet::IpNet;
@@ -2276,7 +2314,7 @@ mod tests {
         }
 
         #[test]
-        fn source_workload_policy_is_the_only_policy_input() {
+        fn workload_policy_applies_without_a_sandbox() {
             let mut workload = test_default_workload();
             workload.namespace = "ns-a".into();
             workload.egress_policies = Some(wrap(vec![EgressPolicy {
@@ -2284,12 +2322,39 @@ mod tests {
                 ..policy_passthrough()
             }]));
 
-            let got = match_workload_egress_policy(&workload, &target("10.0.0.1:443"))
+            let got = match_source_egress_policy(&workload, None, &target("10.0.0.1:443"))
                 .expect("inline workload policy should match");
             assert_eq!(got.policy, EgressPolicyAction::Deny);
 
             workload.egress_policies = None;
-            assert!(match_workload_egress_policy(&workload, &target("10.0.0.1:443")).is_none());
+            assert!(match_source_egress_policy(&workload, None, &target("10.0.0.1:443")).is_none());
+        }
+
+        #[test]
+        fn selected_sandbox_does_not_fall_back_to_workload_policy() {
+            let mut workload = test_default_workload();
+            workload.egress_policies = Some(wrap(vec![EgressPolicy {
+                policy: EgressPolicyAction::Deny,
+                ..policy_passthrough()
+            }]));
+            for routing in [
+                None,
+                Some(wrap(vec![])),
+                Some(wrap(vec![EgressPolicy {
+                    match_ports: vec![80],
+                    ..policy_passthrough()
+                }])),
+            ] {
+                let sandbox = crate::sandbox::discovery::Sandbox {
+                    uid: "sandbox-a".into(),
+                    workload_uid: Some(workload.uid.clone()),
+                    egress_routing: routing,
+                };
+                assert!(
+                    match_source_egress_policy(&workload, Some(&sandbox), &target("10.0.0.1:443"))
+                        .is_none()
+                );
+            }
         }
 
         #[test]
@@ -2447,5 +2512,453 @@ mod tests {
             assert_eq!(got.policy, EgressPolicyAction::Gateway);
             assert!(got.gateway.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn hbone_uses_discovered_sandbox_routing_and_independent_token() {
+        use crate::sandbox::discovery::tests::Fixture;
+        use crate::state::DemandProxyState;
+        let fixture = Fixture::new();
+        let cfg = Arc::new(crate::test_helpers::test_config());
+        let state = DemandProxyState::new(
+            fixture.state.clone(),
+            None,
+            Default::default(),
+            Default::default(),
+            test_proxy_metrics(),
+        );
+        let wi = WorkloadInfo::new("pod".into(), "ns".into(), "default".into());
+        let mut manager = sandbox::SandboxManager::new(state.clone());
+        let local = Arc::new(LocalWorkloadInformation::new(
+            Arc::new(wi),
+            state.clone(),
+            identity::mock::new_secret_manager(Duration::from_secs(10)),
+        ));
+        let socket_factory = Arc::new(crate::proxy::DefaultSocketFactory::default());
+        let token_dir = tempfile::tempdir().unwrap();
+        // The producer's token filename is independent of the xDS Sandbox ID.
+        std::fs::write(token_dir.path().join("producer-key.token"), "correct-token").unwrap();
+        manager
+            .run(token_dir.path().into(), cfg.sandbox_watcher_debounce_ms)
+            .await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while manager.list_sandbox_tokens().len() != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let manager = Arc::new(manager);
+        let outbound = OutboundConnection {
+            pi: Arc::new(ProxyInputs {
+                state: state.clone(),
+                cfg: cfg.clone(),
+                metrics: test_proxy_metrics(),
+                socket_factory: socket_factory.clone(),
+                local_workload_information: local.clone(),
+                connection_manager: ConnectionManager::default(),
+                resolver: None,
+                disable_inbound_freebind: false,
+                crl_manager: None,
+                sandbox_manager: Some(manager.clone()),
+                firewall_metrics: None,
+            }),
+            id: TraceParent::new(),
+            pool: WorkloadHBONEPool::new(cfg.clone(), socket_factory, local),
+            hbone_port: cfg.inbound_addr.port(),
+        };
+        // The same Workload can route through different policies once its Sandbox is selected.
+        use crate::xds::agentio::sandbox::{
+            EgressRouting, Sandbox as XdsSandbox, egress_routing, sandbox::Attester,
+        };
+        fixture
+            .state
+            .write()
+            .unwrap()
+            .workloads
+            .insert(Arc::new(Workload {
+                uid: "egress-gateway".into(),
+                hostname: "egress.ns".into(),
+                workload_ips: vec!["127.0.0.10".parse().unwrap()],
+                ..(*fixture.workload).clone()
+            }));
+        let mut routes = EgressRouting {
+            routes: vec![egress_routing::Route {
+                match_cidrs: vec!["10.0.0.0/8".into()],
+                match_ports: vec!["443".into()],
+                action: egress_routing::Action::Gateway.into(),
+                gateway: Some(egress_routing::GatewayAddress {
+                    service: "egress.ns".into(),
+                    port: 15008,
+                }),
+            }],
+        };
+        let publish_routing = |id: &str, routing: EgressRouting| {
+            fixture
+                .state
+                .write()
+                .unwrap()
+                .sandboxes
+                .update(xds::XdsResource {
+                    name: id.into(),
+                    resource: XdsSandbox {
+                        uid: id.into(),
+                        attester: Some(Attester {
+                            workload_uid: fixture.workload.uid.to_string(),
+                        }),
+                        egress_routing: Some(routing),
+                        ..Default::default()
+                    },
+                })
+                .unwrap();
+        };
+        publish_routing("sandbox-a", routes.clone());
+        publish_routing(
+            "sandbox-b",
+            EgressRouting {
+                routes: vec![egress_routing::Route::default()],
+            },
+        );
+        let sandboxes = fixture
+            .state
+            .read()
+            .unwrap()
+            .sandboxes
+            .get_by_workload(&fixture.workload.uid);
+        let target: SocketAddr = "10.0.0.1:443".parse().unwrap();
+        for mode in [Default::default(), MeshInternalPassthrough] {
+            let workload = Arc::new(Workload {
+                mesh_internal_traffic_policy: mode,
+                egress_policies: Some(EgressPolicies {
+                    policies: vec![EgressPolicy {
+                        namespaces: Default::default(),
+                        match_cidrs: vec![],
+                        match_ports: vec![],
+                        policy: EgressPolicyAction::Deny,
+                        gateway: None,
+                    }],
+                }),
+                ..(*fixture.workload).clone()
+            });
+            assert!(matches!(
+                outbound
+                    .build_request(workload.clone(), None, target.ip(), target)
+                    .await,
+                Err(Error::EgressPolicyDenied(_))
+            ));
+            for selected in &sandboxes {
+                let request = outbound
+                    .build_request(
+                        workload.clone(),
+                        Some(selected.clone()),
+                        target.ip(),
+                        target,
+                    )
+                    .await
+                    .unwrap();
+                assert!(Arc::ptr_eq(request.sandbox.as_ref().unwrap(), selected));
+                if selected.uid == "sandbox-a" {
+                    assert_eq!(request.protocol, OutboundProtocol::HBONE);
+                    assert_eq!(
+                        request.actual_destination,
+                        "127.0.0.10:15008".parse().unwrap()
+                    );
+                    assert_eq!(
+                        request
+                            .hbone_target_destination
+                            .as_ref()
+                            .unwrap()
+                            .to_string(),
+                        target.to_string()
+                    );
+                    let hbone = outbound.create_hbone_request(target, &request, None).await;
+                    assert_eq!(hbone.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
+                } else {
+                    assert_eq!(request.protocol, OutboundProtocol::TCP);
+                    assert_eq!(request.actual_destination, target);
+                }
+            }
+        }
+        // A selected but unavailable gateway fails the request without direct fallback.
+        routes.routes[0].gateway.as_mut().unwrap().service = "missing.ns".into();
+        publish_routing("sandbox-a", routes);
+        let selected = manager.fetch_attested_sandbox(&fixture.workload);
+        assert!(matches!(
+            outbound
+                .build_request(fixture.workload.clone(), selected, target.ip(), target)
+                .await,
+            Err(Error::UnknownWaypoint(_))
+        ));
+        fixture
+            .state
+            .write()
+            .unwrap()
+            .sandboxes
+            .remove(&"sandbox-a".into());
+        fixture
+            .state
+            .write()
+            .unwrap()
+            .sandboxes
+            .remove(&"sandbox-b".into());
+
+        let mut request = Request {
+            protocol: OutboundProtocol::HBONE,
+            source: fixture.workload.clone(),
+            sandbox: None,
+            hbone_target_destination: Some(HboneAddress::SocketAddr(
+                "10.0.0.1:443".parse().unwrap(),
+            )),
+            actual_destination_workload: None,
+            intended_destination_service: None,
+            actual_destination: "10.0.0.1:443".parse().unwrap(),
+            upstream_sans: vec![],
+            final_sans: vec![],
+        };
+        let source = "127.0.0.1:12345".parse().unwrap();
+        let before = outbound.create_hbone_request(source, &request, None).await;
+        assert!(!before.headers().contains_key(sandbox::SANDBOX_ID_HEADER));
+        assert_eq!(
+            before.headers()[sandbox::SANDBOX_TOKEN_HEADER],
+            "Y29ycmVjdC10b2tlbg=="
+        );
+        fixture.publish("sandbox-a");
+        request.sandbox = manager.fetch_attested_sandbox(&request.source);
+        let discovered = outbound.create_hbone_request(source, &request, None).await;
+        assert_eq!(
+            discovered.headers()[sandbox::SANDBOX_ID_HEADER],
+            "sandbox-a"
+        );
+        let captured_a = manager.fetch_attested_sandbox(&request.source).unwrap();
+        request.sandbox = Some(captured_a.clone());
+        for network in [None, Some(&cfg.network)] {
+            let hbone = outbound
+                .create_hbone_request(source, &request, network)
+                .await;
+            assert_eq!(hbone.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
+            assert_eq!(
+                hbone.headers()[sandbox::SANDBOX_TOKEN_HEADER],
+                "Y29ycmVjdC10b2tlbg=="
+            );
+        }
+        fixture.publish("sandbox-b");
+        assert_eq!(
+            manager
+                .fetch_attested_sandbox(&request.source)
+                .map(|sandbox| sandbox.uid.clone())
+                .unwrap(),
+            captured_a.uid
+        );
+        // Each request carries its selected identity while token loading stays independent.
+        for id in ["sandbox-a", "sandbox-b"] {
+            for network in [None, Some(&cfg.network)] {
+                request.sandbox = fixture
+                    .state
+                    .read()
+                    .unwrap()
+                    .sandboxes
+                    .get_by_workload(&request.source.uid)
+                    .into_iter()
+                    .find(|sandbox| sandbox.uid == id);
+                let hbone = outbound
+                    .create_hbone_request(source, &request, network)
+                    .await;
+                assert_eq!(hbone.headers()[sandbox::SANDBOX_ID_HEADER], id);
+                assert_eq!(
+                    hbone.headers()[sandbox::SANDBOX_TOKEN_HEADER],
+                    "Y29ycmVjdC10b2tlbg=="
+                );
+            }
+        }
+        let foreign = Arc::new(Workload {
+            uid: "foreign".into(),
+            ..(*fixture.workload).clone()
+        });
+        fixture
+            .state
+            .write()
+            .unwrap()
+            .workloads
+            .insert(foreign.clone());
+        request.source = foreign;
+        request.sandbox = manager.fetch_attested_sandbox(&request.source);
+        let foreign_request = outbound.create_hbone_request(source, &request, None).await;
+        assert!(
+            !foreign_request
+                .headers()
+                .contains_key(sandbox::SANDBOX_ID_HEADER)
+        );
+        assert!(manager.fetch_attested_sandbox(&request.source).is_none());
+        request.source = fixture.workload.clone();
+        request.sandbox = Some(captured_a.clone());
+        fixture
+            .state
+            .write()
+            .unwrap()
+            .sandboxes
+            .remove(&"sandbox-a".into());
+        // An already-started connection keeps its captured label, including the
+        // inner CONNECT created after a Sandbox update. No revalidation blocks it.
+        let inner = outbound
+            .create_hbone_request(source, &request, Some(&cfg.network))
+            .await;
+        assert_eq!(inner.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
+        let current = manager.fetch_attested_sandbox(&request.source).unwrap();
+        assert_eq!(current.uid, "sandbox-b");
+        request.sandbox = Some(current);
+        let next = outbound.create_hbone_request(source, &request, None).await;
+        assert_eq!(next.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-b");
+        fixture
+            .state
+            .write()
+            .unwrap()
+            .sandboxes
+            .remove(&"sandbox-b".into());
+        // Removing the last binding leaves new connections without a Sandbox label.
+        assert!(manager.fetch_attested_sandbox(&request.source).is_none());
+        request.sandbox = manager.fetch_attested_sandbox(&request.source);
+        let unlabeled = outbound.create_hbone_request(source, &request, None).await;
+        assert!(!unlabeled.headers().contains_key(sandbox::SANDBOX_ID_HEADER));
+    }
+
+    #[tokio::test]
+    async fn sandbox_changes_do_not_close_tcp_or_reject_new_connections() {
+        use crate::sandbox::discovery::tests::Fixture;
+        use crate::state::DemandProxyState;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let fixture = Fixture::new();
+        fixture
+            .state
+            .write()
+            .unwrap()
+            .workloads
+            .insert(Arc::new(Workload {
+                mesh_internal_traffic_policy: MeshInternalPassthrough,
+                ..(*fixture.workload).clone()
+            }));
+        fixture.publish("sandbox-a");
+        let manager = Arc::new(fixture.manager);
+        let cfg = Arc::new(crate::test_helpers::test_config());
+        let state = DemandProxyState::new(
+            fixture.state.clone(),
+            None,
+            Default::default(),
+            Default::default(),
+            test_proxy_metrics(),
+        );
+        let local = Arc::new(LocalWorkloadInformation::new(
+            Arc::new(WorkloadInfo::new(
+                "pod".into(),
+                "ns".into(),
+                "default".into(),
+            )),
+            state.clone(),
+            identity::mock::new_secret_manager(Duration::from_secs(10)),
+        ));
+        let sockets = Arc::new(crate::proxy::DefaultSocketFactory::default());
+        let connection_manager = ConnectionManager::default();
+        let mut outbound = OutboundConnection {
+            pi: Arc::new(ProxyInputs {
+                state,
+                cfg: cfg.clone(),
+                metrics: test_proxy_metrics(),
+                socket_factory: sockets.clone(),
+                local_workload_information: local.clone(),
+                connection_manager: connection_manager.clone(),
+                resolver: None,
+                disable_inbound_freebind: false,
+                crl_manager: None,
+                sandbox_manager: Some(manager.clone()),
+                firewall_metrics: None,
+            }),
+            id: TraceParent::new(),
+            pool: WorkloadHBONEPool::new(cfg.clone(), sockets, local),
+            hbone_port: cfg.inbound_addr.port(),
+        };
+        let inputs = outbound.pi.clone();
+        let pool = outbound.pool.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let destination = upstream.local_addr().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (source, source_addr) = listener.accept().await.unwrap();
+            let forwarding = tokio::spawn(async move {
+                outbound.proxy_to(source, source_addr, destination).await;
+            });
+            let (mut server, _) = upstream.accept().await.unwrap();
+            client.write_all(b"ok").await.unwrap();
+            let mut received = [0; 2];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"ok");
+            assert_eq!(connection_manager.connections().len(), 1);
+            use crate::xds::agentio::sandbox::{Sandbox, SandboxState, sandbox::Attester};
+            for lifecycle in [
+                Some(SandboxState::Paused),
+                Some(SandboxState::Stopped),
+                None,
+            ] {
+                {
+                    let mut state = fixture.state.write().unwrap();
+                    if let Some(lifecycle) = lifecycle {
+                        state
+                            .sandboxes
+                            .update(crate::xds::XdsResource {
+                                name: "sandbox-a".into(),
+                                resource: Sandbox {
+                                    uid: "sandbox-a".into(),
+                                    state: lifecycle.into(),
+                                    attester: Some(Attester {
+                                        workload_uid: fixture.workload.uid.to_string(),
+                                    }),
+                                    ..Default::default()
+                                },
+                            })
+                            .unwrap();
+                    } else {
+                        state.sandboxes.remove(&"sandbox-a".into());
+                    }
+                }
+                // The existing stream still forwards in both directions.
+                client.write_all(b"ok").await.unwrap();
+                server.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"ok");
+                server.write_all(b"ok").await.unwrap();
+                client.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"ok");
+
+                // A new unlabelled connection is also admitted normally.
+                let mut next_client = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (source, source_addr) = listener.accept().await.unwrap();
+                let mut next = OutboundConnection {
+                    pi: inputs.clone(),
+                    id: TraceParent::new(),
+                    pool: pool.clone(),
+                    hbone_port: cfg.inbound_addr.port(),
+                };
+                let next_forwarding = tokio::spawn(async move {
+                    next.proxy_to(source, source_addr, destination).await;
+                });
+                let (mut next_server, _) = upstream.accept().await.unwrap();
+                next_client.write_all(b"ok").await.unwrap();
+                next_server.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"ok");
+                drop(next_client);
+                drop(next_server);
+                next_forwarding.await.unwrap();
+            }
+            drop(client);
+            drop(server);
+            forwarding.await.unwrap();
+            assert!(connection_manager.connections().is_empty());
+        })
+        .await
+        .unwrap();
     }
 }

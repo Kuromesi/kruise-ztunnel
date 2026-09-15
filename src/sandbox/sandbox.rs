@@ -15,6 +15,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::discovery::Sandbox;
+use crate::state::DemandProxyState;
+use crate::state::workload::Workload;
+
 use base64::Engine;
 
 use crate::watcher::watcher::{AsyncFileWatcher, FileStore};
@@ -32,27 +36,40 @@ pub(crate) fn sandbox_token_transform(s: String) -> anyhow::Result<String> {
 }
 
 /// Derive the [`FileStore`] key from a token file path.
-/// Returns the file stem (filename without extension); K8s atomic-write mounts
-/// create files like `<sandbox-id>.token`, so the stem matches the sandbox id
-/// the proxy uses to look the token up.
+/// Returns the file stem (filename without extension) as an opaque cache key.
+/// The producer chooses the filename independently of the xDS Sandbox ID.
 pub(crate) fn sandbox_token_key(path: &PathBuf) -> Option<String> {
     path.file_stem().map(|s| s.to_string_lossy().to_string())
 }
 
-/// Manages sandbox tokens by watching all files in the token directory.
+/// Looks up Sandbox traffic metadata and watches the local token directory.
 pub struct SandboxManager {
     store: Option<Arc<FileStore<String, String>>>,
     token_dir: Option<PathBuf>,
     _watcher_handle: Option<tokio::task::JoinHandle<()>>,
+    state: DemandProxyState,
 }
 
 impl SandboxManager {
-    pub fn new() -> Self {
+    pub fn new(state: DemandProxyState) -> Self {
         SandboxManager {
             store: None,
             token_dir: None,
             _watcher_handle: None,
+            state,
         }
+    }
+
+    /// Return the local Workload's first discovered Sandbox.
+    /// Per-connection selection among multiple Sandboxes can be added here later.
+    /// TODO: Support multiple Sandboxes per Workload, and select the correct one for each connection.
+    pub fn fetch_attested_sandbox(&self, workload: &Workload) -> Option<Arc<Sandbox>> {
+        self.state
+            .read()
+            .sandboxes
+            .get_by_workload(&workload.uid)
+            .first()
+            .cloned()
     }
 
     pub async fn run(&mut self, token_dir: PathBuf, debounce_ms: u64) {
@@ -120,10 +137,10 @@ impl SandboxManager {
         }
     }
 
-    pub fn get_sandbox_token(&self, sandbox_id: String) -> Option<Arc<String>> {
+    pub fn get_sandbox_token(&self, token_key: String) -> Option<Arc<String>> {
         match self.store {
             None => None,
-            Some(ref store) => store.get(&sandbox_id).map(|v| v),
+            Some(ref store) => store.get(&token_key).map(|v| v),
         }
     }
 }
@@ -140,6 +157,7 @@ mod tests {
             ))),
             token_dir: Some(token_dir),
             _watcher_handle: None,
+            state: crate::test_helpers::new_proxy_state(&[], &[], &[]),
         }
     }
 
@@ -255,7 +273,7 @@ mod tests {
 
     #[test]
     fn manager_new_returns_empty_state() {
-        let mgr = SandboxManager::new();
+        let mgr = SandboxManager::new(crate::test_helpers::new_proxy_state(&[], &[], &[]));
         assert!(mgr.list_sandbox_tokens().is_empty());
         assert!(mgr.get_sandbox_token("any-id".to_string()).is_none());
     }
@@ -265,7 +283,7 @@ mod tests {
         // Calling lookup methods before `run()` must not panic and must return
         // empty/None - this is the failure mode we want when the watcher fails
         // to start (e.g. directory missing in an unprivileged sandbox).
-        let mgr = SandboxManager::new();
+        let mgr = SandboxManager::new(crate::test_helpers::new_proxy_state(&[], &[], &[]));
         let tokens = mgr.list_sandbox_tokens();
         let token = mgr.get_sandbox_token("anything".to_string());
         assert!(tokens.is_empty());

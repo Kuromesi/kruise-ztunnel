@@ -180,6 +180,8 @@ pub struct ProxyState {
     pub services: ServiceStore,
 
     pub policies: PolicyStore,
+
+    pub sandboxes: crate::sandbox::discovery::SandboxStore,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -238,6 +240,7 @@ impl ProxyState {
             workloads: WorkloadStore::new(local_node),
             services: Default::default(),
             policies: Default::default(),
+            sandboxes: Default::default(),
         }
     }
 
@@ -1139,12 +1142,16 @@ impl ProxyStateManager {
             let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(
                 config.xds_root_cert.clone(),
             ));
-            Some(
-                xds::Config::new(config.clone(), tls_client_fetcher)
-                    .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, updater.clone())
-                    .with_watched_handler::<XdsAuthorization>(xds::AUTHORIZATION_TYPE, updater)
-                    .build(xds_metrics, awaiting_ready),
-            )
+            let mut builder = xds::Config::new(config.clone(), tls_client_fetcher)
+                .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, updater.clone())
+                .with_watched_handler::<XdsAuthorization>(xds::AUTHORIZATION_TYPE, updater.clone());
+            if config.enable_sandbox_manager {
+                builder = builder.with_optional_watched_handler::<xds::agentio::sandbox::Sandbox>(
+                    xds::SANDBOX_TYPE,
+                    updater,
+                );
+            }
+            Some(builder.build(xds_metrics, awaiting_ready))
         } else {
             None
         };
@@ -1197,6 +1204,28 @@ mod tests {
 
     use crate::{strng, test_helpers};
     use test_case::test_case;
+
+    #[tokio::test]
+    async fn sandbox_discovery_allows_shared_startup_without_workload_or_xds_address() {
+        let mut config = test_helpers::test_config();
+        config.enable_sandbox_manager = true;
+        config.proxy_mode = config::ProxyMode::Shared;
+        config.proxy_workload_information = None;
+        config.local_node = None;
+        config.xds_address = None;
+        config.local_xds_config = None;
+        let mut registry = Registry::default();
+        let state_manager = ProxyStateManager::new(
+            Arc::new(config),
+            xds::Metrics::new(&mut registry),
+            Arc::new(proxy::Metrics::new(&mut registry)),
+            tokio::sync::watch::channel(()).0,
+            crate::identity::mock::new_secret_manager(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap();
+        assert!(!state_manager.state().supports_on_demand());
+    }
 
     #[tokio::test]
     async fn test_wait_for_workload() {
