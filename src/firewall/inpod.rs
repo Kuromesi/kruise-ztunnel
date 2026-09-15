@@ -210,13 +210,13 @@ impl InpodFirewallController {
 
         let (ruleset, policy_hash) = {
             let state_guard = self.state.read();
-            let Some((policies, policy_hash)) =
-                convert::resolve_workload_policies(&state_guard, info)
+            let Some((ruleset, policy_hash)) =
+                convert::resolve_workload_firewall(&state_guard, info)
             else {
                 debug!(info = %info, "Workload not found in xDS state");
                 return (PodState::PendingWorkload, 0);
             };
-            (convert::build_firewall_ruleset(policies), policy_hash)
+            (ruleset, policy_hash)
         };
 
         match backend.apply(&ruleset).await {
@@ -317,15 +317,14 @@ impl InpodFirewallController {
                 if matches!(pod_state.state, PodState::InitFailed { .. }) {
                     continue;
                 }
-                let Some((policies, policy_hash)) =
-                    convert::resolve_workload_policies(&state_guard, &pod_state.workload_info)
+                let Some((ruleset, policy_hash)) =
+                    convert::resolve_workload_firewall(&state_guard, &pod_state.workload_info)
                 else {
                     continue;
                 };
                 if policy_hash == pod_state.last_policy_hash {
                     continue;
                 }
-                let ruleset = convert::build_firewall_ruleset(policies);
                 to_apply.push((
                     uid.clone(),
                     pod_state.netns.clone(),
@@ -418,12 +417,11 @@ impl InpodFirewallController {
                 let Some(pod_state) = self.pods.get(uid) else {
                     continue;
                 };
-                let Some((policies, policy_hash)) =
-                    convert::resolve_workload_policies(&state_guard, &pod_state.workload_info)
+                let Some((ruleset, policy_hash)) =
+                    convert::resolve_workload_firewall(&state_guard, &pod_state.workload_info)
                 else {
                     continue;
                 };
-                let ruleset = convert::build_firewall_ruleset(policies);
                 to_process.push((
                     uid.clone(),
                     pod_state.netns.clone(),

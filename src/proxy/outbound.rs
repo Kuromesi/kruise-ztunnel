@@ -221,6 +221,7 @@ impl OutboundConnection {
                 direction: Direction::Outbound,
             },
             workload: req.source.clone(),
+            sandbox: req.sandbox.clone(),
         };
         let conn = ConnectionAttributes::Outbound(proxy::connection_manager::OutboundAttributes {
             actual_dst: req.actual_destination,
@@ -2349,6 +2350,7 @@ mod tests {
                     uid: "sandbox-a".into(),
                     workload_uid: Some(workload.uid.clone()),
                     egress_routing: routing,
+                    traffic_policies: vec![],
                 };
                 assert!(
                     match_source_egress_policy(&workload, Some(&sandbox), &target("10.0.0.1:443"))
@@ -2822,7 +2824,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_changes_do_not_close_tcp_or_reject_new_connections() {
+    async fn sandbox_policy_updates_recheck_tcp_without_lifecycle_drain() {
         use crate::sandbox::discovery::tests::Fixture;
         use crate::state::DemandProxyState;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2859,6 +2861,29 @@ mod tests {
         ));
         let sockets = Arc::new(crate::proxy::DefaultSocketFactory::default());
         let connection_manager = ConnectionManager::default();
+        let (stop, watch) = crate::drain::new();
+        let watcher = tokio::spawn(
+            crate::proxy::connection_manager::PolicyWatcher::new(
+                state.clone(),
+                watch,
+                connection_manager.clone(),
+            )
+            .run(),
+        );
+        use crate::xds::agentio::sandbox::{Sandbox, SandboxState, sandbox::Attester};
+        use crate::xds::agentio::security::{TrafficPolicy, traffic_policy};
+        use crate::xds::{Handler, ProxyStateUpdater, XdsResource, XdsUpdate};
+        let updater = ProxyStateUpdater::new_no_fetch(fixture.state.clone());
+        let publish = |resource: Sandbox| {
+            updater
+                .handle(Box::new(&mut std::iter::once(XdsUpdate::Update(
+                    XdsResource {
+                        name: resource.uid.clone().into(),
+                        resource,
+                    },
+                ))))
+                .unwrap();
+        };
         let mut outbound = OutboundConnection {
             pi: Arc::new(ProxyInputs {
                 state,
@@ -2896,32 +2921,26 @@ mod tests {
             server.read_exact(&mut received).await.unwrap();
             assert_eq!(&received, b"ok");
             assert_eq!(connection_manager.connections().len(), 1);
-            use crate::xds::agentio::sandbox::{Sandbox, SandboxState, sandbox::Attester};
             for lifecycle in [
                 Some(SandboxState::Paused),
                 Some(SandboxState::Stopped),
                 None,
             ] {
-                {
-                    let mut state = fixture.state.write().unwrap();
-                    if let Some(lifecycle) = lifecycle {
-                        state
-                            .sandboxes
-                            .update(crate::xds::XdsResource {
-                                name: "sandbox-a".into(),
-                                resource: Sandbox {
-                                    uid: "sandbox-a".into(),
-                                    state: lifecycle.into(),
-                                    attester: Some(Attester {
-                                        workload_uid: fixture.workload.uid.to_string(),
-                                    }),
-                                    ..Default::default()
-                                },
-                            })
-                            .unwrap();
-                    } else {
-                        state.sandboxes.remove(&"sandbox-a".into());
-                    }
+                if let Some(lifecycle) = lifecycle {
+                    publish(Sandbox {
+                        uid: "sandbox-a".into(),
+                        state: lifecycle.into(),
+                        attester: Some(Attester {
+                            workload_uid: fixture.workload.uid.to_string(),
+                        }),
+                        ..Default::default()
+                    });
+                } else {
+                    updater
+                        .handle(Box::new(&mut std::iter::once(
+                            XdsUpdate::<Sandbox>::Remove("sandbox-a".into()),
+                        )))
+                        .unwrap();
                 }
                 // The existing stream still forwards in both directions.
                 client.write_all(b"ok").await.unwrap();
@@ -2953,12 +2972,49 @@ mod tests {
                 drop(next_server);
                 next_forwarding.await.unwrap();
             }
-            drop(client);
-            drop(server);
+            // An accepted xDS policy update rechecks and closes the existing TCP stream.
+            publish(Sandbox {
+                uid: "sandbox-a".into(),
+                attester: Some(Attester {
+                    workload_uid: fixture.workload.uid.to_string(),
+                }),
+                traffic_policies: vec![TrafficPolicy {
+                    name: "deny-egress".into(),
+                    priority: 1000,
+                    egress: Some(traffic_policy::PolicyRule {
+                        rules: vec![traffic_policy::Rule {
+                            action: traffic_policy::Action::Deny.into(),
+                            r#match: Some(traffic_policy::Match::default()),
+                        }],
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            assert_eq!(client.read(&mut received).await.unwrap(), 0);
+            assert_eq!(server.read(&mut received).await.unwrap(), 0);
             forwarding.await.unwrap();
+
+            let mut denied_client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (denied_source, denied_addr) = listener.accept().await.unwrap();
+            let mut denied = OutboundConnection {
+                pi: inputs.clone(),
+                id: TraceParent::new(),
+                pool: pool.clone(),
+                hbone_port: cfg.inbound_addr.port(),
+            };
+            denied
+                .proxy_to(denied_source, denied_addr, destination)
+                .await;
+            assert_eq!(denied_client.read(&mut received).await.unwrap(), 0);
             assert!(connection_manager.connections().is_empty());
         })
         .await
         .unwrap();
+        stop.start_drain_and_wait(crate::drain::DrainMode::Immediate)
+            .await;
+        watcher.await.unwrap();
     }
 }

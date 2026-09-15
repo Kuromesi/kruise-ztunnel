@@ -30,7 +30,7 @@ pub const DEFAULT_FIREWALL_MAX_DEBOUNCE_TIME: Duration = Duration::from_secs(1);
 
 pub use backend::{Backend, BackendBuilder, IptBackend, NftBackend};
 pub use convert::{
-    build_firewall_ruleset, collect_workload_policies, hash_policies, resolve_workload_policies,
+    build_firewall_ruleset, collect_workload_policies, hash_policies, resolve_workload_firewall,
 };
 pub use dedicated::FirewallController;
 pub use detect::{FirewallBackend, detect_backend};

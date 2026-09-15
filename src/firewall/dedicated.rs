@@ -81,8 +81,7 @@ impl FirewallController {
 
     fn resolve_and_build(&self) -> Option<(crate::firewall::RuleSet, u64)> {
         let state = self.state.read();
-        let (policies, hash) = convert::resolve_workload_policies(&state, &self.workload_info)?;
-        Some((convert::build_firewall_ruleset(policies), hash))
+        convert::resolve_workload_firewall(&state, &self.workload_info)
     }
 
     async fn drain_cleanup(&self) {
@@ -98,6 +97,8 @@ impl FirewallController {
             return;
         }
 
+        // Subscribe before the initial apply so updates during it are not lost.
+        let mut policies_changed = self.state.read().policies.subscribe();
         let mut last_policy_hash: u64 = 0;
         if let Some((ruleset, policy_hash)) = self.resolve_and_build() {
             let start = Instant::now();
@@ -109,8 +110,6 @@ impl FirewallController {
                 Err(e) => error!("Failed to apply initial firewall rules: {}", e),
             }
         }
-
-        let mut policies_changed = self.state.read().policies.subscribe();
 
         loop {
             tokio::select! {

@@ -227,16 +227,6 @@ pub fn hash_policies(policies: &[&Authorization]) -> u64 {
     hasher.finish()
 }
 
-pub fn resolve_workload_policies<'a>(
-    state: &'a ProxyState,
-    info: &WorkloadInfo,
-) -> Option<(Vec<&'a Authorization>, u64)> {
-    let wl = state.workloads.find_by_info(info)?;
-    let policies = collect_workload_policies(&state.policies, &wl);
-    let policy_hash = hash_policies(&policies);
-    Some((policies, policy_hash))
-}
-
 pub fn build_firewall_ruleset(mut policies: Vec<&Authorization>) -> RuleSet {
     policies.sort_by(|a, b| a.compare_traffic_policy(b));
     RuleSet {
@@ -246,6 +236,27 @@ pub fn build_firewall_ruleset(mut policies: Vec<&Authorization>) -> RuleSet {
             .flat_map(authorization_to_firewall_rules)
             .collect(),
     }
+}
+
+/// Resolve the same first attested Sandbox used by the proxy's current Workload
+/// selection. Native policies replace the legacy Workload TrafficPolicy view.
+pub fn resolve_workload_firewall(
+    state: &ProxyState,
+    info: &WorkloadInfo,
+) -> Option<(RuleSet, u64)> {
+    let wl = state.workloads.find_by_info(info)?;
+    if let Some(sandbox) = state.sandboxes.get_by_workload(&wl.uid).first() {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sandbox.uid.hash(&mut hasher);
+        sandbox.traffic_policies.hash(&mut hasher);
+        return Some((
+            crate::sandbox::traffic_policy::firewall_ruleset(&sandbox.traffic_policies),
+            hasher.finish(),
+        ));
+    }
+    let policies = collect_workload_policies(&state.policies, &wl);
+    let hash = hash_policies(&policies);
+    Some((build_firewall_ruleset(policies), hash))
 }
 
 #[cfg(test)]

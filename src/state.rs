@@ -16,6 +16,7 @@
 use crate::identity::{Identity, SecretManager};
 use crate::proxy::{Error, OnDemandDnsLabels};
 use crate::rbac::{Authorization, Direction, RbacDecision};
+use crate::sandbox::{discovery::Sandbox, traffic_policy};
 use crate::state::policy::PolicyStore;
 use crate::state::service::{
     Endpoint, IpFamily, LoadBalancerMode, LoadBalancerScopes, ServiceStore,
@@ -158,6 +159,21 @@ pub struct ProxyRbacContext {
     pub conn: rbac::Connection,
     #[educe(Hash(ignore), PartialEq(ignore))]
     pub workload: Arc<Workload>,
+    // Retain the selected Sandbox; policy rechecks resolve its UID in the current store.
+    #[serde(skip_serializing)]
+    #[educe(
+        PartialEq(method(same_sandbox_identity)),
+        Hash(method(hash_sandbox_identity))
+    )]
+    pub sandbox: Option<Arc<Sandbox>>,
+}
+
+fn same_sandbox_identity(left: &Option<Arc<Sandbox>>, right: &Option<Arc<Sandbox>>) -> bool {
+    left.as_ref().map(|s| &s.uid) == right.as_ref().map(|s| &s.uid)
+}
+
+fn hash_sandbox_identity<H: std::hash::Hasher>(sandbox: &Option<Arc<Sandbox>>, state: &mut H) {
+    std::hash::Hash::hash(&sandbox.as_ref().map(|s| &s.uid), state);
 }
 
 impl ProxyRbacContext {
@@ -549,6 +565,23 @@ impl DemandProxyState {
         let wl = ctx.workload.clone();
         let conn = &ctx.conn;
         let state = self.read();
+        let sandbox = match &ctx.sandbox {
+            Some(sandbox) => state
+                .sandboxes
+                .get(&sandbox.uid)
+                .filter(|s| s.workload_uid.as_ref() == Some(&wl.uid)),
+            // Connections opened before discovery also pick up the Workload's policies.
+            None => state.sandboxes.get_by_workload(&wl.uid).first().cloned(),
+        };
+        if let Some(sandbox) = &sandbox
+            && matches!(
+                traffic_policy::assert_tcp(&sandbox.traffic_policies, conn)?,
+                RbacDecision::Allow
+            )
+        {
+            // Match Workload TrafficPolicy: an explicit ALLOW ends authorization.
+            return Ok(());
+        }
 
         // We can get policies from namespace, global, and workload...
         let ns = state.policies.get_by_namespace(&wl.namespace);
@@ -562,6 +595,11 @@ impl DemandProxyState {
             .chain(workload)
             .filter_map(|k| {
                 let pol = state.policies.get(k)?;
+                // Sandbox replaces legacy Agentio TrafficPolicy. Istio policies are
+                // consulted only when this direction has no native TrafficPolicy.
+                if sandbox.is_some() && pol.priority.is_some() {
+                    return None;
+                }
                 // Filter by direction: inbound skips server-mode, outbound skips client-mode
                 let skip = match (ctx.conn.direction, pol.mode) {
                     (Direction::Inbound, TrafficPolicyMode::Client) => true,
@@ -1517,6 +1555,7 @@ mod tests {
         let key: Strng = format!("{dest_uid}").into();
         let workload = &state.read().workloads.by_uid[&key];
         crate::state::ProxyRbacContext {
+            sandbox: None,
             conn: rbac::Connection {
                 src_identity: Some(Identity::Spiffe {
                     trust_domain: "cluster.local".into(),

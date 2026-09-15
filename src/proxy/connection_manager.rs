@@ -370,6 +370,7 @@ mod tests {
         // track a new connection
         let rbac_ctx1 = ConnectionContext {
             rbac_ctx: crate::state::ProxyRbacContext {
+                sandbox: None,
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -405,6 +406,7 @@ mod tests {
         // track a second connection
         let rbac_ctx2 = ConnectionContext {
             rbac_ctx: crate::state::ProxyRbacContext {
+                sandbox: None,
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -474,6 +476,7 @@ mod tests {
         // create a new connection
         let conn1 = ConnectionContext {
             rbac_ctx: crate::state::ProxyRbacContext {
+                sandbox: None,
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -495,6 +498,7 @@ mod tests {
         // create a second connection
         let conn2 = ConnectionContext {
             rbac_ctx: crate::state::ProxyRbacContext {
+                sandbox: None,
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -592,6 +596,7 @@ mod tests {
         // create a test connection
         let conn1 = ConnectionContext {
             rbac_ctx: crate::state::ProxyRbacContext {
+                sandbox: None,
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(

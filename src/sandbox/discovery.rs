@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use tracing::warn;
 
+use super::traffic_policy::TrafficPolicy;
 use crate::extensions::extensions::EgressPolicies;
 use crate::strng::Strng;
 use crate::xds::XdsResource;
@@ -41,6 +42,7 @@ pub struct Sandbox {
     pub uid: Strng,
     pub workload_uid: Option<Strng>,
     pub egress_routing: Option<EgressPolicies>,
+    pub traffic_policies: Vec<TrafficPolicy>,
 }
 
 impl TryFrom<XdsSandbox> for Sandbox {
@@ -65,6 +67,11 @@ impl TryFrom<XdsSandbox> for Sandbox {
                 .egress_routing
                 .map(EgressPolicies::try_from)
                 .transpose()?,
+            traffic_policies: resource
+                .traffic_policies
+                .into_iter()
+                .map(TrafficPolicy::try_from)
+                .collect::<anyhow::Result<_>>()?,
         })
     }
 }
@@ -130,6 +137,10 @@ impl SandboxStore {
                 self.by_workload.remove(workload_uid);
             }
         }
+    }
+
+    pub fn get(&self, id: &Strng) -> Option<Arc<Sandbox>> {
+        self.resources.get(id).cloned()
     }
 
     /// Return the Sandboxes bound to a Workload in binding arrival order.

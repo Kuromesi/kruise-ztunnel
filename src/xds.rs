@@ -345,6 +345,8 @@ impl Handler<agentio::sandbox::Sandbox> for ProxyStateUpdater {
                 XdsUpdate::Update(resource) => state.sandboxes.update(resource)?,
                 XdsUpdate::Remove(name) => state.sandboxes.remove(&name),
             }
+            // Reuse authorization notifications for TCP rechecks and firewall rebuilds.
+            state.policies.send();
             Ok(())
         })
     }

@@ -14,3 +14,4 @@
 
 pub mod discovery;
 pub mod sandbox;
+pub mod traffic_policy;
