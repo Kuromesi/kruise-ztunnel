@@ -237,7 +237,8 @@ pub fn resolve_workload_policies<'a>(
     Some((policies, policy_hash))
 }
 
-pub fn build_firewall_ruleset(policies: Vec<&Authorization>) -> RuleSet {
+pub fn build_firewall_ruleset(mut policies: Vec<&Authorization>) -> RuleSet {
+    policies.sort_by(|a, b| a.compare_traffic_policy(b));
     RuleSet {
         policy_attached: !policies.is_empty(),
         rules: policies

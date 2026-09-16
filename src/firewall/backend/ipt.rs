@@ -162,7 +162,8 @@ impl IptBackend {
         }
 
         let mut sorted_rules = ruleset.rules.clone();
-        sorted_rules.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.name.cmp(&b.name)));
+        // Stable sorting preserves namespace/name order and rule declaration order.
+        sorted_rules.sort_by_key(|rule| rule.priority);
 
         for rule in &sorted_rules {
             lines.extend(Self::render_rule(rule));

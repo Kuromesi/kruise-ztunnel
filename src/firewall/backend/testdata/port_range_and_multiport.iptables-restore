@@ -7,8 +7,8 @@
 -A ISTIO_FW_FILTER_OUT -o lo -j ACCEPT
 -A ISTIO_FW_FILTER_OUT -m owner --uid-owner 1337 -j RETURN
 -A ISTIO_FW_FILTER_OUT -m owner --gid-owner 1337 -j RETURN
--A ISTIO_FW_FILTER_OUT -p udp -m multiport --dports 80,443,9000:9100 -j ACCEPT
--A ISTIO_FW_FILTER_OUT -p sctp -m multiport --dports 80,443,9000:9100 -j ACCEPT
 -A ISTIO_FW_FILTER_IN -p udp --dport 8000:8080 -j REJECT
 -A ISTIO_FW_FILTER_IN -p sctp --dport 8000:8080 -j REJECT
+-A ISTIO_FW_FILTER_OUT -p udp -m multiport --dports 80,443,9000:9100 -j ACCEPT
+-A ISTIO_FW_FILTER_OUT -p sctp -m multiport --dports 80,443,9000:9100 -j ACCEPT
 COMMIT

@@ -134,6 +134,14 @@ pub fn should_firewall_handle(protocol: i32) -> bool {
 }
 
 impl Authorization {
+    /// Shared ordering for TCP evaluation and non-TCP firewall compilation.
+    pub fn compare_traffic_policy(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| self.namespace.cmp(&other.namespace))
+            .then_with(|| self.name.cmp(&other.name))
+    }
+
     pub fn to_key(&self) -> Strng {
         let mut res = String::with_capacity(1 + self.namespace.len() + self.name.len());
         res.push_str(&self.namespace);
