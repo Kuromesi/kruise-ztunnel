@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+
+# Copyright 2026 The Kruise Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Keep the runtime used by Agentio release-0.1, including the firewall tools.
+ARG BASE_IMAGE=gcr.io/istio-release/base:1.29-2026-04-09T19-02-21@sha256:0336dad724a520726f79cbcf3448a62b7f1f4a5dbb94923223233246f5026f22
+FROM ${BASE_IMAGE}
+
+WORKDIR /
+ARG TARGETARCH
+ARG ZTUNNEL_VERSION
+COPY --chmod=0755 ${TARGETARCH}/ztunnel /usr/local/bin/ztunnel
+ENV ISTIO_META_ISTIO_VERSION=${ZTUNNEL_VERSION}
+ENTRYPOINT ["/usr/local/bin/ztunnel"]
