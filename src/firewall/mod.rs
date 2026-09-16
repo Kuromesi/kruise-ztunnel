@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Firewall module - translates AuthorizationPolicy to netfilter rules
+//! Firewall module - translates TrafficPolicy to netfilter rules
 
 use std::time::Duration;
 
@@ -29,9 +29,7 @@ pub const DEFAULT_FIREWALL_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(1
 pub const DEFAULT_FIREWALL_MAX_DEBOUNCE_TIME: Duration = Duration::from_secs(1);
 
 pub use backend::{Backend, BackendBuilder, IptBackend, NftBackend};
-pub use convert::{
-    build_firewall_ruleset, collect_workload_policies, hash_policies, resolve_workload_firewall,
-};
+pub use convert::resolve_workload_firewall;
 pub use dedicated::FirewallController;
 pub use detect::{FirewallBackend, detect_backend};
 #[cfg(target_os = "linux")]

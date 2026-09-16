@@ -16,7 +16,7 @@ use super::*;
 use crate::sandbox::discovery::tests::Fixture;
 use crate::test_helpers::xds::{AdsConnection, AdsServer};
 use crate::xds::agentio::sandbox::{Sandbox, SandboxState, sandbox::Attester};
-use crate::xds::{ADDRESS_TYPE, AUTHORIZATION_TYPE, ProxyStateUpdater, SANDBOX_TYPE};
+use crate::xds::{ADDRESS_TYPE, ProxyStateUpdater, SANDBOX_TYPE, TRAFFIC_POLICY_TYPE};
 use prost::Message;
 use test_case::test_case;
 
@@ -27,7 +27,7 @@ async fn next_matching(
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let request = conn.rx.recv().await.expect("open ADS stream");
-            if request.type_url == SANDBOX_TYPE {
+            if request.type_url == SANDBOX_TYPE || request.type_url == TRAFFIC_POLICY_TYPE {
                 assert!(
                     request.resource_names_subscribe.is_empty(),
                     "Sandbox discovery must not send named subscriptions: {request:?}"
@@ -97,6 +97,10 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
             SANDBOX_TYPE,
             ProxyStateUpdater::new_no_fetch(fixture.state.clone()),
         )
+        .with_handler::<crate::xds::agentio::security::TrafficPolicy>(
+            TRAFFIC_POLICY_TYPE,
+            ProxyStateUpdater::new_no_fetch(fixture.state.clone()),
+        )
         .build(metrics, block_ready.unwrap());
     let demander = client.demander();
     assert_eq!(demander.is_some(), on_demand);
@@ -109,13 +113,11 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
 
     for _ in 0..3 {
         let initial = connection.rx.recv().await.unwrap();
-        if initial.type_url == SANDBOX_TYPE {
+        if initial.type_url == SANDBOX_TYPE || initial.type_url == TRAFFIC_POLICY_TYPE {
             assert!(initial.resource_names_subscribe.is_empty());
             assert!(initial.resource_names_unsubscribe.is_empty());
         } else {
-            assert!(
-                matches!(initial.type_url.as_str(), s if s == ADDRESS_TYPE || s == AUTHORIZATION_TYPE)
-            );
+            assert!(matches!(initial.type_url.as_str(), s if s == ADDRESS_TYPE));
             if initial.type_url == ADDRESS_TYPE && on_demand {
                 assert_eq!(initial.resource_names_subscribe, ["*"]);
                 assert_eq!(initial.resource_names_unsubscribe, ["*"]);
@@ -138,6 +140,55 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
     let _ = tokio::time::timeout(Duration::from_secs(5), ready.changed())
         .await
         .unwrap();
+
+    let policy_name = "namespaces/ns/trafficPolicies/shared";
+    let policy_response = |nonce: &str, malformed: bool, remove: bool| {
+        let mut response = response(nonce, vec![], vec![]);
+        response.type_url = TRAFFIC_POLICY_TYPE.to_string();
+        if remove {
+            response.removed_resources.push(policy_name.into());
+        } else {
+            response.resources.push(ProtoResource {
+                name: policy_name.into(),
+                version: "1".into(),
+                resource: Some(prost_types::Any {
+                    type_url: TRAFFIC_POLICY_TYPE.to_string(),
+                    value: if malformed {
+                        vec![0xff]
+                    } else {
+                        crate::xds::agentio::security::TrafficPolicy::default().encode_to_vec()
+                    },
+                }),
+                ..Default::default()
+            });
+        }
+        response
+    };
+    for (nonce, malformed, remove, present) in [
+        ("policy-malformed", true, false, false),
+        ("policy-ready", false, false, true),
+        ("policy-bad-update", true, false, true),
+        ("policy-removed", false, true, false),
+        ("policy-restored", false, false, true),
+    ] {
+        connection
+            .tx
+            .send(Ok(policy_response(nonce, malformed, remove)))
+            .await
+            .unwrap();
+        let ack = next_matching(&mut connection, |r| r.response_nonce == nonce).await;
+        assert_eq!(ack.error_detail.is_some(), malformed);
+        assert_eq!(
+            fixture
+                .state
+                .read()
+                .unwrap()
+                .traffic_policies
+                .get(&policy_name.into())
+                .is_some(),
+            present
+        );
+    }
 
     assert!(manager.fetch_attested_sandbox(&fixture.workload).is_none());
     let mut malformed = resource();
@@ -227,9 +278,24 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
         .await
         .unwrap()
         .unwrap();
-    let initial = next_matching(&mut reconnected, |r| r.type_url == SANDBOX_TYPE).await;
-    assert!(initial.resource_names_subscribe.is_empty());
-    assert!(initial.resource_names_unsubscribe.is_empty());
+    for _ in 0..2 {
+        let initial = next_matching(&mut reconnected, |r| {
+            r.type_url == SANDBOX_TYPE || r.type_url == TRAFFIC_POLICY_TYPE
+        })
+        .await;
+        assert!(initial.resource_names_subscribe.is_empty());
+        assert!(initial.resource_names_unsubscribe.is_empty());
+        if initial.type_url == TRAFFIC_POLICY_TYPE {
+            // ADS tracks known names and intentionally requests a fresh version on reconnect.
+            assert_eq!(
+                initial
+                    .initial_resource_versions
+                    .get(policy_name)
+                    .map(String::as_str),
+                Some("")
+            );
+        }
+    }
     connection = reconnected;
     assert!(manager.fetch_attested_sandbox(&fixture.workload).is_none());
     connection

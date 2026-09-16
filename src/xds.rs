@@ -340,15 +340,45 @@ impl Handler<agentio::sandbox::Sandbox> for ProxyStateUpdater {
         updates: Box<&mut dyn Iterator<Item = XdsUpdate<agentio::sandbox::Sandbox>>>,
     ) -> Result<(), Vec<RejectedConfig>> {
         let mut state = self.state.write().unwrap();
-        handle_single_resource(updates, |update| {
-            match update {
+        let mut changed = false;
+        let result = handle_single_resource(updates, |update| {
+            changed |= match update {
                 XdsUpdate::Update(resource) => state.sandboxes.update(resource)?,
                 XdsUpdate::Remove(name) => state.sandboxes.remove(&name),
-            }
-            // Reuse authorization notifications for TCP rechecks and firewall rebuilds.
-            state.policies.send();
+            };
             Ok(())
-        })
+        });
+        // Notify once for accepted policy/binding changes, including partial batches.
+        if changed {
+            state.policies.send();
+        }
+        result
+    }
+}
+
+impl Handler<agentio::security::TrafficPolicy> for ProxyStateUpdater {
+    fn no_on_demand(&self) -> bool {
+        true
+    }
+
+    fn handle(
+        &self,
+        updates: Box<&mut dyn Iterator<Item = XdsUpdate<agentio::security::TrafficPolicy>>>,
+    ) -> Result<(), Vec<RejectedConfig>> {
+        let mut state = self.state.write().unwrap();
+        let mut changed = false;
+        let result = handle_single_resource(updates, |update| {
+            changed |= match update {
+                XdsUpdate::Update(resource) => state.traffic_policies.update(resource)?,
+                XdsUpdate::Remove(name) => state.traffic_policies.remove(&name),
+            };
+            Ok(())
+        });
+        // Re-evaluate TCP connections and non-TCP firewalls against the shared store.
+        if changed {
+            state.policies.send();
+        }
+        result
     }
 }
 

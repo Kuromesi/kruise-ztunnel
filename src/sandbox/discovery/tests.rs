@@ -79,6 +79,84 @@ fn resource(id: &str, workload_uid: &str) -> XdsResource<XdsSandbox> {
 }
 
 #[test]
+fn config_dump_includes_sandbox_bindings_and_named_traffic_policies() {
+    use crate::xds::agentio::sandbox::PolicyReference;
+    use crate::xds::agentio::security::{
+        TrafficPolicy as XdsTrafficPolicy, traffic_policy as proto,
+    };
+    use serde_json::json;
+
+    let mut state = ProxyState::new(None);
+    let policy = XdsTrafficPolicy {
+        egress: Some(proto::RuleSet {
+            rules: vec![proto::Rule {
+                action: proto::Action::Deny.into(),
+                r#match: Some(proto::Match {
+                    destination_ips: vec![proto::Address {
+                        address: vec![10, 0, 0, 0],
+                        length: 8,
+                    }],
+                    ports: vec![proto::PortMatch {
+                        protocol: proto::Protocol::Tcp.into(),
+                        port: Some(80),
+                        end_port: Some(90),
+                    }],
+                    ..Default::default()
+                }),
+            }],
+        }),
+        ..Default::default()
+    };
+    let names = ["trafficPolicies/z", "trafficPolicies/a"];
+    for name in names {
+        state
+            .traffic_policies
+            .update(XdsResource {
+                name: name.into(),
+                resource: policy.clone(),
+            })
+            .unwrap();
+    }
+    for id in ["sandbox-z", "sandbox-a"] {
+        let mut sandbox = resource(id, "workload-uid");
+        sandbox.resource.traffic_policy = Some(policy.clone());
+        sandbox.resource.policy_refs.insert(
+            crate::xds::TRAFFIC_POLICY_TYPE.to_string(),
+            PolicyReference {
+                resource_names: names.iter().map(|name| name.to_string()).collect(),
+            },
+        );
+        state.sandboxes.update(sandbox).unwrap();
+    }
+
+    let dump = serde_json::to_value(&state).unwrap();
+    let sandbox = &dump["sandboxes"][0];
+    assert_eq!(sandbox["uid"], "sandbox-a");
+    assert_eq!(dump["sandboxes"][1]["uid"], "sandbox-z");
+    assert_eq!(sandbox["workloadUid"], "workload-uid");
+    // Resource output is sorted; policy references retain evaluation order.
+    assert_eq!(sandbox["trafficPolicyRefs"], json!(names));
+    assert_eq!(dump["trafficPolicies"][0]["name"], names[1]);
+    assert_eq!(dump["trafficPolicies"][1]["name"], names[0]);
+    let rule = json!({
+        "action": "Deny",
+        "sourceIps": [],
+        "destinationIps": ["10.0.0.0/8"],
+        "ports": [{"protocol": "TCP", "range": {"start": 80, "end": 90}}]
+    });
+    assert_eq!(sandbox["trafficPolicy"]["egress"]["rules"][0], rule);
+    assert_eq!(dump["trafficPolicies"][0]["egress"]["rules"][0], rule);
+
+    state.sandboxes.remove(&"sandbox-a".into());
+    state.traffic_policies.remove(&names[1].into());
+    let dump = serde_json::to_value(&state).unwrap();
+    assert_eq!(dump["sandboxes"].as_array().unwrap().len(), 1);
+    assert_eq!(dump["sandboxes"][0]["uid"], "sandbox-z");
+    assert_eq!(dump["trafficPolicies"].as_array().unwrap().len(), 1);
+    assert_eq!(dump["trafficPolicies"][0]["name"], names[0]);
+}
+
+#[test]
 fn sandboxes_are_grouped_by_workload_uid() {
     let f = Fixture::new();
     let second = Workload {

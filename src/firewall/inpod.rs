@@ -211,7 +211,7 @@ impl InpodFirewallController {
         let (ruleset, policy_hash) = {
             let state_guard = self.state.read();
             let Some((ruleset, policy_hash)) =
-                convert::resolve_workload_firewall(&state_guard, info)
+                convert::resolve_workload_firewall(&state_guard, info, None)
             else {
                 debug!(info = %info, "Workload not found in xDS state");
                 return (PodState::PendingWorkload, 0);
@@ -317,14 +317,13 @@ impl InpodFirewallController {
                 if matches!(pod_state.state, PodState::InitFailed { .. }) {
                     continue;
                 }
-                let Some((ruleset, policy_hash)) =
-                    convert::resolve_workload_firewall(&state_guard, &pod_state.workload_info)
-                else {
+                let Some((ruleset, policy_hash)) = convert::resolve_workload_firewall(
+                    &state_guard,
+                    &pod_state.workload_info,
+                    Some(pod_state.last_policy_hash),
+                ) else {
                     continue;
                 };
-                if policy_hash == pod_state.last_policy_hash {
-                    continue;
-                }
                 to_apply.push((
                     uid.clone(),
                     pod_state.netns.clone(),
@@ -417,9 +416,11 @@ impl InpodFirewallController {
                 let Some(pod_state) = self.pods.get(uid) else {
                     continue;
                 };
-                let Some((ruleset, policy_hash)) =
-                    convert::resolve_workload_firewall(&state_guard, &pod_state.workload_info)
-                else {
+                let Some((ruleset, policy_hash)) = convert::resolve_workload_firewall(
+                    &state_guard,
+                    &pod_state.workload_info,
+                    None,
+                ) else {
                     continue;
                 };
                 to_process.push((

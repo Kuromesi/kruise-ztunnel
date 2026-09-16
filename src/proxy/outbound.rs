@@ -2350,7 +2350,8 @@ mod tests {
                     uid: "sandbox-a".into(),
                     workload_uid: Some(workload.uid.clone()),
                     egress_routing: routing,
-                    traffic_policies: vec![],
+                    traffic_policy: Default::default(),
+                    traffic_policy_refs: Vec::new(),
                 };
                 assert!(
                     match_source_egress_policy(&workload, Some(&sandbox), &target("10.0.0.1:443"))
@@ -2978,17 +2979,15 @@ mod tests {
                 attester: Some(Attester {
                     workload_uid: fixture.workload.uid.to_string(),
                 }),
-                traffic_policies: vec![TrafficPolicy {
-                    name: "deny-egress".into(),
-                    priority: 1000,
-                    egress: Some(traffic_policy::PolicyRule {
+                traffic_policy: Some(TrafficPolicy {
+                    egress: Some(traffic_policy::RuleSet {
                         rules: vec![traffic_policy::Rule {
                             action: traffic_policy::Action::Deny.into(),
                             r#match: Some(traffic_policy::Match::default()),
                         }],
                     }),
                     ..Default::default()
-                }],
+                }),
                 ..Default::default()
             });
             assert_eq!(client.read(&mut received).await.unwrap(), 0);

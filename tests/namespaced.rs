@@ -31,7 +31,6 @@ mod namespaced {
     use std::str::FromStr;
     use std::thread::JoinHandle;
     use std::time::Duration;
-    use ztunnel::rbac::{Authorization, RbacMatch, StringMatch};
 
     use hyper::{Method, StatusCode};
     use hyper_util::rt::TokioIo;
@@ -977,83 +976,6 @@ mod namespaced {
             }
             Ok(())
         })
-    }
-
-    #[tokio::test]
-    async fn test_policy() -> anyhow::Result<()> {
-        let mut manager = setup_netns_test!(Shared);
-        let zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
-        manager
-            .add_policy(Authorization {
-                name: "deny_bypass".into(),
-                namespace: "default".into(),
-                scope: ztunnel::rbac::RbacScope::Namespace,
-                action: ztunnel::rbac::RbacAction::Allow,
-                rules: vec![vec![vec![RbacMatch {
-                    principals: vec![StringMatch::Exact(
-                        "spiffe://cluster.local/ns/default/sa/waypoint".into(),
-                    )],
-                    ..Default::default()
-                }]]],
-                dry_run: false,
-                ..Default::default()
-            })
-            .await?;
-        let _ = manager
-            .workload_builder("server", DEFAULT_NODE)
-            .register()
-            .await?;
-        let client = manager
-            .workload_builder("client", DEFAULT_NODE)
-            .uncaptured()
-            .register()
-            .await?;
-
-        let srv = resolve_target(manager.resolver(), "server");
-        client
-            .run(move || async move {
-                let builder =
-                    hyper::client::conn::http2::Builder::new(ztunnel::hyper_util::TokioExecutor);
-
-                let request = hyper::Request::builder()
-                    .uri(srv.to_string())
-                    .method(Method::CONNECT)
-                    .version(hyper::Version::HTTP_2)
-                    .body(Empty::<Bytes>::new())
-                    .unwrap();
-
-                let id = &identity::Identity::default();
-                let dst_id =
-                    identity::Identity::from_str("spiffe://cluster.local/ns/default/sa/server")
-                        .unwrap();
-                let cert = zt.cert_manager.fetch_certificate(id).await?;
-                let connector = cert.outbound_connector(vec![dst_id]).unwrap();
-                let hbone = SocketAddr::new(srv.ip(), 15008);
-                let tcp_stream = TcpStream::connect(hbone).await.unwrap();
-                let tls_stream = connector.connect(tcp_stream).await.unwrap();
-                let (mut request_sender, connection) =
-                    builder.handshake(TokioIo::new(tls_stream)).await.unwrap();
-                // spawn a task to poll the connection and drive the HTTP state
-                tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        error!("Error in HBONE connection handshake: {:?}", e);
-                    }
-                });
-
-                let response = request_sender.send_request(request).await.unwrap();
-                assert_eq!(response.status(), hyper::StatusCode::UNAUTHORIZED);
-                Ok(())
-            })?
-            .join()
-            .unwrap()?;
-        telemetry::testing::assert_contains(HashMap::from([
-            ("scope", "access"),
-            (
-                "error",
-                "connection closed due to policy rejection: allow policies exist, but none allowed",
-            ),
-        ]));
-        Ok(())
     }
 
     #[tokio::test]

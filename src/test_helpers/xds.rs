@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use crate::xds::istio::security::Authorization as XdsAuthorization;
+use crate::xds::agentio::security::TrafficPolicy as XdsTrafficPolicy;
 use crate::xds::istio::workload::Address as XdsAddress;
 use async_trait::async_trait;
 use futures::Stream;
@@ -124,7 +124,10 @@ impl AdsServer {
         ));
         let xds_client = xds::Config::new(Arc::new(cfg), tls_client_fetcher)
             .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, store_updater.clone())
-            .with_watched_handler::<XdsAuthorization>(xds::AUTHORIZATION_TYPE, store_updater)
+            .with_optional_watched_handler::<XdsTrafficPolicy>(
+                xds::TRAFFIC_POLICY_TYPE,
+                store_updater,
+            )
             .build(metrics, block_tx);
 
         (rx, xds_client, dstate, block_rx)

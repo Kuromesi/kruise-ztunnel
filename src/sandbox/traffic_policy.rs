@@ -12,9 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Native Sandbox TrafficPolicy evaluation and conversion to non-TCP firewall rules.
+//! Native TrafficPolicy evaluation and conversion to non-TCP firewall rules.
 
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
+
+use crate::strng::Strng;
+use crate::xds::XdsResource;
 
 use anyhow::{Context, ensure};
 use ipnet::IpNet;
@@ -22,24 +27,21 @@ use ipnet::IpNet;
 use crate::proxy::AuthorizationRejectionError;
 use crate::rbac::{Connection, Direction, RbacAction, RbacDecision};
 use crate::state::workload::byte_to_ip;
-use crate::strng::Strng;
 use crate::xds::agentio::security::{TrafficPolicy as XdsTrafficPolicy, traffic_policy as proto};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct TrafficPolicy {
-    pub name: Strng,
-    pub namespace: Strng,
-    pub priority: i32,
-    ingress: Option<PolicyRule>,
-    egress: Option<PolicyRule>,
+    ingress: Option<RuleSet>,
+    egress: Option<RuleSet>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PolicyRule {
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+struct RuleSet {
     rules: Vec<Rule>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Rule {
     action: RbacAction,
     source_ips: Vec<IpNet>,
@@ -47,10 +49,18 @@ struct Rule {
     ports: Vec<PortMatch>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 struct PortMatch {
+    #[serde(serialize_with = "serialize_protocol")]
     protocol: proto::Protocol,
     range: Option<RangeInclusive<u16>>,
+}
+
+fn serialize_protocol<S>(protocol: &proto::Protocol, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(protocol.as_str_name())
 }
 
 impl Rule {
@@ -72,72 +82,140 @@ impl Rule {
     }
 }
 
-impl PolicyRule {
-    fn evaluate_tcp(&self, conn: &Connection) -> RbacDecision {
-        match self.rules.iter().find(|rule| rule.matches_tcp(conn)) {
-            Some(rule) => match rule.action {
-                RbacAction::Allow => RbacDecision::Allow,
-                RbacAction::Deny => RbacDecision::Deny,
-            },
-            None => RbacDecision::NoMatch,
+/// Shared compiled bodies, replaced atomically after validation.
+#[derive(Debug, Default)]
+pub struct TrafficPolicyStore {
+    resources: HashMap<Strng, Arc<TrafficPolicy>>,
+}
+
+impl TrafficPolicyStore {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Strng, &TrafficPolicy)> {
+        self.resources
+            .iter()
+            .map(|(name, policy)| (name, policy.as_ref()))
+    }
+
+    pub fn get(&self, name: &Strng) -> Option<&TrafficPolicy> {
+        self.resources.get(name).map(AsRef::as_ref)
+    }
+
+    pub fn update(&mut self, update: XdsResource<XdsTrafficPolicy>) -> anyhow::Result<bool> {
+        let validation = (|| {
+            ensure!(
+                !update.name.is_empty() && update.name != "*",
+                "empty or wildcard TrafficPolicy name"
+            );
+            TrafficPolicy::try_from(update.resource)
+        })();
+        let policy = validation.map_err(|error| {
+            tracing::warn!(name = %update.name, %error, "ignoring invalid TrafficPolicy update; retaining last accepted resource");
+            error
+        })?;
+        if self.get(&update.name) == Some(&policy) {
+            return Ok(false);
         }
+        self.resources.insert(update.name, Arc::new(policy));
+        Ok(true)
+    }
+
+    pub fn remove(&mut self, name: &Strng) -> bool {
+        self.resources.remove(name).is_some()
     }
 }
 
-/// Evaluate the already ordered policy view against the original TCP connection.
-/// A configured direction defaults to deny only after all policies miss.
-/// NoMatch means this direction is absent and normal Istio authorization can run.
-pub fn assert_tcp(
-    policies: &[TrafficPolicy],
+#[cfg(test)]
+fn assert_tcp(
+    policy: &TrafficPolicy,
     conn: &Connection,
 ) -> Result<RbacDecision, AuthorizationRejectionError> {
+    assert_tcp_policies(std::iter::once(("inline", Some(policy))), conn)
+}
+
+/// Evaluate inline rules followed by ordered shared policies. A missing body is
+/// a deny barrier; preceding explicit decisions remain terminal.
+/// NoMatch means no policy configures this direction.
+pub fn assert_tcp_policies<'a>(
+    policies: impl IntoIterator<Item = (&'a str, Option<&'a TrafficPolicy>)>,
+    conn: &Connection,
+) -> Result<RbacDecision, AuthorizationRejectionError> {
+    let deny = |name: String| {
+        AuthorizationRejectionError::ExplicitlyDenied(crate::strng::EMPTY, name.into())
+    };
     let mut configured = false;
-    for policy in policies {
-        let Some(rules) = (match conn.direction {
+    for (name, policy) in policies {
+        let policy = policy.ok_or_else(|| {
+            AuthorizationRejectionError::ExplicitlyDenied(name.into(), "policy-unavailable".into())
+        })?;
+        let rules = match conn.direction {
             Direction::Inbound => &policy.ingress,
             Direction::Outbound => &policy.egress,
-        }) else {
+        };
+        let Some(rules) = rules else {
             continue;
         };
         configured = true;
-        match rules.evaluate_tcp(conn) {
-            RbacDecision::Allow => return Ok(RbacDecision::Allow),
-            RbacDecision::Deny => {
-                return Err(AuthorizationRejectionError::ExplicitlyDenied(
-                    policy.namespace.clone(),
-                    policy.name.clone(),
-                ));
+        for (index, rule) in rules.rules.iter().enumerate() {
+            if !rule.matches_tcp(conn) {
+                continue;
             }
-            RbacDecision::NoMatch => {}
+            return match rule.action {
+                RbacAction::Allow => {
+                    tracing::debug!(
+                        policy = name,
+                        rule = index,
+                        "TrafficPolicy allowed connection"
+                    );
+                    Ok(RbacDecision::Allow)
+                }
+                RbacAction::Deny => Err(AuthorizationRejectionError::ExplicitlyDenied(
+                    name.into(),
+                    format!("rule-{index}").into(),
+                )),
+            };
         }
     }
     if configured {
-        Err(AuthorizationRejectionError::ExplicitlyDenied(
-            crate::strng::EMPTY,
-            "SANDBOX-DEFAULT-DENY".into(),
-        ))
+        Err(deny("DEFAULT-DENY".into()))
     } else {
         Ok(RbacDecision::NoMatch)
     }
 }
 
+#[cfg(test)]
+fn firewall_ruleset(policy: &TrafficPolicy) -> crate::firewall::RuleSet {
+    firewall_rulesets(std::iter::once(("inline", Some(policy))))
+}
+
 /// Feed native policies into the same netfilter backends used by Workload policies.
-pub fn firewall_ruleset(policies: &[TrafficPolicy]) -> crate::firewall::RuleSet {
+pub fn firewall_rulesets<'a>(
+    policies: impl Iterator<Item = (&'a str, Option<&'a TrafficPolicy>)> + Clone,
+) -> crate::firewall::RuleSet {
     use crate::firewall::{
         Direction as FirewallDirection, FirewallMatch, FirewallProtocol, FirewallRule, PortGroup,
-        RuleAction, RuleSet,
+        RuleAction,
     };
 
     let mut rules = Vec::new();
-    for policy in policies {
-        for (direction, body) in [
-            (FirewallDirection::Inbound, &policy.ingress),
-            (FirewallDirection::Outbound, &policy.egress),
-        ] {
+    for direction in [FirewallDirection::Inbound, FirewallDirection::Outbound] {
+        let mut configured = false;
+        let mut default_deny_name = "DEFAULT-DENY".into();
+        let mut offset = 0;
+        for (name, policy) in policies.clone() {
+            let Some(policy) = policy else {
+                // Unknown directions cannot safely fall through to later policies.
+                configured = true;
+                default_deny_name = format!("{name}/policy-unavailable").into();
+                break;
+            };
+            let body = match direction {
+                FirewallDirection::Inbound => &policy.ingress,
+                FirewallDirection::Outbound => &policy.egress,
+            };
             let Some(body) = body else {
                 continue;
             };
-            for rule in &body.rules {
+            configured = true;
+            for (index, rule) in body.rules.iter().enumerate() {
                 let port_groups: Vec<_> = rule
                     .ports
                     .iter()
@@ -159,13 +237,14 @@ pub fn firewall_ruleset(policies: &[TrafficPolicy]) -> crate::firewall::RuleSet 
                     continue;
                 }
                 rules.push(FirewallRule {
-                    name: policy.name.clone(),
+                    name: format!("{name}/rule-{index}").into(),
                     action: match rule.action {
                         RbacAction::Allow => RuleAction::Allow,
                         RbacAction::Deny => RuleAction::Deny,
                     },
                     direction,
-                    priority: policy.priority,
+                    // The shared backend sorts rules. Preserve control-plane order.
+                    priority: (offset + index) as i32,
                     clauses: vec![vec![FirewallMatch {
                         source_ips: rule.source_ips.clone(),
                         dest_ips: rule.destination_ips.clone(),
@@ -173,12 +252,33 @@ pub fn firewall_ruleset(policies: &[TrafficPolicy]) -> crate::firewall::RuleSet 
                     }]],
                 });
             }
+            offset += body.rules.len();
         }
+        if !configured {
+            continue;
+        }
+        // A configured direction always defaults to deny, even with no rules
+        // or only TCP rules. Leave absent directions untouched.
+        rules.push(FirewallRule {
+            name: default_deny_name,
+            action: RuleAction::Deny,
+            direction,
+            priority: i32::MAX,
+            clauses: vec![vec![FirewallMatch {
+                port_groups: vec![PortGroup {
+                    protocol: FirewallProtocol::NonTcp,
+                    ports: vec![],
+                }],
+                source_ips: vec![],
+                dest_ips: vec![],
+            }]],
+        });
     }
-    RuleSet {
+    crate::firewall::RuleSet {
         rules,
-        // Preserve the existing Workload firewall's default-deny behavior.
-        policy_attached: !policies.is_empty(),
+        // Per-direction defaults are explicit rules; this flag is the legacy
+        // Workload policy's bidirectional default.
+        policy_attached: false,
     }
 }
 
@@ -186,43 +286,25 @@ impl TryFrom<XdsTrafficPolicy> for TrafficPolicy {
     type Error = anyhow::Error;
 
     fn try_from(resource: XdsTrafficPolicy) -> Result<Self, Self::Error> {
-        ensure!(!resource.name.is_empty(), "empty TrafficPolicy name");
-        ensure!(resource.priority >= 0, "negative TrafficPolicy priority");
-        let scope = proto::Scope::try_from(resource.scope)?;
-        ensure!(
-            scope != proto::Scope::Namespace || !resource.namespace.is_empty(),
-            "NAMESPACE TrafficPolicy requires a namespace"
-        );
-        ensure!(
-            scope != proto::Scope::Global || resource.namespace.is_empty(),
-            "GLOBAL TrafficPolicy must not specify a namespace"
-        );
-        ensure!(
-            resource.ingress.is_some() || resource.egress.is_some(),
-            "TrafficPolicy requires at least one direction"
-        );
         Ok(Self {
             ingress: resource
                 .ingress
-                .map(PolicyRule::try_from)
+                .map(RuleSet::try_from)
                 .transpose()
-                .with_context(|| format!("TrafficPolicy {} ingress", resource.name))?,
+                .context("TrafficPolicy ingress")?,
             egress: resource
                 .egress
-                .map(PolicyRule::try_from)
+                .map(RuleSet::try_from)
                 .transpose()
-                .with_context(|| format!("TrafficPolicy {} egress", resource.name))?,
-            name: resource.name.into(),
-            namespace: resource.namespace.into(),
-            priority: resource.priority,
+                .context("TrafficPolicy egress")?,
         })
     }
 }
 
-impl TryFrom<proto::PolicyRule> for PolicyRule {
+impl TryFrom<proto::RuleSet> for RuleSet {
     type Error = anyhow::Error;
 
-    fn try_from(value: proto::PolicyRule) -> Result<Self, Self::Error> {
+    fn try_from(value: proto::RuleSet) -> Result<Self, Self::Error> {
         Ok(Self {
             rules: value
                 .rules

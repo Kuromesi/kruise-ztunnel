@@ -15,7 +15,7 @@
 
 use crate::identity::{Identity, SecretManager};
 use crate::proxy::{Error, OnDemandDnsLabels};
-use crate::rbac::{Authorization, Direction, RbacDecision};
+use crate::rbac::Authorization;
 use crate::sandbox::{discovery::Sandbox, traffic_policy};
 use crate::state::policy::PolicyStore;
 use crate::state::service::{
@@ -28,7 +28,6 @@ use crate::state::workload::{
 };
 use crate::strng::Strng;
 use crate::tls;
-use crate::xds::istio::security::Authorization as XdsAuthorization;
 use crate::xds::istio::workload::Address as XdsAddress;
 use crate::xds::{AdsClient, Demander, LocalClient, ProxyStateUpdater};
 use crate::{cert_fetcher, config, rbac, xds};
@@ -51,7 +50,6 @@ use std::str::FromStr;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
 use tracing::{debug, trace, warn};
-use xds::kruise::networking::extensions::v1::TrafficPolicyMode;
 
 use self::workload::ApplicationTunnel;
 
@@ -198,6 +196,8 @@ pub struct ProxyState {
     pub policies: PolicyStore,
 
     pub sandboxes: crate::sandbox::discovery::SandboxStore,
+
+    pub traffic_policies: traffic_policy::TrafficPolicyStore,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -206,7 +206,16 @@ struct ProxyStateSerialization<'a> {
     workloads: Vec<Arc<Workload>>,
     services: Vec<Arc<Service>>,
     policies: Vec<Authorization>,
+    sandboxes: Vec<&'a crate::sandbox::discovery::Sandbox>,
+    traffic_policies: Vec<NamedTrafficPolicy<'a>>,
     staged_services: &'a HashMap<NamespacedHostname, HashMap<Strng, Endpoint>>,
+}
+
+#[derive(serde::Serialize, Debug)]
+struct NamedTrafficPolicy<'a> {
+    name: &'a Strng,
+    #[serde(flatten)]
+    policy: &'a traffic_policy::TrafficPolicy,
 }
 
 impl serde::Serialize for ProxyState {
@@ -244,6 +253,18 @@ impl serde::Serialize for ProxyState {
             workloads,
             services,
             policies,
+            sandboxes: self
+                .sandboxes
+                .iter()
+                .map(AsRef::as_ref)
+                .sorted_by(|a, b| a.uid.cmp(&b.uid))
+                .collect(),
+            traffic_policies: self
+                .traffic_policies
+                .iter()
+                .sorted_by_key(|(name, _)| *name)
+                .map(|(name, policy)| NamedTrafficPolicy { name, policy })
+                .collect(),
             staged_services: &self.services.staged_services,
         };
         serializable.serialize(serializer)
@@ -257,6 +278,7 @@ impl ProxyState {
             services: Default::default(),
             policies: Default::default(),
             sandboxes: Default::default(),
+            traffic_policies: Default::default(),
         }
     }
 
@@ -562,151 +584,30 @@ impl DemandProxyState {
         &self,
         ctx: &ProxyRbacContext,
     ) -> Result<(), proxy::AuthorizationRejectionError> {
-        let wl = ctx.workload.clone();
         let conn = &ctx.conn;
         let state = self.read();
+        // Rechecks resolve the current Sandbox binding and policies.
+        let workload_uid = &ctx.workload.uid;
         let sandbox = match &ctx.sandbox {
             Some(sandbox) => state
                 .sandboxes
                 .get(&sandbox.uid)
-                .filter(|s| s.workload_uid.as_ref() == Some(&wl.uid)),
-            // Connections opened before discovery also pick up the Workload's policies.
-            None => state.sandboxes.get_by_workload(&wl.uid).first().cloned(),
+                .filter(|s| s.workload_uid.as_ref() == Some(workload_uid)),
+            // Connections opened before discovery also use the current binding.
+            None => state
+                .sandboxes
+                .get_by_workload(workload_uid)
+                .first()
+                .cloned(),
         };
-        if let Some(sandbox) = &sandbox
-            && matches!(
-                traffic_policy::assert_tcp(&sandbox.traffic_policies, conn)?,
-                RbacDecision::Allow
+        match sandbox {
+            Some(sandbox) => traffic_policy::assert_tcp_policies(
+                sandbox.traffic_policies(&state.traffic_policies),
+                conn,
             )
-        {
-            // Match Workload TrafficPolicy: an explicit ALLOW ends authorization.
-            return Ok(());
+            .map(|_| ()),
+            None => Ok(()),
         }
-
-        // We can get policies from namespace, global, and workload...
-        let ns = state.policies.get_by_namespace(&wl.namespace);
-        let global = state.policies.get_by_namespace(&crate::strng::EMPTY);
-        let workload = wl.authorization_policies.iter();
-
-        // Aggregate all policies
-        let all_policies: Vec<&Authorization> = ns
-            .iter()
-            .chain(global.iter())
-            .chain(workload)
-            .filter_map(|k| {
-                let pol = state.policies.get(k)?;
-                // Sandbox replaces legacy Agentio TrafficPolicy. Istio policies are
-                // consulted only when this direction has no native TrafficPolicy.
-                if sandbox.is_some() && pol.priority.is_some() {
-                    return None;
-                }
-                // Filter by direction: inbound skips server-mode, outbound skips client-mode
-                let skip = match (ctx.conn.direction, pol.mode) {
-                    (Direction::Inbound, TrafficPolicyMode::Client) => true,
-                    (Direction::Outbound, TrafficPolicyMode::Server) => true,
-                    _ => false,
-                };
-                if skip { None } else { Some(pol) }
-            })
-            .collect();
-
-        // Split into priority and non-priority policies
-        let (mut priority_policies, non_priority_policies): (Vec<_>, Vec<_>) =
-            all_policies.into_iter().partition(|p| p.priority.is_some());
-        priority_policies.sort_by(|a, b| a.compare_traffic_policy(b));
-
-        for pol in priority_policies.iter() {
-            debug!(policy = pol.to_key().as_str(), "traffic policy matching");
-            match pol.match_with_decision(conn) {
-                RbacDecision::Allow => {
-                    debug!(
-                        policy = pol.to_key().as_str(),
-                        "traffic policy match allowed"
-                    );
-                    return Ok(());
-                }
-                RbacDecision::Deny => {
-                    debug!(
-                        policy = pol.to_key().as_str(),
-                        "traffic policy match denied"
-                    );
-                    return Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
-                        pol.namespace.to_owned(),
-                        pol.name.to_owned(),
-                    ));
-                }
-                RbacDecision::NoMatch => {
-                    continue;
-                }
-            }
-        }
-        if !priority_policies.is_empty() {
-            return Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
-                "".into(),
-                "DEFAULT-DENY".into(),
-            ));
-        }
-
-        // Second round: no priority policy matched, fall back to non-priority policies
-        let (all_allow, all_deny): (Vec<_>, Vec<_>) = non_priority_policies
-            .into_iter()
-            .partition(|p| p.action == rbac::RbacAction::Allow);
-
-        let (deny, deny_dry_run): (Vec<&Authorization>, Vec<&Authorization>) =
-            all_deny.iter().partition(|p| !p.dry_run);
-        let (allow, allow_dry_run): (Vec<&Authorization>, Vec<&Authorization>) =
-            all_allow.iter().partition(|p| !p.dry_run);
-
-        trace!(
-            allow = allow.len(),
-            deny = deny.len(),
-            "checking connection"
-        );
-
-        // Allow and deny logic follows https://istio.io/latest/docs/reference/config/security/authorization-policy/
-
-        for pol in deny_dry_run.iter() {
-            if pol.matches(conn) {
-                debug!(policy = pol.to_key().as_str(), "dry-run deny policy match");
-            }
-        }
-        // "If there are any DENY policies that match the request, deny the request."
-        for pol in deny.iter() {
-            if pol.matches(conn) {
-                debug!(policy = pol.to_key().as_str(), "deny policy match");
-                return Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
-                    pol.namespace.to_owned(),
-                    pol.name.to_owned(),
-                ));
-            } else {
-                trace!(policy = pol.to_key().as_str(), "deny policy does not match");
-            }
-        }
-        for pol in allow_dry_run.iter() {
-            if pol.matches(conn) {
-                debug!(policy = pol.to_key().as_str(), "dry-run allow policy match");
-            }
-        }
-        // "If there are no ALLOW policies for the workload, allow the request."
-        if allow.is_empty() {
-            debug!("no allow policies, allow");
-            return Ok(());
-        }
-        // "If any of the ALLOW policies match the request, allow the request."
-        for pol in allow.iter() {
-            if pol.matches(conn) {
-                debug!(policy = pol.to_key().as_str(), "allow policy match");
-                return Ok(());
-            } else {
-                trace!(
-                    policy = pol.to_key().as_str(),
-                    "allow policy does not match"
-                );
-            }
-        }
-        // "Deny the request."
-        debug!("no allow policies matched");
-        Err(proxy::AuthorizationRejectionError::NotAllowed)
     }
 
     // Select a workload IP, with DNS resolution if needed
@@ -1182,7 +1083,10 @@ impl ProxyStateManager {
             ));
             let mut builder = xds::Config::new(config.clone(), tls_client_fetcher)
                 .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, updater.clone())
-                .with_watched_handler::<XdsAuthorization>(xds::AUTHORIZATION_TYPE, updater.clone());
+                .with_optional_watched_handler::<xds::agentio::security::TrafficPolicy>(
+                    xds::TRAFFIC_POLICY_TYPE,
+                    updater.clone(),
+                );
             if config.enable_sandbox_manager {
                 builder = builder.with_optional_watched_handler::<xds::agentio::sandbox::Sandbox>(
                     xds::SANDBOX_TYPE,
@@ -1232,7 +1136,6 @@ mod tests {
     use crate::state::service::{EndpointSet, LoadBalancer, LoadBalancerHealthPolicy};
     use crate::state::workload::{HealthStatus, Locality};
     use prometheus_client::registry::Registry;
-    use rbac::StringMatch;
     use std::{net::Ipv4Addr, net::SocketAddrV4, time::Duration};
 
     use self::workload::{ApplicationTunnel, application_tunnel::Protocol as AppProtocol};
@@ -1586,280 +1489,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn traffic_policy_order_tcp_and_firewall() {
-        use crate::firewall::{IptBackend, NftBackend, build_firewall_ruleset};
-        use crate::xds::kruise::networking::extensions::v1::TrafficPolicyExtension;
-        use prost::Message as _;
-
-        let policy = |name: &str, namespace: &str, priority, deny| {
-            let extension = TrafficPolicyExtension {
-                priority,
-                mode: TrafficPolicyMode::Client as i32,
-            };
-            let mut auth = Authorization::try_from(XdsAuthorization {
-                name: name.into(),
-                namespace: namespace.into(),
-                scope: if namespace == "ns1" { 1 } else { 0 },
-                auth_extensions: vec![crate::xds::istio::security::Extension {
-                    name: "traffic-policy".into(),
-                    config: Some(prost_types::Any {
-                        type_url: "type.googleapis.com/kruise.networking.extensions.v1.TrafficPolicyExtension".into(),
-                        value: extension.encode_to_vec(),
-                    }),
-                }],
-                ..Default::default()
-            }).unwrap();
-            // Both policies match every destination, with opposing decisions.
-            let addresses = vec!["0.0.0.0/0".parse().unwrap()];
-            auth.rules = vec![vec![vec![if deny {
-                rbac::RbacMatch {
-                    not_destination_ips: addresses,
-                    ..Default::default()
-                }
-            } else {
-                rbac::RbacMatch {
-                    destination_ips: addresses,
-                    ..Default::default()
-                }
-            }]]];
-            auth
-        };
-        let cases = vec![
-            (
-                "priority before identity",
-                policy("a-egress", "a-root", 20, false),
-                policy("z-egress", "ns1", 10, true),
-                false,
-            ),
-            (
-                "namespace before name",
-                policy("a-egress", "ns1", 10, false),
-                policy("z-egress", "istio-system", 10, true),
-                false,
-            ),
-            (
-                "namespace before scope",
-                policy("z-egress", "ns1", 10, false),
-                policy("a-egress", "z-root", 10, true),
-                true,
-            ),
-            (
-                "namespace prefix uses separate fields",
-                policy("z-egress", "ns1", 10, false),
-                policy("a-egress", "ns1-a", 10, true),
-                true,
-            ),
-            (
-                "name orders deny first",
-                policy("z-egress", "ns1", 10, false),
-                policy("a-egress", "ns1", 10, true),
-                false,
-            ),
-            (
-                "name orders allow first",
-                policy("a-egress", "ns1", 10, false),
-                policy("z-egress", "ns1", 10, true),
-                true,
-            ),
-            (
-                "use Authorization name including suffix",
-                policy("a-egress", "ns1", 10, false),
-                policy("a-a-egress", "ns1", 10, true),
-                false,
-            ),
-        ];
-        for (scenario, allow, deny, allowed) in cases {
-            for direction in [Direction::Inbound, Direction::Outbound] {
-                // Arrival order and hash iteration must not determine the result.
-                for reverse in [false, true] {
-                    let mut policies = vec![allow.clone(), deny.clone()];
-                    if reverse {
-                        policies.reverse();
-                    }
-                    let mut state = ProxyState::new(None);
-                    state.workloads.insert(Arc::new(create_workload(1)));
-                    for pol in &mut policies {
-                        pol.mode = match direction {
-                            Direction::Inbound => TrafficPolicyMode::Server,
-                            Direction::Outbound => TrafficPolicyMode::Client,
-                        };
-                        state.policies.insert(pol.to_key(), pol.clone());
-                    }
-                    let state = create_state(state);
-                    let mut ctx = get_rbac_context(&state, 1, "defaultacct");
-                    ctx.conn.direction = direction;
-                    assert_eq!(
-                        state.assert_rbac(&ctx).await.is_ok(),
-                        allowed,
-                        "{scenario}/{direction:?}"
-                    );
-
-                    let rules = build_firewall_ruleset(policies.iter().collect());
-                    let first = if allowed {
-                        allow.to_key()
-                    } else {
-                        deny.to_key()
-                    };
-                    assert_eq!(rules.rules[0].name, first, "{scenario}/{direction:?}");
-                    for (rendered, accept, reject) in [
-                        (
-                            IptBackend::new().render_ruleset(&rules),
-                            "-j ACCEPT",
-                            "-j REJECT",
-                        ),
-                        (
-                            NftBackend::new().render_ruleset(&rules),
-                            " accept ",
-                            " reject ",
-                        ),
-                    ] {
-                        let policy_lines: Vec<_> = rendered
-                            .lines()
-                            .filter(|line| line.contains("0.0.0.0/0"))
-                            .collect();
-                        assert_eq!(
-                            policy_lines.len(),
-                            2,
-                            "{scenario}/{direction:?}:\n{rendered}"
-                        );
-                        assert!(
-                            policy_lines[0].contains(if allowed { accept } else { reject }),
-                            "{scenario}/{direction:?}:\n{rendered}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn create_dry_run_wildcard_rbac_policy(action: rbac::RbacAction) -> rbac::Authorization {
-        rbac::Authorization {
-            action,
-            namespace: "ns1".into(),
-            name: "wildcard".into(),
-            rules: vec![vec![]],
-            scope: rbac::RbacScope::Namespace,
-            dry_run: true,
-            ..Default::default()
-        }
-    }
-
-    // test that we confirm with https://istio.io/latest/docs/reference/config/security/authorization-policy/.
-    // We don't test #1 as ztunnel doesn't support custom policies.
-    // 1. If there are any CUSTOM policies that match the request, evaluate and deny the request if the evaluation result is deny.
-    // 2. If there are any DENY policies that match the request, deny the request.
-    // 3. If there are no ALLOW policies for the workload, allow the request.
-    // 4. If any of the ALLOW policies match the request, allow the request.
-    // 5. Deny the request.
-    #[tokio::test]
-    async fn assert_rbac_logic_deny_allow() {
-        let mut state = ProxyState::new(None);
-        state.workloads.insert(Arc::new(create_workload(1)));
-        state.workloads.insert(Arc::new(create_workload(2)));
-        // Dry run policies should have no effect.
-        state.policies.insert(
-            "wildcard-allow".into(),
-            create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Allow),
-        );
-        state.policies.insert(
-            "wildcard-deny".into(),
-            create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Deny),
-        );
-        state.policies.insert(
-            "allow".into(),
-            rbac::Authorization {
-                action: rbac::RbacAction::Allow,
-                namespace: "ns1".into(),
-                name: "foo".into(),
-                rules: vec![
-                    // rule1:
-                    vec![
-                        // from:
-                        vec![rbac::RbacMatch {
-                            principals: vec![StringMatch::Exact(
-                                "cluster.local/ns/default/sa/defaultacct".into(),
-                            )],
-                            ..Default::default()
-                        }],
-                    ],
-                ],
-                scope: rbac::RbacScope::Namespace,
-                dry_run: false,
-                ..Default::default()
-            },
-        );
-        state.policies.insert(
-            "deny".into(),
-            rbac::Authorization {
-                action: rbac::RbacAction::Deny,
-                namespace: "ns1".into(),
-                name: "deny".into(),
-                rules: vec![
-                    // rule1:
-                    vec![
-                        // from:
-                        vec![rbac::RbacMatch {
-                            principals: vec![StringMatch::Exact(
-                                "cluster.local/ns/default/sa/denyacct".into(),
-                            )],
-                            ..Default::default()
-                        }],
-                    ],
-                ],
-                scope: rbac::RbacScope::Namespace,
-                dry_run: false,
-                ..Default::default()
-            },
-        );
-
-        let mock_proxy_state = create_state(state);
-
-        // test workload in ns2. this should work as ns2 doesn't have any policies. this tests:
-        // 3. If there are no ALLOW policies for the workload, allow the request.
-        assert!(
-            mock_proxy_state
-                .assert_rbac(&get_rbac_context(&mock_proxy_state, 2, "not-defaultacct"))
-                .await
-                .is_ok()
-        );
-
-        let ctx = get_rbac_context(&mock_proxy_state, 1, "defaultacct");
-        // 4. if any allow policies match, allow
-        assert!(mock_proxy_state.assert_rbac(&ctx).await.is_ok());
-
-        {
-            // test a src workload with unknown svc account. this should fail as we have allow policies,
-            // but they don't match.
-            // 5. deny the request
-            let mut ctx = ctx.clone();
-            ctx.conn.src_identity = Some(Identity::Spiffe {
-                trust_domain: "cluster.local".into(),
-                namespace: "default".into(),
-                service_account: "not-defaultacct".into(),
-            });
-
-            assert_eq!(
-                mock_proxy_state.assert_rbac(&ctx).await.err().unwrap(),
-                proxy::AuthorizationRejectionError::NotAllowed
-            );
-        }
-        {
-            let mut ctx = ctx.clone();
-            ctx.conn.src_identity = Some(Identity::Spiffe {
-                trust_domain: "cluster.local".into(),
-                namespace: "default".into(),
-                service_account: "denyacct".into(),
-            });
-
-            // 2. If there are any DENY policies that match the request, deny the request.
-            assert_eq!(
-                mock_proxy_state.assert_rbac(&ctx).await.err().unwrap(),
-                proxy::AuthorizationRejectionError::ExplicitlyDenied("ns1".into(), "deny".into())
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn assert_rbac_with_dest_workload_info() {
         let mut state = ProxyState::new(None);
         state.workloads.insert(Arc::new(create_workload(1)));
@@ -1868,113 +1497,6 @@ mod tests {
 
         let ctx = get_rbac_context(&mock_proxy_state, 1, "defaultacct");
         assert!(mock_proxy_state.assert_rbac(&ctx).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn assert_rbac_dry_run_with_real_policies() {
-        initialize_telemetry();
-        crate::telemetry::set_level(true, "debug").ok();
-
-        let mut state = ProxyState::new(None);
-        state.workloads.insert(Arc::new(create_workload(1)));
-
-        // Real deny policy that matches denyacct
-        state.policies.insert(
-            "real-deny".into(),
-            rbac::Authorization {
-                action: rbac::RbacAction::Deny,
-                namespace: "ns1".into(),
-                name: "real-deny".into(),
-                rules: vec![vec![vec![rbac::RbacMatch {
-                    principals: vec![StringMatch::Exact(
-                        "cluster.local/ns/default/sa/denyacct".into(),
-                    )],
-                    ..Default::default()
-                }]]],
-                scope: rbac::RbacScope::Namespace,
-                dry_run: false,
-                ..Default::default()
-            },
-        );
-
-        // Dry-run deny policy that matches both defaultacct and denyacct
-        state.policies.insert(
-            "dry-run-deny".into(),
-            rbac::Authorization {
-                action: rbac::RbacAction::Deny,
-                namespace: "ns1".into(),
-                name: "dry-run-deny".into(),
-                rules: vec![
-                    vec![vec![rbac::RbacMatch {
-                        principals: vec![StringMatch::Exact(
-                            "cluster.local/ns/default/sa/defaultacct".into(),
-                        )],
-                        ..Default::default()
-                    }]],
-                    vec![vec![rbac::RbacMatch {
-                        principals: vec![StringMatch::Exact(
-                            "cluster.local/ns/default/sa/denyacct".into(),
-                        )],
-                        ..Default::default()
-                    }]],
-                ],
-                scope: rbac::RbacScope::Namespace,
-                dry_run: true,
-                ..Default::default()
-            },
-        );
-
-        // Real allow policy that matches defaultacct
-        state.policies.insert(
-            "real-allow".into(),
-            rbac::Authorization {
-                action: rbac::RbacAction::Allow,
-                namespace: "ns1".into(),
-                name: "real-allow".into(),
-                rules: vec![vec![vec![rbac::RbacMatch {
-                    principals: vec![StringMatch::Exact(
-                        "cluster.local/ns/default/sa/defaultacct".into(),
-                    )],
-                    ..Default::default()
-                }]]],
-                scope: rbac::RbacScope::Namespace,
-                dry_run: false,
-                ..Default::default()
-            },
-        );
-
-        // Dry-run allow policy that matches defaultacct
-        state.policies.insert(
-            "dry-run-allow".into(),
-            rbac::Authorization {
-                action: rbac::RbacAction::Allow,
-                namespace: "ns1".into(),
-                name: "dry-run-allow".into(),
-                rules: vec![vec![vec![rbac::RbacMatch {
-                    principals: vec![StringMatch::Exact(
-                        "cluster.local/ns/default/sa/defaultacct".into(),
-                    )],
-                    ..Default::default()
-                }]]],
-                scope: rbac::RbacScope::Namespace,
-                dry_run: true,
-                ..Default::default()
-            },
-        );
-
-        let mock_proxy_state = create_state(state);
-
-        let ctx = get_rbac_context(&mock_proxy_state, 1, "defaultacct");
-        assert!(mock_proxy_state.assert_rbac(&ctx).await.is_ok());
-
-        crate::telemetry::testing::assert_contains(std::collections::HashMap::from([
-            ("policy", "ns1/dry-run-deny"),
-            ("message", "dry-run deny policy match"),
-        ]));
-        crate::telemetry::testing::assert_contains(std::collections::HashMap::from([
-            ("policy", "ns1/dry-run-allow"),
-            ("message", "dry-run allow policy match"),
-        ]));
     }
 
     #[tokio::test]

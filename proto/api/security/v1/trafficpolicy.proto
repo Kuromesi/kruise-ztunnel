@@ -18,25 +18,23 @@ package agentio.security;
 
 option go_package = "github.com/openkruise/agentio/api/security/v1;securityv1";
 
-// One compiled TrafficPolicy/GlobalTrafficPolicy, retaining both directions.
-// Selection and explicit attachment are resolved before publication.
+// Traffic rules carried inline in a Sandbox or published as an independent
+// xDS resource. The resource name is carried by xDS, not this message.
+// Independent resource names follow the AIP-122 path convention:
+// - TrafficPolicy: namespaces/{namespace}/trafficPolicies/{name}.
+// - GlobalTrafficPolicy: trafficPolicies/{name}.
+// Namespace and name are the source object's identifiers. Selectors affect
+// attachment, not resource identity. Inline rules have no independent name.
+// Selection and ordering of predefined policies are resolved by the control
+// plane and published in Sandbox.policy_refs.
 message TrafficPolicy {
-  // Stable identity, e.g. trafficpolicy/demo/internet or
-  // globaltrafficpolicy/platform-baseline.
-  string name = 1;
-  // Source namespace; required for NAMESPACE scope.
-  // Empty for a cluster-scoped GlobalTrafficPolicy.
-  string namespace = 2;
-  // Nonnegative; lower values are evaluated first.
-  // The compiler materializes the source default (1000).
-  int32 priority = 3;
-  // Absent = direction not configured; present with no rules = no rule matches.
-  PolicyRule ingress = 4;
-  PolicyRule egress = 5;
-  // GLOBAL: applies to all workloads; NAMESPACE: applies within namespace.
-  // WORKLOAD_SELECTOR: applies through control-plane-generated workload refs,
-  // including selector-based GlobalTrafficPolicies. Do not infer scope from name.
-  Scope scope = 6;
+  // Absent = this policy does not configure the direction.
+  // Present (including an empty rule set) = this direction is configured.
+  // First matching rule wins; no match continues to the next referenced policy.
+  // Default deny applies only after every inline/referenced policy misses,
+  // provided at least one policy configures this direction.
+  RuleSet ingress = 1;
+  RuleSet egress = 2;
 
   // An IPv4 or IPv6 network prefix.
   message Address {
@@ -44,12 +42,6 @@ message TrafficPolicy {
     bytes address = 1;
     // Prefix length: 0..32 for IPv4, 0..128 for IPv6.
     uint32 length = 2;
-  }
-
-  enum Scope {
-    GLOBAL = 0;
-    NAMESPACE = 1;
-    WORKLOAD_SELECTOR = 2;
   }
 
   enum Action {
@@ -65,9 +57,9 @@ message TrafficPolicy {
     SCTP = 4;
   }
 
-  message PolicyRule {
-    // First matching rule wins, in declaration order.
-    // No match continues to the next policy; no per-policy default.
+  message RuleSet {
+    // Declaration order within this policy. A matching ALLOW or DENY is terminal.
+    // No per-policy default action.
     repeated Rule rules = 1;
   }
 

@@ -339,8 +339,8 @@ mod tests {
     use crate::rbac::Connection;
     use crate::state::{DemandProxyState, ProxyState};
     use crate::test_helpers::test_default_workload;
-    use crate::xds::ProxyStateUpdateMutator;
-    use crate::xds::istio::security::{Action, Authorization, Scope};
+    use crate::xds::agentio::security::{TrafficPolicy, traffic_policy};
+    use crate::xds::{Handler, ProxyStateUpdater, XdsResource, XdsUpdate};
 
     use super::{
         ConnectionAttributes, ConnectionContext, ConnectionGuard, ConnectionManager,
@@ -568,8 +568,51 @@ mod tests {
 
     #[tokio::test]
     async fn test_policy_watcher_lifecycle() {
-        // preamble: setup an environment
+        let policy_name = "trafficPolicies/test";
         let state = Arc::new(RwLock::new(ProxyState::new(None)));
+        let workload = Arc::new(crate::state::workload::Workload {
+            uid: "workload".into(),
+            ..test_default_workload()
+        });
+        state.write().unwrap().workloads.insert(workload.clone());
+        let updater = ProxyStateUpdater::new_no_fetch(state.clone());
+        updater
+            .handle(Box::new(&mut std::iter::once(XdsUpdate::Update(
+                XdsResource {
+                    name: "sandbox".into(),
+                    resource: crate::xds::agentio::sandbox::Sandbox {
+                        uid: "sandbox".into(),
+                        attester: Some(crate::xds::agentio::sandbox::sandbox::Attester {
+                            workload_uid: workload.uid.to_string(),
+                        }),
+                        policy_refs: std::collections::HashMap::from([(
+                            crate::xds::TRAFFIC_POLICY_TYPE.to_string(),
+                            crate::xds::agentio::sandbox::PolicyReference {
+                                resource_names: vec![policy_name.into()],
+                            },
+                        )]),
+                        ..Default::default()
+                    },
+                },
+            ))))
+            .unwrap();
+        let publish = |rules| {
+            updater
+                .handle(Box::new(&mut std::iter::once(XdsUpdate::Update(
+                    XdsResource {
+                        name: policy_name.into(),
+                        resource: TrafficPolicy {
+                            ingress: Some(traffic_policy::RuleSet { rules }),
+                            egress: None,
+                        },
+                    },
+                ))))
+                .unwrap();
+        };
+        publish(vec![traffic_policy::Rule {
+            action: traffic_policy::Action::Allow.into(),
+            r#match: Some(traffic_policy::Match::default()),
+        }]);
         let mut registry = Registry::default();
         let metrics = Arc::new(crate::proxy::Metrics::new(&mut registry));
         let dstate = DemandProxyState::new(
@@ -581,78 +624,38 @@ mod tests {
         );
         let connection_manager = ConnectionManager::default();
         let (tx, stop) = drain::new();
-        let state_mutator = ProxyStateUpdateMutator::new_no_fetch();
+        let watcher = PolicyWatcher::new(dstate.clone(), stop, connection_manager.clone());
+        // Start the subscription before publishing the policy change.
+        let mut watching = Box::pin(watcher.run());
+        assert!(futures_util::poll!(&mut watching).is_pending());
+        let watcher_task = tokio::spawn(watching);
 
-        // clones to move into spawned task
-        let ds = dstate.clone();
-        let cm = connection_manager.clone();
-        let pw = PolicyWatcher::new(ds, stop, cm);
-        // spawn a task which watches policy and asserts that the policy watcher stop correctly
-        tokio::spawn(async move {
-            let res = tokio::time::timeout(Duration::from_secs(1), pw.run()).await;
-            assert!(res.is_ok())
-        });
-
-        // create a test connection
-        let conn1 = ConnectionContext {
+        let conn = ConnectionContext {
             rbac_ctx: crate::state::ProxyRbacContext {
                 sandbox: None,
                 conn: Connection {
                     src_identity: None,
-                    src: std::net::SocketAddr::new(
-                        std::net::Ipv4Addr::new(192, 168, 0, 1).into(),
-                        80,
-                    ),
+                    src: "192.168.0.1:80".parse().unwrap(),
                     dst_network: "".into(),
-                    dst: std::net::SocketAddr::V4(SocketAddrV4::new(
-                        Ipv4Addr::new(192, 168, 0, 2),
-                        8080,
-                    )),
+                    dst: "192.168.0.2:8080".parse().unwrap(),
                     direction: crate::rbac::Direction::Inbound,
                 },
-                workload: Arc::new(test_default_workload()),
+                workload,
             },
             attributes: ConnectionAttributes::Inbound(InboundAttributes { dest_service: None }),
         };
-        // watch the connection
-        let close1 = connection_manager
-            .register(&conn1)
-            .expect("should not be None");
+        let mut connection = connection_manager.assert_rbac(&dstate, conn).await.unwrap();
+        let close = connection.watch.take().unwrap();
 
-        // generate policy which denies everything
-        let auth_name = "allow-nothing";
-        let auth_namespace = "default";
-        let auth = Authorization {
-            name: auth_name.into(),
-            action: Action::Deny as i32,
-            scope: Scope::Global as i32,
-            namespace: auth_namespace.into(),
-            rules: vec![],
-            dry_run: false,
-            auth_extensions: vec![],
-        };
-        let mut auth_xds_name = String::with_capacity(1 + auth_namespace.len() + auth_name.len());
-        auth_xds_name.push_str(auth_namespace);
-        auth_xds_name.push('/');
-        auth_xds_name.push_str(auth_name);
-
-        // spawn an assertion that our connection close is received
-        tokio::spawn(assert_close(close1));
-
-        // this block will scope our guard appropriately
-        {
-            // update our state
-            let mut s = state
-                .write()
-                .expect("test fails if we're unable to get a write lock on state");
-            let res =
-                state_mutator.insert_authorization(&mut s, auth_xds_name.clone().into(), auth);
-            // assert that the update was OK
-            assert!(res.is_ok());
-        } // release lock
-
-        // send the signal which stops policy watcher
+        // An explicitly empty ingress denies the previously allowed connection.
+        publish(vec![]);
+        assert_close(close).await;
+        drop(connection);
         tx.start_drain_and_wait(drain::DrainMode::Immediate).await;
+        tokio::time::timeout(Duration::from_secs(1), watcher_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     // small helper to assert that the Watches are working in a timely manner

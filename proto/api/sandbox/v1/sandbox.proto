@@ -22,10 +22,14 @@ import "google/protobuf/any.proto";
 
 option go_package = "github.com/openkruise/agentio/api/sandbox/v1;sandboxv1";
 
-// Sandbox carries the current host binding and complete policy view for a
-// stable Sandbox UID. Consumers must authenticate the attester and validate
+// Sandbox carries the current host binding, inline policies and ordered policy
+// references for a stable Sandbox UID. Consumers must authenticate the attester and validate
 // their RuntimeAttachment independently of the reported lifecycle state.
 message Sandbox {
+  // Stable, case-sensitive identity: <type>:<instance-id>.
+  // Types include workload (derived from a Workload) and kruise.
+  // Instances must be unique within their type across the discovery scope.
+  // Consumers use the complete value as an opaque key, without URI normalization.
   string uid = 1;
   // The single Workload currently hosting this Sandbox. Absent when unassigned.
   // Replacing or clearing this field invalidates the previous host binding.
@@ -35,21 +39,47 @@ message Sandbox {
   SandboxState state = 3;
   // Effective exit routing, delivered atomically with this Sandbox.
   EgressRouting egress_routing = 4;
-  // Effective policies in evaluation order; rules retain their source order.
-  // All bodies are delivered together in this Sandbox resource.
-  repeated agentio.security.TrafficPolicy traffic_policies = 5;
+  // Sandbox-owned traffic rules, delivered atomically with the host binding.
+  // Evaluated before referenced TrafficPolicies. A matching ALLOW or DENY is
+  // terminal; no match continues through the referenced policies in order.
+  agentio.security.TrafficPolicy traffic_policy = 5;
   // Inline extension policy bodies, replaced atomically with this Sandbox.
   // Entries of the same type retain their evaluation order. Different types
   // define their own execution stages; list order does not order those stages.
   // Consumers must reject this Sandbox update if any extension is unsupported
   // or cannot be decoded. Runtime state does not imply extension support.
   repeated google.protobuf.Any extensions = 6;
+  // Predefined policies selected and ordered by the control plane.
+  // Keys are full xDS type URLs, e.g.
+  // type.googleapis.com/agentio.security.TrafficPolicy.
+  // Map iteration order does not define execution order across policy types.
+  map<string, PolicyReference> policy_refs = 7;
 
   message Attester {
     // Required, non-empty Workload.uid, used to locate its WDS Address resource.
     // Treat as an opaque identifier; do not infer endpoint type from its format.
     string workload_uid = 1;
   }
+}
+
+// Ordered references to resources of one policy type.
+message PolicyReference {
+  // Stable xDS resource names, unique within this list, in evaluation order.
+  // Relative names follow the AIP-122 collection/ID path convention:
+  // https://google.aip.dev/122
+  // - Namespaced: namespaces/{namespace}/{collection}/{name}.
+  // - Global: {collection}/{name}.
+  // Collections are plural lowerCamelCase, e.g. trafficPolicies.
+  // Namespace and name IDs are lowercase DNS names, without '/' characters.
+  // No leading or trailing slash. Each name must exactly match the referenced
+  // xDS Resource.name under the type URL used as the policy_refs map key.
+  // Names remain stable across content, selector and priority changes; do not
+  // embed versions or content hashes. Consumers treat names as opaque lookup
+  // keys and must not infer policy scope or precedence from their format.
+  // An empty list is equivalent to no entry for the policy type.
+  // A referenced resource that has not arrived is an unresolved dependency,
+  // not an empty policy. Content updates do not require changing this list.
+  repeated string resource_names = 1;
 }
 
 // Provider-neutral lifecycle state of the Sandbox.

@@ -14,12 +14,12 @@
 
 //! Cached Sandbox resources and their attester Workload bindings.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tracing::warn;
 
-use super::traffic_policy::TrafficPolicy;
+use super::traffic_policy::{TrafficPolicy, TrafficPolicyStore};
 use crate::extensions::extensions::EgressPolicies;
 use crate::strng::Strng;
 use crate::xds::XdsResource;
@@ -37,12 +37,14 @@ fn validate_id(id: &str) -> anyhow::Result<()> {
 }
 
 /// Sandbox information used by the proxy, independent of the xDS wire format.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Sandbox {
     pub uid: Strng,
     pub workload_uid: Option<Strng>,
     pub egress_routing: Option<EgressPolicies>,
-    pub traffic_policies: Vec<TrafficPolicy>,
+    pub traffic_policy: Option<TrafficPolicy>,
+    pub traffic_policy_refs: Vec<Strng>,
 }
 
 impl TryFrom<XdsSandbox> for Sandbox {
@@ -60,19 +62,53 @@ impl TryFrom<XdsSandbox> for Sandbox {
             }
             None => None,
         };
+        let mut traffic_policy_refs = Vec::new();
+        for (type_url, reference) in resource.policy_refs {
+            if reference.resource_names.is_empty() {
+                continue;
+            }
+            anyhow::ensure!(
+                type_url == crate::xds::TRAFFIC_POLICY_TYPE,
+                "unsupported policy reference type: {type_url}"
+            );
+            let mut seen = HashSet::new();
+            for name in reference.resource_names {
+                anyhow::ensure!(
+                    !name.is_empty() && name != "*" && seen.insert(name.clone()),
+                    "invalid or duplicate TrafficPolicy reference: {name}"
+                );
+                traffic_policy_refs.push(name.into());
+            }
+        }
         Ok(Self {
+            traffic_policy_refs,
             uid: resource.uid.into(),
             workload_uid,
             egress_routing: resource
                 .egress_routing
                 .map(EgressPolicies::try_from)
                 .transpose()?,
-            traffic_policies: resource
-                .traffic_policies
-                .into_iter()
+            traffic_policy: resource
+                .traffic_policy
                 .map(TrafficPolicy::try_from)
-                .collect::<anyhow::Result<_>>()?,
+                .transpose()?,
         })
+    }
+}
+
+impl Sandbox {
+    pub fn traffic_policies<'a>(
+        &'a self,
+        store: &'a TrafficPolicyStore,
+    ) -> impl Iterator<Item = (&'a str, Option<&'a TrafficPolicy>)> + Clone {
+        self.traffic_policy
+            .iter()
+            .map(|policy| ("inline", Some(policy)))
+            .chain(
+                self.traffic_policy_refs
+                    .iter()
+                    .map(move |name| (name.as_str(), store.get(name))),
+            )
     }
 }
 
@@ -85,7 +121,11 @@ pub struct SandboxStore {
 }
 
 impl SandboxStore {
-    pub fn update(&mut self, update: XdsResource<XdsSandbox>) -> anyhow::Result<()> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Arc<Sandbox>> {
+        self.resources.values()
+    }
+
+    pub fn update(&mut self, update: XdsResource<XdsSandbox>) -> anyhow::Result<bool> {
         let validation = (|| {
             anyhow::ensure!(
                 update.resource.uid == update.name,
@@ -107,6 +147,11 @@ impl SandboxStore {
         let previous = self.resources.insert(update.name.clone(), sandbox.clone());
         let previous_workload = previous.as_ref().and_then(|s| s.workload_uid.as_deref());
         let workload = sandbox.workload_uid.as_deref();
+        let policy_changed = previous.as_ref().is_none_or(|old| {
+            old.workload_uid != sandbox.workload_uid
+                || old.traffic_policy != sandbox.traffic_policy
+                || old.traffic_policy_refs != sandbox.traffic_policy_refs
+        });
         // Keep the selection order stable when only the resource contents change.
         if previous_workload != workload {
             if let Some(uid) = previous_workload {
@@ -119,15 +164,17 @@ impl SandboxStore {
                     .push(update.name);
             }
         }
-        Ok(())
+        Ok(policy_changed)
     }
 
-    pub fn remove(&mut self, name: &Strng) {
-        if let Some(previous) = self.resources.remove(name)
-            && let Some(workload_uid) = &previous.workload_uid
-        {
+    pub fn remove(&mut self, name: &Strng) -> bool {
+        let Some(previous) = self.resources.remove(name) else {
+            return false;
+        };
+        if let Some(workload_uid) = &previous.workload_uid {
             self.remove_workload_binding(workload_uid, name);
         }
+        true
     }
 
     fn remove_workload_binding(&mut self, workload_uid: &str, sandbox_id: &Strng) {

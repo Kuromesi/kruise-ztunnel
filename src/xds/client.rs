@@ -672,6 +672,11 @@ impl AdsClient {
         debug!("connected established");
 
         info!("Stream established");
+        // On-demand Workloads plus optional policy watches may have no initial
+        // resource barrier. The established ADS stream is enough in that case.
+        if self.types_to_expect.is_empty() {
+            mem::drop(mem::take(&mut self.block_ready));
+        }
         loop {
             tokio::select! {
                 _demand_event = self.state.demand.recv() => {
@@ -847,18 +852,16 @@ mod tests {
     use tokio::time::sleep;
 
     use crate::xds::ADDRESS_TYPE;
-    use crate::xds::istio::security::Authorization as XdsAuthorization;
     use crate::xds::istio::workload::Address as XdsAddress;
     use crate::xds::istio::workload::Workload as XdsWorkload;
     use crate::xds::istio::workload::WorkloadType;
-    use crate::xds::{AUTHORIZATION_TYPE, istio::workload::address::Type as XdsType};
+    use crate::xds::{TRAFFIC_POLICY_TYPE, istio::workload::address::Type as XdsType};
     use workload::Workload;
 
     use crate::state::workload::NetworkAddress;
     use crate::state::{DemandProxyState, workload};
     use crate::test_helpers::{
         helpers::{self},
-        test_default_workload,
         xds::AdsServer,
     };
 
@@ -894,35 +897,6 @@ mod tests {
         }
     }
 
-    fn get_auth(i: usize) -> ProtoResource {
-        let addr = XdsAuthorization {
-            name: format!("foo{i}"),
-            namespace: "default".to_string(),
-            scope: crate::xds::istio::security::Scope::Global as i32,
-            action: crate::xds::istio::security::Action::Deny as i32,
-            rules: vec![crate::xds::istio::security::Rule {
-                clauses: vec![crate::xds::istio::security::Clause {
-                    matches: vec![crate::xds::istio::security::Match {
-                        destination_ports: vec![80],
-                        ..Default::default()
-                    }],
-                }],
-            }],
-            dry_run: false,
-            auth_extensions: vec![],
-        };
-        ProtoResource {
-            name: format!("foo{i}"),
-            aliases: vec![],
-            version: "0.0.1".to_string(),
-            resource: Some(Any {
-                type_url: AUTHORIZATION_TYPE.to_string(),
-                value: addr.encode_to_vec(),
-            }),
-            ttl: None,
-            cache_control: None,
-        }
-    }
     fn get_address(i: usize, addr: std::net::IpAddr) -> ProtoResource {
         let octets = match addr {
             IpAddr::V4(v4) => v4.octets().to_vec(),
@@ -973,7 +947,7 @@ mod tests {
 
         let mut conn = conn_receiver.recv().await.unwrap();
 
-        let mut auth_seen = false;
+        let mut policy_seen = false;
         let mut addr_seen = false;
 
         let timer = tokio::time::sleep(std::time::Duration::from_secs(1));
@@ -992,35 +966,6 @@ mod tests {
                         address: std::net::Ipv4Addr::new(1, 2, 3, 4).into(),
                     })
                     .expect("address not in cache");
-                    let conn = crate::rbac::Connection{
-                        dst: std::net::SocketAddr::new(std::net::Ipv4Addr::new(1, 2, 3, 4).into(), 80),
-                        src_identity: None,
-                        src: std::net::SocketAddr::new(std::net::Ipv4Addr::new(1, 2, 3, 4).into(), 80),
-                        dst_network: "".into(),
-                        direction: crate::rbac::Direction::Inbound,
-                    };
-                    let rbac_ctx = crate::state::ProxyRbacContext {
-                        sandbox: None,
-                        conn: conn.clone(),
-                        workload: Arc::new(test_default_workload()),
-                    };
-
-                    // rbac should reject port 80
-                    let rbac_res = state.assert_rbac(&rbac_ctx).await;
-                    assert!(rbac_res.is_err());
-                    let conn = crate::rbac::Connection{
-                        dst: std::net::SocketAddr::new(std::net::Ipv4Addr::new(1, 2, 3, 4).into(), 81),
-                        ..conn
-                    };
-                    let rbac_ctx = crate::state::ProxyRbacContext {
-                        sandbox: None,
-                        conn,
-                        workload: Arc::new(test_default_workload()),
-                    };
-
-                    // but allow port 81
-                    let rbac_res = state.assert_rbac(&rbac_ctx).await;
-                    assert!(rbac_res.is_ok());
                     return;
                 }
                 req = conn.rx.recv() => {
@@ -1029,16 +974,16 @@ mod tests {
             };
 
             info!("received request: {:?}", req);
-            if req.type_url == AUTHORIZATION_TYPE && !auth_seen {
+            if req.type_url == TRAFFIC_POLICY_TYPE && !policy_seen {
                 let response = Ok(DeltaDiscoveryResponse {
-                    resources: vec![get_auth(0)],
+                    resources: vec![],
                     nonce: TextNonce::new().to_string(),
                     system_version_info: "1.0.0".to_string(),
-                    type_url: AUTHORIZATION_TYPE.to_string(),
+                    type_url: TRAFFIC_POLICY_TYPE.to_string(),
                     removed_resources: vec![],
                 });
                 conn.tx.send(response).await.unwrap();
-                auth_seen = true;
+                policy_seen = true;
             } else if req.type_url == ADDRESS_TYPE && !addr_seen {
                 let response = Ok(DeltaDiscoveryResponse {
                     resources: vec![get_address(0, "1.2.3.4".parse().unwrap())],
@@ -1068,7 +1013,7 @@ mod tests {
 
         let mut conn = conn_receiver.recv().await.unwrap();
 
-        let mut auth_seen = false;
+        let mut policy_seen = false;
         let mut addr_seen = false;
 
         let timer = tokio::time::sleep(std::time::Duration::from_secs(1));
@@ -1085,17 +1030,17 @@ mod tests {
             };
 
             info!("received request: {:?}", req);
-            if req.type_url == AUTHORIZATION_TYPE {
+            if req.type_url == TRAFFIC_POLICY_TYPE {
                 assert_eq!(req.resource_names_subscribe, Vec::<String>::new());
                 assert_eq!(req.resource_names_unsubscribe, Vec::<String>::new());
-                auth_seen = true;
+                policy_seen = true;
             } else if req.type_url == ADDRESS_TYPE {
                 assert_eq!(req.resource_names_subscribe, vec!["*"]);
                 assert_eq!(req.resource_names_unsubscribe, vec!["*"]);
                 addr_seen = true;
             }
 
-            if auth_seen && addr_seen {
+            if policy_seen && addr_seen {
                 return;
             }
         }
