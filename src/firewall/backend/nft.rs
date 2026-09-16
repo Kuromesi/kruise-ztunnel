@@ -145,9 +145,9 @@ impl NftBackend {
             .collect();
 
         // Sort by priority (lower value = higher priority = executed first)
-        // Use name as tiebreaker for deterministic ordering
-        inbound_rules.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.name.cmp(&b.name)));
-        outbound_rules.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.name.cmp(&b.name)));
+        // Stable sorting preserves namespace/name order and rule declaration order.
+        inbound_rules.sort_by_key(|rule| rule.priority);
+        outbound_rules.sort_by_key(|rule| rule.priority);
 
         // Render all rules first (collecting named sets)
         let mut all_sets: Vec<NamedSet> = Vec::new();

@@ -572,8 +572,7 @@ impl DemandProxyState {
         // Split into priority and non-priority policies
         let (mut priority_policies, non_priority_policies): (Vec<_>, Vec<_>) =
             all_policies.into_iter().partition(|p| p.priority.is_some());
-        // Sort priority policies by priority ascending (lower priority first)
-        priority_policies.sort_by_key(|p| p.priority);
+        priority_policies.sort_by(|a, b| a.compare_traffic_policy(b));
 
         for pol in priority_policies.iter() {
             debug!(policy = pol.to_key().as_str(), "traffic policy matching");
@@ -1516,6 +1515,153 @@ mod tests {
             ResolverOpts::default(),
             metrics,
         )
+    }
+
+    #[tokio::test]
+    async fn traffic_policy_order_tcp_and_firewall() {
+        use crate::firewall::{IptBackend, NftBackend, build_firewall_ruleset};
+        use crate::xds::kruise::networking::extensions::v1::TrafficPolicyExtension;
+        use prost::Message as _;
+
+        let policy = |name: &str, namespace: &str, priority, deny| {
+            let extension = TrafficPolicyExtension {
+                priority,
+                mode: TrafficPolicyMode::Client as i32,
+            };
+            let mut auth = Authorization::try_from(XdsAuthorization {
+                name: name.into(),
+                namespace: namespace.into(),
+                scope: if namespace == "ns1" { 1 } else { 0 },
+                auth_extensions: vec![crate::xds::istio::security::Extension {
+                    name: "traffic-policy".into(),
+                    config: Some(prost_types::Any {
+                        type_url: "type.googleapis.com/kruise.networking.extensions.v1.TrafficPolicyExtension".into(),
+                        value: extension.encode_to_vec(),
+                    }),
+                }],
+                ..Default::default()
+            }).unwrap();
+            // Both policies match every destination, with opposing decisions.
+            let addresses = vec!["0.0.0.0/0".parse().unwrap()];
+            auth.rules = vec![vec![vec![if deny {
+                rbac::RbacMatch {
+                    not_destination_ips: addresses,
+                    ..Default::default()
+                }
+            } else {
+                rbac::RbacMatch {
+                    destination_ips: addresses,
+                    ..Default::default()
+                }
+            }]]];
+            auth
+        };
+        let cases = vec![
+            (
+                "priority before identity",
+                policy("a-egress", "a-root", 20, false),
+                policy("z-egress", "ns1", 10, true),
+                false,
+            ),
+            (
+                "namespace before name",
+                policy("a-egress", "ns1", 10, false),
+                policy("z-egress", "istio-system", 10, true),
+                false,
+            ),
+            (
+                "namespace before scope",
+                policy("z-egress", "ns1", 10, false),
+                policy("a-egress", "z-root", 10, true),
+                true,
+            ),
+            (
+                "namespace prefix uses separate fields",
+                policy("z-egress", "ns1", 10, false),
+                policy("a-egress", "ns1-a", 10, true),
+                true,
+            ),
+            (
+                "name orders deny first",
+                policy("z-egress", "ns1", 10, false),
+                policy("a-egress", "ns1", 10, true),
+                false,
+            ),
+            (
+                "name orders allow first",
+                policy("a-egress", "ns1", 10, false),
+                policy("z-egress", "ns1", 10, true),
+                true,
+            ),
+            (
+                "use Authorization name including suffix",
+                policy("a-egress", "ns1", 10, false),
+                policy("a-a-egress", "ns1", 10, true),
+                false,
+            ),
+        ];
+        for (scenario, allow, deny, allowed) in cases {
+            for direction in [Direction::Inbound, Direction::Outbound] {
+                // Arrival order and hash iteration must not determine the result.
+                for reverse in [false, true] {
+                    let mut policies = vec![allow.clone(), deny.clone()];
+                    if reverse {
+                        policies.reverse();
+                    }
+                    let mut state = ProxyState::new(None);
+                    state.workloads.insert(Arc::new(create_workload(1)));
+                    for pol in &mut policies {
+                        pol.mode = match direction {
+                            Direction::Inbound => TrafficPolicyMode::Server,
+                            Direction::Outbound => TrafficPolicyMode::Client,
+                        };
+                        state.policies.insert(pol.to_key(), pol.clone());
+                    }
+                    let state = create_state(state);
+                    let mut ctx = get_rbac_context(&state, 1, "defaultacct");
+                    ctx.conn.direction = direction;
+                    assert_eq!(
+                        state.assert_rbac(&ctx).await.is_ok(),
+                        allowed,
+                        "{scenario}/{direction:?}"
+                    );
+
+                    let rules = build_firewall_ruleset(policies.iter().collect());
+                    let first = if allowed {
+                        allow.to_key()
+                    } else {
+                        deny.to_key()
+                    };
+                    assert_eq!(rules.rules[0].name, first, "{scenario}/{direction:?}");
+                    for (rendered, accept, reject) in [
+                        (
+                            IptBackend::new().render_ruleset(&rules),
+                            "-j ACCEPT",
+                            "-j REJECT",
+                        ),
+                        (
+                            NftBackend::new().render_ruleset(&rules),
+                            " accept ",
+                            " reject ",
+                        ),
+                    ] {
+                        let policy_lines: Vec<_> = rendered
+                            .lines()
+                            .filter(|line| line.contains("0.0.0.0/0"))
+                            .collect();
+                        assert_eq!(
+                            policy_lines.len(),
+                            2,
+                            "{scenario}/{direction:?}:\n{rendered}"
+                        );
+                        assert!(
+                            policy_lines[0].contains(if allowed { accept } else { reject }),
+                            "{scenario}/{direction:?}:\n{rendered}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn create_dry_run_wildcard_rbac_policy(action: rbac::RbacAction) -> rbac::Authorization {

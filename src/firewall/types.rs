@@ -110,7 +110,8 @@ pub struct FirewallRule {
 /// Complete rule set (passed to Backend)
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RuleSet {
-    /// List of firewall rules
+    /// Rules in policy evaluation order, preserving declaration order within
+    /// each policy. Backends must preserve this order when priorities are equal.
     pub rules: Vec<FirewallRule>,
     /// When true, unmatched non-TCP traffic is rejected (trailing REJECT rule).
     /// Set when any TrafficPolicy match the workload.
