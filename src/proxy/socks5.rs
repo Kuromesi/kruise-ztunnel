@@ -14,7 +14,6 @@
 // limitations under the License.
 
 use anyhow::Result;
-use byteorder::{BigEndian, ByteOrder};
 
 use crate::dns::resolver::Resolver;
 use hickory_net::xfer::Protocol;
@@ -94,7 +93,6 @@ impl Socks5 {
                             pi: self.pi.clone(),
                             id: TraceParent::new(),
                             pool: pool.clone(),
-                            hbone_port: self.pi.cfg.inbound_addr.port(),
                         };
                         let span = info_span!("socks5", id=%oc.id);
                         let metrics_for_socket_close = self.pi.metrics.clone();
@@ -274,7 +272,7 @@ async fn negotiate_socks_connection(
 
     let mut port = [0u8; 2];
     stream.read_exact(&mut port).await?;
-    let port = BigEndian::read_u16(&port);
+    let port = u16::from_be_bytes(port);
 
     let host = SocketAddr::new(ip, port);
 

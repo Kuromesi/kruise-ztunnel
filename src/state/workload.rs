@@ -20,7 +20,7 @@ use crate::extensions::extensions::{EgressPolicies, EgressPolicyError, WorkloadE
 use crate::state::WorkloadInfo;
 use crate::strng::Strng;
 use crate::xds::istio::workload::{Port, PortList};
-use crate::xds::kruise::networking::extensions::v1::{MeshInternalTrafficPolicy, WorkloadMetadata};
+use crate::xds::kruise::networking::extensions::v1::WorkloadMetadata;
 use crate::{strng, xds};
 use bytes::Bytes;
 use serde::Deserialize;
@@ -285,8 +285,6 @@ pub struct Workload {
     pub encoded_labels: Option<Strng>,
     #[serde(skip)]
     pub egress_policies: Option<EgressPolicies>,
-    #[serde(skip)]
-    pub mesh_internal_traffic_policy: MeshInternalTrafficPolicy,
 }
 
 fn default_capacity() -> u32 {
@@ -533,12 +531,6 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
                 .map(|m| Some(strng::new(m.encode_labels())))
                 .unwrap_or_default(),
             egress_policies,
-            mesh_internal_traffic_policy: metadata
-                .as_ref()
-                .and_then(|m| {
-                    MeshInternalTrafficPolicy::try_from(m.mesh_internal_traffic_policy).ok()
-                })
-                .unwrap_or(MeshInternalTrafficPolicy::MeshInternalPeerAware),
         };
         // Return back part we did not use (service) so it can be consumed without cloning
         Ok((wl, resource.services))
@@ -936,7 +928,7 @@ pub enum WorkloadError {
 mod tests {
     use super::*;
     use crate::config::ConfigSource;
-    use crate::state::{DemandProxyState, ProxyState, ServiceResolutionMode, UpstreamDestination};
+    use crate::state::{DemandProxyState, ProxyState, UpstreamDestination};
     use crate::test_helpers::helpers::initialize_telemetry;
     use crate::xds::istio::workload::PortList as XdsPortList;
     use crate::xds::istio::workload::Service as XdsService;
@@ -1892,13 +1884,11 @@ mod tests {
         .try_into()
         .unwrap();
         for _ in 0..1000 {
-            if let Some(UpstreamDestination::UpstreamParts(workload, _, _)) =
-                state.state.read().unwrap().find_upstream(
-                    strng::EMPTY,
-                    &wl,
-                    "127.0.1.1:80".parse().unwrap(),
-                    ServiceResolutionMode::Standard,
-                )
+            if let Some(UpstreamDestination::UpstreamParts(workload, _, _)) = state
+                .state
+                .read()
+                .unwrap()
+                .find_upstream(strng::EMPTY, &wl, "127.0.1.1:80".parse().unwrap())
             {
                 let n = &workload.name; // borrow name instead of cloning
                 found.insert(n.to_string()); // insert an owned copy of the borrowed n
@@ -1942,7 +1932,6 @@ mod tests {
             strng::EMPTY,
             wl.as_ref().unwrap(),
             "127.10.0.1:80".parse().unwrap(),
-            ServiceResolutionMode::Standard,
         ) {
             Some(UpstreamDestination::UpstreamParts(_, port, svc)) => (port, svc),
             _ => panic!("should get"),
@@ -1959,7 +1948,6 @@ mod tests {
             "remote".into(),
             wl.as_ref().unwrap(),
             "127.10.0.2:80".parse().unwrap(),
-            ServiceResolutionMode::Standard,
         ) {
             Some(UpstreamDestination::UpstreamParts(_, port, _)) => port,
             _ => panic!("should get"),

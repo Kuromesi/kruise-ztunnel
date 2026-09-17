@@ -13,16 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp::Ordering::{Equal, Greater, Less};
 use std::future::Future;
 use std::io::Error;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::{io, thread};
 
-use bytes::BufMut;
 use criterion::measurement::Measurement;
 use criterion::{
     BenchmarkGroup, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
@@ -30,28 +28,21 @@ use criterion::{
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use pprof::criterion::{Output, PProfProfiler};
 use prometheus_client::registry::Registry;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tracing::info;
 
-use ztunnel::state::workload::{InboundProtocol, Workload};
 use ztunnel::state::{DemandProxyState, ProxyRbacContext, ProxyState};
-use ztunnel::test_helpers::app::{DestinationAddr, TestApp};
 use ztunnel::test_helpers::linux::{TestMode, WorkloadManager};
 use ztunnel::test_helpers::tcp::Mode;
-use ztunnel::test_helpers::{helpers, tcp, test_default_workload};
-use ztunnel::xds::LocalWorkload;
+use ztunnel::test_helpers::{tcp, test_default_workload};
 use ztunnel::xds::agentio::sandbox::{PolicyReference, Sandbox as XdsSandbox, sandbox::Attester};
 use ztunnel::xds::agentio::security::{TrafficPolicy as XdsTrafficPolicy, traffic_policy};
 use ztunnel::xds::{TRAFFIC_POLICY_TYPE, XdsResource};
-use ztunnel::{app, identity, metrics, proxy, rbac, setup_netns_test, strng, test_helpers};
+use ztunnel::{metrics, proxy, rbac, setup_netns_test, strng, test_helpers};
 
 const KB: usize = 1024;
 const MB: usize = 1024 * KB;
 const GB: usize = 1024 * MB;
-// Must be less than or equal to 254
-const MAX_HBONE_WORKLOADS: u8 = 64;
 
 const N_RULES: usize = 10;
 const N_POLICIES: usize = 10_000;
@@ -164,7 +155,16 @@ fn initialize_environment(
         Mode::ForwardProxyProtocol => todo!("not implemented for benchmark"),
     };
     let clients: Vec<_> = (0..clients)
-        .map(|id| spawn_client(id, &mut manager, traffic_mode, echo_addr, client_mode))
+        .map(|id| {
+            spawn_client(
+                id,
+                &mut manager,
+                ztunnel_mode,
+                traffic_mode,
+                echo_addr,
+                client_mode,
+            )
+        })
         .collect();
     thread::spawn(move || {
         while let Ok(size) = rx.recv() {
@@ -190,16 +190,18 @@ fn initialize_environment(
 fn spawn_client(
     i: usize,
     manager: &mut WorkloadManager,
+    ztunnel_mode: WorkloadMode,
     traffic_mode: TestTrafficMode,
     echo_addr: SocketAddr,
     client_mode: Mode,
 ) -> TestClient {
     let client = run_async_blocking(async move {
-        manager
-            .workload_builder(&format!("client-{i}"), "LOCAL")
-            .register()
-            .await
-            .unwrap()
+        let name = format!("client-{i}");
+        let mut builder = manager.workload_builder(&name, "LOCAL");
+        if ztunnel_mode == WorkloadMode::HBONE {
+            builder = builder.egress_gateway(echo_addr.ip());
+        }
+        builder.register().await.unwrap()
     });
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(0);
@@ -440,154 +442,12 @@ pub fn metrics(c: &mut Criterion) {
     });
 }
 
-/// Iterate through possible IP pairs restricted to 0 < ip_pair.0 < ip_pair.1 <= MAX_HBONE_WORKLOADS.
-fn next_ip_pair(ip_pair: (u8, u8)) -> (u8, u8) {
-    if ip_pair.0 == 0 || ip_pair.1 == 0 {
-        panic!("Invalid host");
-    }
-    match (
-        Ord::cmp(&ip_pair.0, &(MAX_HBONE_WORKLOADS - 1)),
-        Ord::cmp(&ip_pair.1, &MAX_HBONE_WORKLOADS),
-    ) {
-        (Greater, _) | (_, Greater) | (Equal, Equal) => panic!("Invalid host"),
-        (_, Less) => (ip_pair.0, ip_pair.1 + 1),
-        (Less, Equal) => (ip_pair.0 + 1, ip_pair.0 + 2),
-    }
-}
-
-/// Reserve IPs in 127.0.1.0/24 for these HBONE connection tests.
-/// Thus, we identify hosts by a u8 which represents an IP in the form 127.0.1.x.
-fn hbone_connection_ip(x: u8) -> IpAddr {
-    IpAddr::V4(Ipv4Addr::new(127, 0, 1, x))
-}
-
-fn hbone_connection_config() -> ztunnel::config::ConfigSource {
-    let mut workloads: Vec<LocalWorkload> = Vec::with_capacity(MAX_HBONE_WORKLOADS as usize);
-    // We can't create one work load with many IPs because ztunnel could connect to any one causing
-    // inconsistent behavior. Instead, we create one workload per IP.
-    for i in 1..MAX_HBONE_WORKLOADS + 1 {
-        let lwl = LocalWorkload {
-            workload: Workload {
-                workload_ips: vec![hbone_connection_ip(i)],
-                protocol: InboundProtocol::HBONE,
-                uid: strng::format!("cluster1//v1/Pod/default/remote{i}"),
-                name: strng::format!("workload-{i}"),
-                namespace: strng::format!("namespace-{i}"),
-                service_account: strng::format!("service-account-{i}"),
-                ..test_helpers::test_default_workload()
-            },
-            services: Default::default(),
-        };
-        workloads.push(lwl);
-    }
-    let lwl = LocalWorkload {
-        workload: Workload {
-            workload_ips: vec![],
-            protocol: InboundProtocol::HBONE,
-            uid: "cluster1//v1/Pod/default/local-source".into(),
-            name: "local-source".into(),
-            namespace: "default".into(),
-            service_account: "default".into(),
-            ..test_helpers::test_default_workload()
-        },
-        services: Default::default(),
-    };
-    workloads.push(lwl);
-
-    let lc = ztunnel::xds::LocalConfig {
-        workloads,
-        services: vec![],
-        ..Default::default()
-    };
-    let mut b = bytes::BytesMut::new().writer();
-    serde_yaml::to_writer(&mut b, &lc).ok();
-    let b = b.into_inner().freeze();
-    ztunnel::config::ConfigSource::Static(b)
-}
-
-/// Benchmark how long it takes to establish a new HBONE connection.
-/// This is tricky because ztunnel will keep a connection pool.
-/// Repeated connections from the same source to the same destination will use the pooled
-/// connection. Instead, we register MAX_HBONE_WORKLOADS giving us O(MAX_HBONE_WORKLOADS^2)
-/// source/destination IP combinations which is (hopefully) enough.
-fn hbone_connections(c: &mut Criterion) {
-    helpers::run_command("ip link set dev lo up").unwrap();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    // Global setup: spin up an echo server and ztunnel instance
-    let (echo_addr, ta) = rt.block_on(async move {
-        let cert_manager = identity::mock::new_secret_manager(Duration::from_secs(10));
-        let port = 80;
-        let config_source = Some(hbone_connection_config());
-        let config = test_helpers::test_config_with_port_xds_addr_and_root_cert(
-            port,
-            None,
-            None,
-            config_source,
-        );
-        let app = app::build_with_cert(Arc::new(config), cert_manager.clone())
-            .await
-            .unwrap();
-        let ta = TestApp::from((&app, cert_manager));
-        ta.ready().await;
-
-        let echo = tcp::TestServer::new(Mode::ReadWrite, 0).await;
-        let echo_addr = echo.address();
-        drop(tokio::spawn(async move {
-            let _ = tokio::join!(app.wait_termination(), echo.run());
-        }));
-        (echo_addr, ta)
-    });
-
-    let ta: Arc<Mutex<TestApp>> = Arc::new(Mutex::new(ta));
-    let addresses = Arc::new(Mutex::new((1u8, 2u8)));
-
-    let mut c = c.benchmark_group("hbone_connections");
-    // WARNING: increasing the measurement time could lead to running out of IP pairs or having too
-    // many open connections.
-    c.measurement_time(Duration::from_secs(5));
-    // Connections/second
-    c.throughput(Throughput::Elements(1));
-    c.bench_function("connect_request_response", |b| {
-        b.to_async(&rt).iter(|| async {
-            let bench = async {
-                let mut addresses = addresses.lock().await;
-                let ta = ta.lock().await;
-
-                // Get next address pair
-                *addresses = next_ip_pair(*addresses);
-                let source_addr = hbone_connection_ip(addresses.0);
-                let dest_addr = hbone_connection_ip(addresses.1);
-
-                // Start HBONE connection
-                let mut hbone = ta
-                    .socks5_connect(DestinationAddr::Ip(helpers::with_ip(echo_addr, dest_addr)), source_addr)
-                    .await;
-
-                // TCP ping
-                hbone.write_u8(42).await.ok();
-                hbone.read_u8().await.ok();
-            };
-
-            // If misconfigured, `socks5_connect` will silently fail causing subsequent commands
-            // to hang. Panic if too slow.
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("Timeout: Test is hanging."),
-                _ = bench => ()
-            };
-        })
-    });
-}
-
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .with_profiler(PProfProfiler::new(100, Output::Protobuf))
         .warm_up_time(Duration::from_millis(1));
-    targets = hbone_connections
+    targets = connections
 }
 
 criterion_main!(benches);

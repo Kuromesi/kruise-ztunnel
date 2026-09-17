@@ -309,7 +309,6 @@ impl ProxyState {
         network: Strng,
         source_workload: &Workload,
         addr: SocketAddr,
-        resolution_mode: ServiceResolutionMode,
     ) -> Option<UpstreamDestination> {
         if let Some(svc) = self
             .services
@@ -320,12 +319,7 @@ impl ProxyState {
             {
                 return Some(UpstreamDestination::OriginalDestination);
             }
-            return self.find_upstream_from_service(
-                source_workload,
-                addr.port(),
-                resolution_mode,
-                svc,
-            );
+            return self.find_upstream_from_service(source_workload, addr.port(), svc);
         }
         if let Some(wl) = self
             .workloads
@@ -340,13 +334,11 @@ impl ProxyState {
         &self,
         source_workload: &Workload,
         svc_port: u16,
-        resolution_mode: ServiceResolutionMode,
         svc: Arc<Service>,
     ) -> Option<UpstreamDestination> {
         // Randomly pick an upstream
         // TODO: do this more efficiently, and not just randomly
-        let Some((ep, wl)) = self.load_balance(source_workload, &svc, svc_port, resolution_mode)
-        else {
+        let Some((ep, wl)) = self.load_balance(source_workload, &svc, svc_port) else {
             debug!("Service {} has no healthy endpoints", svc.hostname);
             return None;
         };
@@ -382,15 +374,8 @@ impl ProxyState {
         src: &Workload,
         svc: &'a Service,
         svc_port: u16,
-        resolution_mode: ServiceResolutionMode,
     ) -> Option<(&'a Endpoint, Arc<Workload>)> {
         let target_port = svc.ports.get(&svc_port).copied();
-
-        if resolution_mode == ServiceResolutionMode::Standard && target_port.is_none() {
-            // Port doesn't exist on the service at all, this is invalid
-            debug!("service {} does not have port {}", svc.hostname, svc_port);
-            return None;
-        };
 
         let endpoints = svc.endpoints.iter().filter_map(|ep| {
             let Some(wl) = self.workloads.find_uid(&ep.workload_uid) else {
@@ -401,34 +386,12 @@ impl ProxyState {
             if wl.workload_ips.is_empty() && wl.hostname.is_empty() {
                 return None;
             }
-            if resolution_mode == ServiceResolutionMode::Standard && wl.network != src.network {
+            if target_port.is_none() && wl.application_tunnel.is_none() {
+                trace!(
+                    "filter gateway endpoint {}, target port is not defined",
+                    ep.workload_uid
+                );
                 return None;
-            }
-
-            match resolution_mode {
-                ServiceResolutionMode::Standard => {
-                    if target_port.unwrap_or_default() == 0 && !ep.port.contains_key(&svc_port) {
-                        // Filter workload out, it doesn't have a matching port
-                        trace!(
-                            "filter endpoint {}, it does not have service port {}",
-                            ep.workload_uid, svc_port
-                        );
-                        return None;
-                    }
-                }
-                ServiceResolutionMode::Waypoint => {
-                    if target_port.is_none() && wl.application_tunnel.is_none() {
-                        // We ignore this for app_tunnel; in this case, the port does not need to be on the service.
-                        // This is only valid for waypoints, which are not explicitly addressed by users.
-                        // We do happen to do a lookup by `waypoint-svc:15008`, this is not a literal call on that service;
-                        // the port is not required at all if they have application tunnel, as it will be handled by ztunnel on the other end.
-                        trace!(
-                            "filter waypoint endpoint {}, target port is not defined",
-                            ep.workload_uid
-                        );
-                        return None;
-                    }
-                }
             }
             Some((ep, wl))
         });
@@ -772,25 +735,6 @@ impl DemandProxyState {
         self.read().workloads.find_uid(uid)
     }
 
-    pub async fn fetch_upstream(
-        &self,
-        network: Strng,
-        source_workload: &Workload,
-        addr: SocketAddr,
-        resolution_mode: ServiceResolutionMode,
-    ) -> Result<Option<Upstream>, Error> {
-        self.fetch_address(&network_addr(network.clone(), addr.ip()))
-            .await;
-        let upstream = {
-            self.read()
-                .find_upstream(network, source_workload, addr, resolution_mode)
-            // Drop the lock
-        };
-        tracing::trace!(%addr, ?upstream, "fetch_upstream");
-        self.finalize_upstream(source_workload, addr, upstream)
-            .await
-    }
-
     async fn finalize_upstream(
         &self,
         source_workload: &Workload,
@@ -833,12 +777,9 @@ impl DemandProxyState {
         let (res, target_address) = match &gw_address.destination {
             Destination::Address(ip) => {
                 let addr = SocketAddr::new(ip.address, gw_address.hbone_mtls_port);
-                let us = self.read().find_upstream(
-                    ip.network.clone(),
-                    source_workload,
-                    addr,
-                    ServiceResolutionMode::Waypoint,
-                );
+                let us = self
+                    .read()
+                    .find_upstream(ip.network.clone(), source_workload, addr);
                 // If they referenced a waypoint by IP, use that IP as the destination.
                 // Note this means that an IPv6 call may be translated to IPv4 if the waypoint is specified
                 // as an IPv4 address.
@@ -852,7 +793,6 @@ impl DemandProxyState {
                         let us = state.find_upstream_from_service(
                             source_workload,
                             gw_address.hbone_mtls_port,
-                            ServiceResolutionMode::Waypoint,
                             s,
                         );
                         // For hostname, use the original_destination_address as the target so we can
@@ -879,36 +819,6 @@ impl DemandProxyState {
         self.finalize_upstream(source_workload, target_address, res)
             .await?
             .ok_or_else(|| Error::UnknownWaypoint(format!("waypoint {gw_address:?} not found")))
-    }
-
-    pub async fn fetch_service_waypoint(
-        &self,
-        service: &Service,
-        source_workload: &Workload,
-        original_destination_address: SocketAddr,
-    ) -> Result<Option<Upstream>, Error> {
-        let Some(gw_address) = &service.waypoint else {
-            // no waypoint
-            return Ok(None);
-        };
-        self.fetch_waypoint(gw_address, source_workload, original_destination_address)
-            .await
-            .map(Some)
-    }
-
-    pub async fn fetch_workload_waypoint(
-        &self,
-        wl: &Workload,
-        source_workload: &Workload,
-        original_destination_address: SocketAddr,
-    ) -> Result<Option<Upstream>, Error> {
-        let Some(gw_address) = &wl.waypoint else {
-            // no waypoint
-            return Ok(None);
-        };
-        self.fetch_waypoint(gw_address, source_workload, original_destination_address)
-            .await
-            .map(Some)
     }
 
     /// Looks for either a workload or service by the destination. If not found locally,
@@ -969,14 +879,6 @@ impl DemandProxyState {
             debug!(%key, "on demand ready");
         }
     }
-}
-
-#[derive(Eq, PartialEq, Clone, Copy, Debug)]
-pub enum ServiceResolutionMode {
-    // We are resolving a normal service
-    Standard,
-    // We are resolving a waypoint proxy
-    Waypoint,
 }
 
 #[derive(serde::Serialize)]
@@ -1344,12 +1246,7 @@ mod tests {
         state.workloads.insert(wl.clone().into());
         state.services.insert(svc);
 
-        let mode = match tc {
-            PortMappingTestCase::AppTunnel => ServiceResolutionMode::Waypoint,
-            _ => ServiceResolutionMode::Standard,
-        };
-
-        let port = match state.find_upstream("".into(), &wl, "10.0.0.1:80".parse().unwrap(), mode) {
+        let port = match state.find_upstream("".into(), &wl, "10.0.0.1:80".parse().unwrap()) {
             Some(UpstreamDestination::UpstreamParts(_, port, _)) => port,
             _ => panic!("upstream to be found"),
         };
@@ -1571,7 +1468,7 @@ mod tests {
 
         let assert_endpoint = |src: &Workload, svc: &Service, workloads: Vec<&str>, desc: &str| {
             let got = state
-                .load_balance(src, svc, 80, ServiceResolutionMode::Standard)
+                .load_balance(src, svc, 80)
                 .map(|(ep, _)| ep.workload_uid.to_string());
             if workloads.is_empty() {
                 assert!(got.is_none(), "{}", desc);
@@ -1584,7 +1481,7 @@ mod tests {
             |src: &Workload, svc: &Service, uid: &str, tries: usize, desc: &str| {
                 for _ in 0..tries {
                     let got = state
-                        .load_balance(src, svc, 80, ServiceResolutionMode::Standard)
+                        .load_balance(src, svc, 80)
                         .map(|(ep, _)| ep.workload_uid.as_str());
                     assert!(got != Some(uid), "{}", desc);
                 }
@@ -1612,8 +1509,12 @@ mod tests {
         assert_endpoint(
             &wl_no_locality,
             &failover_svc,
-            vec![],
-            "failover does not select endpoints in other networks",
+            vec![
+                "cluster1//v1/Pod/default/ep_almost",
+                "cluster1//v1/Pod/default/ep_no_match",
+                "cluster1//v1/Pod/default/wl_match",
+            ],
+            "gateway failover can select a reachable endpoint in another network",
         );
         assert_endpoint(
             &wl_almost,

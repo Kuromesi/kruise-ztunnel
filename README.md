@@ -8,8 +8,12 @@ ztunnel is the Layer 4 traffic enforcement data plane for [Agentio](https://gith
 - **Non-TCP firewall enforcement** — translates traffic policies into inbound and outbound iptables or nftables rules for UDP, ICMP, and other supported non-TCP traffic, with automatic backend detection and live rule updates.
 - **Per-workload sidecar deployment** — runs a dedicated ztunnel alongside each sandbox workload instead of as a node-level proxy, enforcing traffic policy at the workload boundary.
 
-Traffic uses TCP or single-layer HBONE, including connections to the Agentio egress gateway.
-Cross-network routing through Istio east-west gateways (double HBONE) is unsupported.
+Outbound traffic follows the source Sandbox or Workload's egress policy: connect
+through an Agentio egress gateway over HBONE, or connect directly to the original
+destination over TCP. Destination Service and Workload metadata does not select
+waypoints, service endpoints, or peer HBONE routes. Service VIP routing is handled
+by the underlying network. Cross-network routing through Istio east-west gateways
+(double HBONE) is unsupported.
 
 ## Sidecar admin socket
 
@@ -176,7 +180,7 @@ An example access log looks like (with newlines for readability; the real logs a
 ```text
 2024-04-11T15:38:42.182974Z  INFO access: connection complete
     src.addr=10.244.0.24:46238 src.workload="shell-6d8bcd654d-t88gp" src.namespace="default" src.identity="spiffe://cluster.local/ns/default/sa/default"
-    dst.addr=10.244.0.42:15008 dst.hbone_addr=10.96.108.116:80 dst.service="echo.default.svc.cluster.local"
+    dst.addr=10.244.0.42:15008 dst.hbone_addr=203.0.113.10:443 dst.workload="egress-gateway" dst.namespace="agentio-system"
     direction="outbound" bytes_sent=67 bytes_recv=490 duration="13ms"
 ```
 

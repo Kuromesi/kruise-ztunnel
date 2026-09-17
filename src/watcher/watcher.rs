@@ -12,559 +12,428 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arc_swap::ArcSwap;
-use notify_debouncer_full::{DebounceEventResult, Debouncer, FileIdMap, new_debouncer_opt};
-use std::sync::{Arc, RwLock};
-use std::{fs, path::PathBuf, time::Duration};
-
-use std::{
-    collections::{HashMap, HashSet},
-    hash::{DefaultHasher, Hash, Hasher},
-};
-
 use anyhow::Context;
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
+use arc_swap::ArcSwap;
+use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
-/// Tracks a file's content hash and transformed value.
-#[derive(Clone)]
-pub struct FileTracker<V> {
-    pub path: PathBuf,
-    pub hash: u64,
-    pub transformed: Arc<V>,
-}
+// Recover from missed notifications, including a native watch lost after a directory replacement.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Thread-safe store that holds transformed file contents.
+/// A directory snapshot with lock-free reads and serialized refreshes.
 pub struct FileStore<K, V> {
-    pub transform: fn(String) -> anyhow::Result<V>,
-    pub key_func: fn(&PathBuf) -> Option<K>,
-    pub store: ArcSwap<HashMap<K, FileTracker<V>>>,
-    write_lock: tokio::sync::Mutex<()>,
+    path: PathBuf,
+    transform: fn(String) -> anyhow::Result<V>,
+    key_func: fn(&Path) -> Option<K>,
+    snapshot: ArcSwap<BTreeMap<K, Arc<V>>>,
+    refresh_lock: Mutex<()>,
 }
 
 impl<K, V> FileStore<K, V>
 where
-    K: Hash + Eq + Clone + Send + Sync + std::fmt::Debug + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: Ord + Send + Sync + 'static,
+    V: Send + Sync + 'static,
 {
     pub fn new(
+        path: impl Into<PathBuf>,
         transform: fn(String) -> anyhow::Result<V>,
-        key_func: fn(&PathBuf) -> Option<K>,
+        key_func: fn(&Path) -> Option<K>,
     ) -> Self {
         Self {
+            path: path.into(),
             transform,
             key_func,
-            store: ArcSwap::new(Arc::new(HashMap::new())),
-            write_lock: tokio::sync::Mutex::new(()),
+            snapshot: ArcSwap::from_pointee(BTreeMap::new()),
+            refresh_lock: Mutex::new(()),
         }
     }
-    /// Handles file change events: reads, transforms, and updates the store.
-    pub async fn handle_change(&self, path: &PathBuf) -> anyhow::Result<()> {
-        // Canonicalize early so we deduplicate across symlinks.
-        let canonical = match path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => {
-                debug!("Path no longer exists, removing: {:?}", path);
-                self.handle_remove(path).await;
-                return Ok(());
-            }
-        };
 
-        let key = match (self.key_func)(&canonical) {
-            Some(k) => k,
-            None => return Ok(()),
-        };
-
-        // Read file content.
-        let content = match tokio::fs::read_to_string(&canonical).await {
-            Ok(c) => c,
-            Err(e) => {
-                debug!("Failed to read {:?}: {}", canonical, e);
-                self.handle_remove(&canonical).await;
-                return Ok(());
-            }
-        };
-
-        // Transform content to value.
-        let value = match (self.transform)(content.clone()) {
-            Ok(v) => v,
-            Err(e) => {
-                // Keep old value on transient parse errors (e.g., K8s mid-write).
-                warn!(
-                    "Transform error for {:?}: {}, keeping old value",
-                    canonical, e
-                );
-                return Ok(());
-            }
-        };
-
-        // Compute hash.
-        let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        // Update store.
-        {
-            let _guard = self.write_lock.lock().await;
-            let current_map = self.store.load();
-
-            if let Some(tracker) = current_map.get(&key) {
-                if tracker.hash == hash {
-                    debug!("File unchanged: {:?}", canonical);
-                    return Ok(());
-                }
-            }
-
-            let mut new_map = (**current_map).clone();
-            new_map.insert(
-                key.clone(),
-                FileTracker {
-                    path: canonical,
-                    hash,
-                    transformed: Arc::new(value),
-                },
-            );
-            self.store.store(Arc::new(new_map));
-            info!("Updated store (hash={})", hash);
-        }
-
-        Ok(())
-    }
-
-    /// Return a cached value, or make one blocking read attempt on an empty store.
-    /// Never overwrite a store update that happened while the read was in flight.
-    /// An absent file is not cached, so the next caller can observe its creation.
-    pub async fn get_or_load<F>(&self, load: F) -> anyhow::Result<Option<Arc<V>>>
-    where
-        F: FnOnce() -> std::io::Result<Option<(PathBuf, String)>> + Send + 'static,
-    {
-        let snapshot = self.store.load_full();
-        if let Some(tracker) = snapshot.values().next() {
-            return Ok(Some(tracker.transformed.clone()));
-        }
-
-        let loaded = tokio::task::spawn_blocking(load)
-            .await
-            .context("file read task failed")??;
-        let Some((path, content)) = loaded else {
-            return Ok(self.first());
-        };
-        let Some(key) = (self.key_func)(&path) else {
-            return Ok(self.first());
-        };
-        let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
-        let hash = hasher.finish();
-        let transformed = Arc::new((self.transform)(content)?);
-
-        let _guard = self.write_lock.lock().await;
-        let current = self.store.load();
-        if !Arc::ptr_eq(&snapshot, &current) {
-            return Ok(current.values().next().map(|v| v.transformed.clone()));
-        }
-        self.store.store(Arc::new(HashMap::from([(
-            key,
-            FileTracker {
-                path,
-                hash,
-                transformed: transformed.clone(),
-            },
-        )])));
-        Ok(Some(transformed))
-    }
-
-    /// Return the first value in the store's unspecified iteration order.
+    /// Select by key order so rescanning unchanged files does not switch values.
     pub fn first(&self) -> Option<Arc<V>> {
-        self.store
+        self.snapshot
             .load()
-            .values()
-            .next()
-            .map(|v| v.transformed.clone())
-    }
-
-    /// Removes a file entry from the store.
-    pub async fn handle_remove(&self, path: &PathBuf) {
-        let Some(key) = (self.key_func)(path) else {
-            return;
-        };
-
-        let _guard = self.write_lock.lock().await;
-        let current_map = self.store.load();
-        let mut new_map = (**current_map).clone();
-        let removed = new_map.remove(&key).is_some();
-        // Publish even when the key was not cached: a concurrent read-through
-        // may have read this file before its deletion and must not restore it.
-        self.store.store(Arc::new(new_map));
-        if removed {
-            info!("Removed {:?} from store (key={:?})", path, key);
-        }
+            .first_key_value()
+            .map(|(_, value)| value.clone())
     }
 
     pub fn get(&self, key: &K) -> Option<Arc<V>> {
-        self.store
-            .load()
-            .get(key)
-            .map(|tracker| tracker.transformed.clone())
+        self.snapshot.load().get(key).cloned()
     }
 
     pub fn values(&self) -> Vec<Arc<V>> {
-        self.store
-            .load()
-            .values()
-            .map(|tracker| tracker.transformed.clone())
-            .collect()
+        self.snapshot.load().values().cloned().collect()
     }
 
-    pub fn keys(&self) -> Vec<K> {
-        self.store.load().keys().cloned().collect()
+    /// Retry an empty snapshot on demand, using the same refresh path as the watcher.
+    pub async fn get_or_load(self: &Arc<Self>) -> anyhow::Result<Option<Arc<V>>> {
+        if let Some(value) = self.first() {
+            return Ok(Some(value));
+        }
+        let _guard = self.refresh_lock.lock().await;
+        if let Some(value) = self.first() {
+            return Ok(Some(value));
+        }
+        self.load().await?;
+        Ok(self.first())
     }
 
-    pub fn values_owned(&self) -> Vec<V>
-    where
-        V: Clone,
-    {
-        self.store
-            .load()
-            .values()
-            .map(|tracker| (*tracker.transformed).clone())
-            .collect()
+    async fn refresh(self: &Arc<Self>) -> anyhow::Result<()> {
+        let _guard = self.refresh_lock.lock().await;
+        self.load().await
+    }
+
+    /// Called with refresh_lock held through scanning and publication.
+    async fn load(self: &Arc<Self>) -> anyhow::Result<()> {
+        let store = self.clone();
+        let snapshot = tokio::task::spawn_blocking(move || store.scan())
+            .await
+            .context("directory scan task failed")??;
+        // Publish outside spawn_blocking: a cancelled refresh must not publish late.
+        self.snapshot.store(Arc::new(snapshot));
+        Ok(())
+    }
+
+    fn scan(&self) -> anyhow::Result<BTreeMap<K, Arc<V>>> {
+        let mut snapshot = BTreeMap::new();
+        for entry in walkdir::WalkDir::new(&self.path).sort_by_file_name() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error)
+                    if error
+                        .io_error()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(key) = (self.key_func)(path) else {
+                continue;
+            };
+            let content = match std::fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", path.display()));
+                }
+            };
+            let value = (self.transform)(content)
+                .with_context(|| format!("transforming {}", path.display()))?;
+            // Duplicate keys use the first path in sorted traversal order.
+            match snapshot.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Arc::new(value));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    warn!(path = %path.display(), "ignoring duplicate file key");
+                }
+            }
+        }
+        Ok(snapshot)
     }
 }
 
-/// Asynchronous file watcher that monitors a directory and updates the store.
-pub struct AsyncFileWatcher<K, V>
-where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
-{
+/// File events invalidate the directory snapshot; they are never applied as deltas.
+pub struct AsyncFileWatcher<K, V> {
     store: Arc<FileStore<K, V>>,
-    watch_path: PathBuf,
-    debounce_ms: u64,
+    debounce: Duration,
 }
 
 impl<K, V> AsyncFileWatcher<K, V>
 where
-    K: Hash + Eq + Clone + Send + Sync + std::fmt::Debug + 'static,
-    V: Clone + Send + Sync + 'static,
+    K: Ord + Send + Sync + 'static,
+    V: Send + Sync + 'static,
 {
-    pub fn new(store: Arc<FileStore<K, V>>, path: impl Into<PathBuf>) -> Self {
+    pub fn new(store: Arc<FileStore<K, V>>) -> Self {
         Self {
             store,
-            watch_path: path.into(),
-            debounce_ms: 500,
+            debounce: Duration::from_millis(500),
         }
     }
 
-    /// Set the debounce interval in milliseconds.
-    /// Higher values batch more events but increase update latency.
     pub fn with_debounce_ms(mut self, ms: u64) -> Self {
-        self.debounce_ms = ms;
+        self.debounce = Duration::from_millis(ms);
         self
     }
 
-    pub fn store(&self) -> Arc<FileStore<K, V>> {
-        self.store.clone()
-    }
-
-    /// Starts the watcher: sets up notify first, then scans existing files.
+    /// Install the watch before the initial scan. The caller owns task cancellation.
     pub async fn start(self) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-        // Channel: size 256 to tolerate bursts.
-        let (tx, mut rx) = mpsc::channel::<Event>(256);
-
-        // Create watcher *before* scanning so we don't miss early events.
-        let watch_path = self.watch_path.clone();
+        anyhow::ensure!(
+            !self.debounce.is_zero(),
+            "watcher debounce must be positive"
+        );
+        // A full channel already represents a pending refresh, so coalescing is safe.
+        let (tx, rx) = mpsc::channel(1);
         let mut watcher = RecommendedWatcher::new(
-            move |res: notify::Result<Event>| {
-                if let Ok(event) = res {
-                    debug!(
-                        kind = ?event.kind,
-                        paths = ?event.paths,
-                        "Notify event"
-                    );
-                    if tx.try_send(event).is_err() {
-                        warn!("Event channel full, dropping event");
+            move |result: notify::Result<notify::Event>| {
+                match result {
+                    Ok(event)
+                        if !event.need_rescan() && matches!(event.kind, EventKind::Access(_)) =>
+                    {
+                        return;
                     }
+                    Err(error) => warn!(%error, "file watch error, requesting rescan"),
+                    _ => {}
                 }
+                let _ = tx.try_send(());
             },
             Config::default(),
         )
         .context("failed to create file watcher")?;
-
         watcher
-            .watch(&watch_path, RecursiveMode::Recursive)
-            .context("failed to watch path")?;
+            .watch(&self.store.path, RecursiveMode::Recursive)
+            .context("failed to watch directory")?;
 
-        info!("Watching directory: {:?}", watch_path);
-
-        // Spawn the event processing loop (debounce + process).
-        let store = self.store.clone();
-        let debounce_interval = Duration::from_millis(self.debounce_ms);
-
-        let handle = tokio::spawn(async move {
-            let _keep_alive = watcher; // keep watcher alive for the lifetime of this task
-
-            let mut pending: HashSet<PathBuf> = HashSet::new();
-            let mut tick = tokio::time::interval(debounce_interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    biased;
-                    // Collect incoming events into the pending set.
-                    Some(event) = rx.recv() => {
-                        for path in event.paths {
-                            match event.kind {
-                                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                                    pending.insert(path);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-
-                    // Debounce tick: flush pending paths.
-                    _ = tick.tick() => {
-                        if pending.is_empty() {
-                            continue;
-                        }
-
-                        let paths: Vec<_> = pending.drain().collect();
-                        debug!("Debounce tick: processing {} paths", paths.len());
-
-                        for path in &paths {
-                            if path.is_file() {
-                                // Best-effort: log errors but don't abort the loop.
-                                if let Err(e) = store.handle_change(path).await {
-                                    warn!("Failed to handle change: {}", e);
-                                }
-                            } else {
-                                // Likely removed or a broken symlink.
-                                store.handle_remove(path).await;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        // Initial scan *after* watcher is running, so early events are captured.
-        // This also runs concurrently — the watcher thread will process events
-        // while we scan.
-        let store_scan = self.store.clone();
-        let path_scan = self.watch_path.clone();
-        tokio::spawn(async move {
-            info!("Initial scan of {:?}", path_scan);
-            match tokio::task::spawn_blocking(move || {
-                let mut files = Vec::new();
-                let walker = walkdir::WalkDir::new(&path_scan);
-                for entry in walker.into_iter().filter_map(|e| e.ok()) {
-                    if entry.file_type().is_file() {
-                        files.push(entry.path().to_path_buf());
-                    }
-                }
-                files
-            })
-            .await
-            {
-                Ok(file_paths) => {
-                    info!("Found {} files in initial scan", file_paths.len());
-                    for path in &file_paths {
-                        if let Err(e) = store_scan.handle_change(path).await {
-                            warn!("Initial scan failed for {:?}: {}", path, e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Initial scan task panicked: {}", e);
-                }
-            }
-            info!("Initial scan completed");
-        });
-
-        Ok(handle)
-    }
-}
-
-pub struct FileWatcher<V> {
-    path: PathBuf,
-    debouncer: RwLock<Option<Debouncer<RecommendedWatcher, FileIdMap>>>,
-    pub transform: fn(String) -> anyhow::Result<V>,
-    transformed: ArcSwap<Option<V>>,
-}
-
-impl<V> FileWatcher<V>
-where
-    V: Clone + Send + Sync + 'static,
-{
-    pub fn new(path: PathBuf, transform: fn(String) -> anyhow::Result<V>) -> Self {
-        Self {
-            path,
-            debouncer: RwLock::new(None),
-            transform,
-            transformed: ArcSwap::new(Arc::new(None)),
+        if let Err(error) = self.store.refresh().await {
+            warn!(%error, "initial directory scan failed, will retry");
         }
+        info!(path = %self.store.path.display(), "watching directory");
+        Ok(tokio::spawn(async move {
+            let _watcher = watcher;
+            self.run(rx, RESCAN_INTERVAL).await;
+        }))
     }
 
-    fn load(&self) -> anyhow::Result<()> {
-        let content = fs::read_to_string(&self.path)?;
-        let transformed = (self.transform)(content)?;
-
-        self.transformed.store(Arc::new(Some(transformed)));
-        Ok(())
-    }
-
-    pub fn read(&self) -> Arc<Option<V>> {
-        self.transformed.load().clone()
-    }
-
-    pub fn run(self: &Arc<Self>) -> anyhow::Result<()> {
-        debug!(
-            path = ?self.path,
-            debounce_secs = 2,
-            "starting file watcher"
+    async fn run(self, mut changes: mpsc::Receiver<()>, rescan_interval: Duration) {
+        let mut rescan = tokio::time::interval_at(
+            tokio::time::Instant::now() + rescan_interval,
+            rescan_interval,
         );
-
-        let watcher: Arc<FileWatcher<V>> = self.clone();
-        // create debouncer with 2-second timeout
-        // this collapses multiple events (CREATE/CHMOD/RENAME/REMOVE) into a single reload
-        let mut debouncer = new_debouncer_opt(
-            Duration::from_secs(2),
-            None,
-            move |result: DebounceEventResult| match result {
-                Ok(events) => {
-                    if !events.is_empty() {
-                        debug!(event_count = events.len(), "directory events detected");
-
-                        debug!("directory changed, reloading");
-                        match watcher.load() {
-                            Ok(()) => {
-                                debug!("file reloaded successfully after file change");
-                            }
-                            Err(e) => debug!(error = %e, "failed to reload file"),
-                        }
-                    }
+        rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                Some(()) = changes.recv() => {
+                    // Bound batching latency even if changes keep arriving.
+                    tokio::time::sleep(self.debounce).await;
+                    let _ = changes.try_recv();
                 }
-                Err(errors) => {
-                    for error in errors {
-                        debug!(error = ?error, "watcher error");
-                    }
-                }
-            },
-            FileIdMap::new(),
-            notify::Config::default(),
-        )?;
-
-        // start watching the directory
-        debouncer.watch(self.path.clone(), RecursiveMode::NonRecursive)?;
-
-        {
-            let mut guard = self.debouncer.write().unwrap();
-            *guard = Some(debouncer);
+                _ = rescan.tick() => {}
+            }
+            match self.store.refresh().await {
+                Ok(()) => debug!(path = %self.store.path.display(), "directory snapshot refreshed"),
+                Err(error) => warn!(%error, "directory scan failed, keeping previous snapshot"),
+            }
         }
-
-        debug!("file watcher started successfully");
-        Ok(())
     }
 }
 
 #[cfg(test)]
-mod read_through_tests {
+mod tests {
     use super::*;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    use tokio::time::timeout;
 
-    fn store() -> Arc<FileStore<String, String>> {
-        Arc::new(FileStore::new(Ok, |path| {
-            path.file_stem().map(|s| s.to_string_lossy().into_owned())
-        }))
+    fn key(path: &Path) -> Option<String> {
+        path.file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+    }
+
+    fn store(path: &Path) -> Arc<FileStore<String, String>> {
+        Arc::new(FileStore::new(path, Ok, key))
+    }
+
+    async fn wait_for(store: &FileStore<String, String>, value: Option<&str>) {
+        timeout(Duration::from_secs(5), async {
+            while store.first().as_deref().map(String::as_str) != value {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("directory snapshot converges");
     }
 
     #[tokio::test]
-    async fn cache_hit_skips_loader() {
+    async fn refresh_reconciles_duplicate_keys_and_directory_removal() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("token");
-        std::fs::write(&path, "cached").unwrap();
-        let store = store();
-        store.handle_change(&path).await.unwrap();
+        let old = dir.path().join("a-old");
+        let new = dir.path().join("b-new");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&new).unwrap();
+        std::fs::write(old.join("token"), "old").unwrap();
+        std::fs::write(new.join("token"), "new").unwrap();
+        let store = store(dir.path());
+        store.refresh().await.unwrap();
+        assert_eq!(store.first().as_deref().map(String::as_str), Some("old"));
+        std::fs::remove_dir_all(old).unwrap();
+        store.refresh().await.unwrap();
+        assert_eq!(store.first().as_deref().map(String::as_str), Some("new"));
+        std::fs::remove_dir_all(new).unwrap();
+        store.refresh().await.unwrap();
+        assert!(store.first().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_scan_preserves_complete_snapshot_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        std::fs::write(dir.path().join("a"), "first").unwrap();
+        std::fs::write(dir.path().join("b"), "second").unwrap();
+        store.refresh().await.unwrap();
+        let snapshot = store.snapshot.load_full();
+        std::fs::remove_file(dir.path().join("a")).unwrap();
+        std::fs::write(dir.path().join("b"), [0xff]).unwrap();
+        assert!(store.refresh().await.is_err());
+        assert!(Arc::ptr_eq(&snapshot, &store.snapshot.load_full()));
+        std::fs::write(dir.path().join("b"), "updated").unwrap();
+        store.refresh().await.unwrap();
+        assert_eq!(store.values().len(), 1);
         assert_eq!(
-            store
-                .get_or_load(|| panic!("cache hit must not read files"))
-                .await
-                .unwrap(),
-            Some(Arc::new("cached".to_string()))
+            store.first().as_deref().map(String::as_str),
+            Some("updated")
         );
     }
 
     #[tokio::test]
-    async fn stale_read_does_not_overwrite_watcher_update() {
-        concurrent_update(false).await;
+    async fn rescans_select_a_stable_first_key_and_cache_hits_skip_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        std::fs::write(dir.path().join("b"), "second").unwrap();
+        std::fs::write(dir.path().join("a"), "first").unwrap();
+        for _ in 0..3 {
+            store.refresh().await.unwrap();
+            assert_eq!(store.first().as_deref().map(String::as_str), Some("first"));
+        }
+        let cached = store.first().unwrap();
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert!(Arc::ptr_eq(
+            &cached,
+            &store.get_or_load().await.unwrap().unwrap()
+        ));
+    }
+
+    struct ScanGate {
+        started: tokio::sync::Notify,
+        resume: StdMutex<std::sync::mpsc::Receiver<()>>,
+    }
+    static SCAN_GATE: OnceLock<ScanGate> = OnceLock::new();
+
+    fn pause_old_content(content: String) -> anyhow::Result<String> {
+        if content == "old" {
+            let gate = SCAN_GATE.get().unwrap();
+            gate.started.notify_one();
+            gate.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))?;
+        }
+        Ok(content)
     }
 
     #[tokio::test]
-    async fn stale_read_does_not_restore_a_removed_token() {
-        concurrent_update(true).await;
-    }
-
-    #[tokio::test]
-    async fn stale_read_does_not_cache_a_file_removed_before_its_first_publication() {
+    async fn scans_are_serialized_and_cancelled_scans_cannot_publish() {
+        let (resume, receiver) = std::sync::mpsc::channel();
+        assert!(
+            SCAN_GATE
+                .set(ScanGate {
+                    started: tokio::sync::Notify::new(),
+                    resume: StdMutex::new(receiver),
+                })
+                .is_ok()
+        );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token");
-        std::fs::write(&path, "stale").unwrap();
-        let store = store();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let reader = {
+        let store = Arc::new(FileStore::new(dir.path(), pause_old_content, key));
+        std::fs::write(&path, "old").unwrap();
+        let initial = tokio::spawn({
             let store = store.clone();
-            let path = path.clone();
-            tokio::spawn(async move {
-                store
-                    .get_or_load(move || {
-                        let content = std::fs::read_to_string(&path)?;
-                        started_tx.send(()).unwrap();
-                        release_rx.recv().unwrap();
-                        Ok(Some((path, content)))
-                    })
-                    .await
-                    .unwrap()
-            })
-        };
-        started_rx.await.unwrap();
+            async move { store.refresh().await }
+        });
+        timeout(
+            Duration::from_secs(5),
+            SCAN_GATE.get().unwrap().started.notified(),
+        )
+        .await
+        .unwrap();
+        std::fs::write(&path, "new").unwrap();
+        // An event refresh must wait for the entire initial scan, not only publication.
+        assert!(
+            timeout(Duration::from_millis(20), store.refresh())
+                .await
+                .is_err()
+        );
+        resume.send(()).unwrap();
+        initial.await.unwrap().unwrap();
+        store.refresh().await.unwrap();
+        assert_eq!(store.first().as_deref().map(String::as_str), Some("new"));
+
+        std::fs::write(&path, "old").unwrap();
+        let cancelled = tokio::spawn({
+            let store = store.clone();
+            async move { store.refresh().await }
+        });
+        timeout(
+            Duration::from_secs(5),
+            SCAN_GATE.get().unwrap().started.notified(),
+        )
+        .await
+        .unwrap();
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
         std::fs::remove_file(&path).unwrap();
-        store.handle_remove(&path).await;
-        release_tx.send(()).unwrap();
-        assert!(reader.await.unwrap().is_none());
+        store.refresh().await.unwrap();
+        resume.send(()).unwrap();
+        // The abandoned blocking scan may finish, but cannot restore the deleted value.
+        timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&store) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(store.first().is_none());
     }
 
-    async fn concurrent_update(remove: bool) {
+    #[tokio::test]
+    async fn watcher_reconciles_directory_moves_and_atomic_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let watched = dir.path().join("watched");
+        let staged = dir.path().join("staged");
+        std::fs::create_dir(&watched).unwrap();
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("token"), "first").unwrap();
+        let store = store(&watched);
+        let task = AsyncFileWatcher::new(store.clone())
+            .with_debounce_ms(10)
+            .start()
+            .await
+            .unwrap();
+        let nested = watched.join("nested");
+        std::fs::rename(&staged, &nested).unwrap();
+        wait_for(&store, Some("first")).await;
+        std::fs::write(dir.path().join("replacement"), "second").unwrap();
+        std::fs::rename(dir.path().join("replacement"), nested.join("token")).unwrap();
+        wait_for(&store, Some("second")).await;
+        std::fs::rename(&nested, &staged).unwrap();
+        wait_for(&store, None).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn periodic_scan_recovers_without_notifications() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token");
-        let store = store();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let reader = {
-            let store = store.clone();
-            let path = path.clone();
-            tokio::spawn(async move {
-                store
-                    .get_or_load(move || {
-                        started_tx.send(()).unwrap();
-                        release_rx.recv().unwrap();
-                        Ok(Some((path, "stale".to_string())))
-                    })
-                    .await
-                    .unwrap()
-            })
-        };
-        started_rx.await.unwrap();
-        std::fs::write(&path, "newer").unwrap();
-        store.handle_change(&path).await.unwrap();
-        if remove {
-            std::fs::remove_file(&path).unwrap();
-            store.handle_remove(&path).await;
-        }
-        release_tx.send(()).unwrap();
-        let expected = (!remove).then(|| Arc::new("newer".to_string()));
-        assert_eq!(reader.await.unwrap(), expected);
-        assert_eq!(store.first(), expected);
+        let store = store(dir.path());
+        std::fs::write(&path, "old").unwrap();
+        store.refresh().await.unwrap();
+        // No OS watcher or event sends: only the recovery timer can update the cache.
+        let (_sender, receiver) = mpsc::channel(1);
+        let watcher = AsyncFileWatcher::new(store.clone());
+        let task = tokio::spawn(watcher.run(receiver, Duration::from_millis(20)));
+        std::fs::write(&path, "new").unwrap();
+        wait_for(&store, Some("new")).await;
+        std::fs::remove_file(path).unwrap();
+        wait_for(&store, None).await;
+        task.abort();
+        let _ = task.await;
     }
 }

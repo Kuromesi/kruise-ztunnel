@@ -17,8 +17,8 @@ use crate::config::ConfigSource;
 use crate::config::{self, RootCert};
 use crate::state::service::{Endpoint, EndpointSet, Service};
 use crate::state::workload::InboundProtocol::{HBONE, TCP};
-use crate::state::workload::{GatewayAddress, NetworkAddress, Workload, gatewayaddress};
 use crate::state::workload::{HealthStatus, InboundProtocol};
+use crate::state::workload::{NetworkAddress, Workload};
 use crate::state::{DemandProxyState, ProxyState};
 use crate::xds::agentio::sandbox::Sandbox as XdsSandbox;
 use crate::xds::istio::workload::Address as XdsAddress;
@@ -71,15 +71,6 @@ pub fn can_run_privilged_test() -> bool {
     is_root
 }
 
-pub fn test_config_with_waypoint(addr: IpAddr) -> config::Config {
-    config::Config {
-        local_xds_config: Some(ConfigSource::Static(
-            local_xds_config(80, Some(addr)).unwrap(),
-        )),
-        ..test_config()
-    }
-}
-
 pub fn test_config_with_port_xds_addr_and_root_cert(
     port: u16,
     xds_addr: Option<String>,
@@ -107,7 +98,7 @@ pub fn test_config_with_port_xds_addr_and_root_cert(
         },
         local_xds_config: match xds_config {
             Some(c) => Some(c),
-            None => Some(ConfigSource::Static(local_xds_config(port, None).unwrap())),
+            None => Some(ConfigSource::Static(local_xds_config(port).unwrap())),
         },
         // Switch all addressed to localhost (so we don't make a bunch of ports expose on public internet when someone runs a test),
         // and port 0 (to avoid port conflicts)
@@ -129,7 +120,6 @@ pub fn test_config_with_port_xds_addr_and_root_cert(
             service_account: "default".to_string(),
         }),
         illegal_ports: HashSet::new(), // for "direct" tests, since the ports are latebound, we can't test illegal ports
-        fake_self_inbound: true, // for "direct" tests, since the ports are latebound, we have to do this. Yes, this is test concerns leaking into prod code
         packet_mark: None,
         ..config::parse_config().unwrap()
     };
@@ -151,7 +141,6 @@ pub fn test_config() -> config::Config {
 pub const TEST_WORKLOAD_SOURCE: &str = "127.0.0.2";
 pub const TEST_WORKLOAD_HBONE: &str = "127.0.0.3";
 pub const TEST_WORKLOAD_TCP: &str = "127.0.0.4";
-pub const TEST_WORKLOAD_WAYPOINT: &str = "127.0.0.5";
 pub const TEST_VIP: &str = "127.10.0.1";
 pub const TEST_VIP_DNS: &str = "127.10.0.2";
 pub const TEST_SERVICE_NAMESPACE: &str = "default";
@@ -226,7 +215,6 @@ pub fn test_default_workload() -> Workload {
         services: Default::default(),
         encoded_labels: None,
         egress_policies: None,
-        mesh_internal_traffic_policy: Default::default(),
     }
 }
 
@@ -294,7 +282,7 @@ fn test_custom_svc(
     })
 }
 
-pub fn local_xds_config(echo_port: u16, waypoint_ip: Option<IpAddr>) -> anyhow::Result<Bytes> {
+pub fn local_xds_config(echo_port: u16) -> anyhow::Result<Bytes> {
     let default_svc = test_custom_svc(
         TEST_SERVICE_NAME,
         TEST_SERVICE_HOST,
@@ -310,7 +298,7 @@ pub fn local_xds_config(echo_port: u16, waypoint_ip: Option<IpAddr>) -> anyhow::
         echo_port,
     )?;
 
-    let mut res: Vec<LocalWorkload> = vec![
+    let res: Vec<LocalWorkload> = vec![
         test_custom_workload(
             TEST_WORKLOAD_SOURCE,
             "local-source",
@@ -344,28 +332,6 @@ pub fn local_xds_config(echo_port: u16, waypoint_ip: Option<IpAddr>) -> anyhow::
             false,
         )?,
     ];
-    if let Some(waypoint_ip) = waypoint_ip {
-        res.push(LocalWorkload {
-            workload: Workload {
-                workload_ips: vec![TEST_WORKLOAD_WAYPOINT.parse()?],
-                protocol: HBONE,
-                uid: "cluster1//v1/Pod/default/local-waypoint".into(),
-                name: "local-waypoint".into(),
-                namespace: "default".into(),
-                service_account: "default".into(),
-                node: "local".into(),
-                waypoint: Some(GatewayAddress {
-                    destination: gatewayaddress::Destination::Address(NetworkAddress {
-                        network: "".into(),
-                        address: waypoint_ip,
-                    }),
-                    hbone_mtls_port: 15008,
-                }),
-                ..test_default_workload()
-            },
-            services: Default::default(),
-        })
-    }
     let svcs: Vec<Service> = vec![default_svc, dns_svc];
     let lc = LocalConfig {
         workloads: res,

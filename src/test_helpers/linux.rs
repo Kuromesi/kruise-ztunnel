@@ -15,7 +15,9 @@
 
 use crate::config::{ConfigSource, ProxyMode};
 use crate::state::service::{Endpoint, Service};
-use crate::state::workload::{HealthStatus, NamespacedHostname, Workload, gatewayaddress};
+use crate::state::workload::{
+    GatewayAddress, HealthStatus, NamespacedHostname, Workload, gatewayaddress,
+};
 use crate::strng::Strng;
 use crate::test_helpers::app::TestApp;
 use crate::test_helpers::netns::{Namespace, Resolver};
@@ -507,28 +509,37 @@ impl<'a> TestWorkloadBuilder<'a> {
         self
     }
 
-    /// Set a waypoint to the workload
-    pub fn waypoint(mut self, waypoint: IpAddr) -> Self {
-        self.w.workload.waypoint = Some(GatewayAddress {
-            destination: gatewayaddress::Destination::Address(NetworkAddress {
-                network: strng::EMPTY,
-                address: waypoint,
-            }),
-            hbone_mtls_port: 15008,
-        });
+    /// Route outbound traffic through an explicit gateway.
+    pub fn egress_gateway(mut self, gateway: IpAddr) -> Self {
+        self.set_egress_gateway(gatewayaddress::Destination::Address(NetworkAddress {
+            network: strng::EMPTY,
+            address: gateway,
+        }));
         self
     }
 
-    /// Set the service waypoint by hostname
-    pub fn waypoint_hostname(mut self, hostname: &str) -> Self {
-        self.w.workload.waypoint = Some(GatewayAddress {
-            destination: gatewayaddress::Destination::Hostname(NamespacedHostname {
-                namespace: strng::literal!("default"),
-                hostname: hostname.into(),
-            }),
-            hbone_mtls_port: 15008,
-        });
+    pub fn egress_gateway_hostname(mut self, hostname: &str) -> Self {
+        self.set_egress_gateway(gatewayaddress::Destination::Hostname(NamespacedHostname {
+            namespace: strng::literal!("default"),
+            hostname: hostname.into(),
+        }));
         self
+    }
+
+    fn set_egress_gateway(&mut self, destination: gatewayaddress::Destination) {
+        use crate::extensions::extensions::{EgressPolicies, EgressPolicy, EgressPolicyAction};
+        self.w.workload.egress_policies = Some(EgressPolicies {
+            policies: vec![EgressPolicy {
+                namespaces: Default::default(),
+                match_cidrs: vec![],
+                match_ports: vec![],
+                policy: EgressPolicyAction::Gateway,
+                gateway: Some(GatewayAddress {
+                    destination,
+                    hbone_mtls_port: 15008,
+                }),
+            }],
+        });
     }
 
     /// Mutate the workload

@@ -37,6 +37,7 @@ pub use metrics::*;
 
 use crate::identity::{Identity, SecretManager};
 
+#[cfg(any(test, feature = "testing"))]
 use crate::dns::resolver::Resolver;
 use crate::drain::DrainWatcher;
 use crate::firewall::metrics::Metrics as FirewallMetrics;
@@ -44,11 +45,11 @@ use crate::firewall::{FirewallController, detect_backend};
 use crate::proxy::connection_manager::{ConnectionManager, PolicyWatcher};
 use crate::proxy::inbound_passthrough::InboundPassthrough;
 use crate::proxy::outbound::Outbound;
+#[cfg(any(test, feature = "testing"))]
 use crate::proxy::socks5::Socks5;
 use crate::rbac::Connection;
 use crate::state::service::{Service, ServiceDescription};
-use crate::state::workload::address::Address;
-use crate::state::workload::{GatewayAddress, Workload};
+use crate::state::workload::Workload;
 use crate::state::{DemandProxyState, WorkloadInfo};
 use crate::{config, identity, socket, tls};
 
@@ -61,6 +62,7 @@ mod inbound_passthrough;
 pub mod metrics;
 mod outbound;
 pub mod pool;
+#[cfg(any(test, feature = "testing"))]
 mod socks5;
 pub mod util;
 
@@ -172,6 +174,7 @@ pub struct Proxy {
     inbound: Inbound,
     inbound_passthrough: InboundPassthrough,
     outbound: Outbound,
+    #[cfg(any(test, feature = "testing"))]
     socks5: Option<Socks5>,
     policy_watcher: PolicyWatcher,
     firewall_controller: Option<FirewallController>,
@@ -262,6 +265,7 @@ pub(super) struct ProxyInputs {
     metrics: Arc<Metrics>,
     socket_factory: Arc<dyn SocketFactory + Send + Sync>,
     local_workload_information: Arc<LocalWorkloadInformation>,
+    #[cfg(any(test, feature = "testing"))]
     resolver: Option<Arc<dyn Resolver + Send + Sync>>,
     // If true, inbound connections created with these inputs will not attempt to preserve the original source IP.
     pub disable_inbound_freebind: bool,
@@ -278,7 +282,7 @@ impl ProxyInputs {
         state: DemandProxyState,
         metrics: Arc<Metrics>,
         socket_factory: Arc<dyn SocketFactory + Send + Sync>,
-        resolver: Option<Arc<dyn Resolver + Send + Sync>>,
+        #[cfg(any(test, feature = "testing"))] resolver: Option<Arc<dyn Resolver + Send + Sync>>,
         local_workload_information: Arc<LocalWorkloadInformation>,
         disable_inbound_freebind: bool,
         crl_manager: Option<Arc<tls::crl::CrlManager>>,
@@ -292,6 +296,7 @@ impl ProxyInputs {
             connection_manager,
             socket_factory,
             local_workload_information,
+            #[cfg(any(test, feature = "testing"))]
             resolver,
             disable_inbound_freebind,
             crl_manager,
@@ -302,28 +307,16 @@ impl ProxyInputs {
 }
 
 impl Proxy {
-    #[allow(unused_mut)]
     pub(super) async fn from_inputs(
-        mut pi: Arc<ProxyInputs>,
+        pi: Arc<ProxyInputs>,
         drain: DrainWatcher,
     ) -> Result<Self, Error> {
         // We setup all the listeners first so we can capture any errors that should block startup
         let inbound = Inbound::new(pi.clone(), drain.clone()).await?;
 
-        // This exists for `direct` integ tests, no other reason
-        #[cfg(any(test, feature = "testing"))]
-        if pi.cfg.fake_self_inbound {
-            warn!("TEST FAKE - overriding inbound address for test");
-            let mut old_cfg = (*pi.cfg).clone();
-            old_cfg.inbound_addr = inbound.address();
-            let mut new_pi = (*pi).clone();
-            new_pi.cfg = Arc::new(old_cfg);
-            pi = Arc::new(new_pi);
-            warn!("TEST FAKE: new address is {:?}", pi.cfg.inbound_addr);
-        }
-
         let inbound_passthrough = InboundPassthrough::new(pi.clone(), drain.clone()).await?;
         let outbound = Outbound::new(pi.clone(), drain.clone()).await?;
+        #[cfg(any(test, feature = "testing"))]
         let socks5 = if pi.cfg.socks5_addr.is_some() {
             let socks5 = Socks5::new(pi.clone(), drain.clone()).await?;
             Some(socks5)
@@ -371,6 +364,7 @@ impl Proxy {
             inbound,
             inbound_passthrough,
             outbound,
+            #[cfg(any(test, feature = "testing"))]
             socks5,
             policy_watcher,
             firewall_controller,
@@ -389,6 +383,7 @@ impl Proxy {
             tasks.push(tokio::spawn(fw.run().in_current_span()));
         }
 
+        #[cfg(any(test, feature = "testing"))]
         if let Some(socks5) = self.socks5 {
             tasks.push(tokio::spawn(socks5.run().in_current_span()));
         };
@@ -400,6 +395,7 @@ impl Proxy {
         Addresses {
             outbound: self.outbound.address(),
             inbound: self.inbound.address(),
+            #[cfg(any(test, feature = "testing"))]
             socks5: self.socks5.as_ref().map(|s| s.address()),
         }
     }
@@ -409,6 +405,7 @@ impl Proxy {
 pub struct Addresses {
     pub outbound: SocketAddr,
     pub inbound: SocketAddr,
+    #[cfg(any(test, feature = "testing"))]
     pub socks5: Option<SocketAddr>,
 }
 
@@ -790,50 +787,6 @@ pub fn guess_inbound_service(
             false
         })
         .map(|s| ServiceDescription::from(s.as_ref()))
-}
-
-// Checks that the source identiy and address match the upstream's waypoint
-async fn check_from_waypoint(
-    state: &DemandProxyState,
-    upstream: &Workload,
-    src_identity: Option<&Identity>,
-    src_ip: &IpAddr,
-) -> bool {
-    let is_waypoint = |wl: &Workload| {
-        Some(wl.identity()).as_ref() == src_identity && wl.workload_ips.contains(src_ip)
-    };
-    check_gateway_address(state, upstream.waypoint.as_ref(), is_waypoint).await
-}
-
-// Check if the source's identity matches any workloads that make up the given gateway
-// TODO: This can be made more accurate by also checking addresses.
-async fn check_gateway_address<F>(
-    state: &DemandProxyState,
-    gateway_address: Option<&GatewayAddress>,
-    predicate: F,
-) -> bool
-where
-    F: Fn(&Workload) -> bool,
-{
-    let Some(gateway_address) = gateway_address else {
-        return false;
-    };
-
-    match state.fetch_destination(&gateway_address.destination).await {
-        Some(Address::Workload(wl)) => return predicate(wl.as_ref()),
-        Some(Address::Service(svc)) => {
-            for ep in svc.endpoints.iter() {
-                // fetch workloads by workload UID since we may not have an IP for an endpoint (e.g., endpoint is just a hostname)
-                let wl = state.fetch_workload_by_uid(&ep.workload_uid).await;
-                if wl.as_ref().is_some_and(|wl| predicate(wl.as_ref())) {
-                    return true;
-                }
-            }
-        }
-        None => {}
-    };
-
-    false
 }
 
 const IPV6_DISABLED_LO: &str = "/proc/sys/net/ipv6/conf/lo/disable_ipv6";

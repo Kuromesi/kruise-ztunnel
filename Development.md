@@ -22,6 +22,10 @@ To do more comprehensive testing, please refer to [Local Testing](#local-testing
 
 ## Local Testing
 
+SOCKS5 is available only in test builds (`cfg(test)` or the `testing` feature).
+Integration tests enable it through `Config::socks5_addr`; normal builds have no
+SOCKS5 listener or configuration. `UNSTABLE_ENABLE_SOCKS5` is no longer supported.
+
 Along with running in a Kubernetes, ztunnel can be run locally for development purposes.
 
 This doc covers ztunnel specifically, for general Istio local development see
@@ -257,6 +261,7 @@ Finally, requests can be sent through the ztunnel:
 redirect-run curl localhost:8080
 ```
 
-In the example request above, the request will go from `curl -> ztunnel (15001) --HBONE--> ztunnel (15008) -> localhost:8080`.
-
-If you wanted the same request to not go over HBONE, you could connect to/from another unknown IP like `127.0.0.2`.
+Without a matching gateway egress policy, the request follows
+`curl -> ztunnel (15001) -> localhost:8080` over TCP. A gateway egress policy routes
+the connection through the configured gateway over HBONE. Discovering the target
+as a Service or Workload does not change the selected route.

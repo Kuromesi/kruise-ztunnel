@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::discovery::Sandbox;
@@ -38,15 +38,14 @@ pub(crate) fn sandbox_token_transform(s: String) -> anyhow::Result<String> {
 /// Derive the [`FileStore`] key from a token file path.
 /// Returns the file stem (filename without extension) as an opaque cache key.
 /// The producer chooses the filename independently of the xDS Sandbox ID.
-pub(crate) fn sandbox_token_key(path: &PathBuf) -> Option<String> {
+pub(crate) fn sandbox_token_key(path: &Path) -> Option<String> {
     path.file_stem().map(|s| s.to_string_lossy().to_string())
 }
 
 /// Looks up Sandbox traffic metadata and watches the local token directory.
 pub struct SandboxManager {
     store: Option<Arc<FileStore<String, String>>>,
-    token_dir: Option<PathBuf>,
-    _watcher_handle: Option<tokio::task::JoinHandle<()>>,
+    watcher_task: Option<tokio::task::JoinHandle<()>>,
     state: DemandProxyState,
 }
 
@@ -54,8 +53,7 @@ impl SandboxManager {
     pub fn new(state: DemandProxyState) -> Self {
         SandboxManager {
             store: None,
-            token_dir: None,
-            _watcher_handle: None,
+            watcher_task: None,
             state,
         }
     }
@@ -79,22 +77,24 @@ impl SandboxManager {
             token_dir,
         );
 
-        let store = Arc::new(FileStore::new(sandbox_token_transform, sandbox_token_key));
+        let store = Arc::new(FileStore::new(
+            token_dir,
+            sandbox_token_transform,
+            sandbox_token_key,
+        ));
 
-        let watcher =
-            AsyncFileWatcher::new(store.clone(), token_dir.clone()).with_debounce_ms(debounce_ms);
+        let watcher = AsyncFileWatcher::new(store.clone()).with_debounce_ms(debounce_ms);
 
         match watcher.start().await {
             Ok(handle) => {
                 tracing::info!("sandbox token watcher started");
-                self._watcher_handle = Some(handle);
+                if let Some(previous) = self.watcher_task.replace(handle) {
+                    previous.abort();
+                }
                 self.store = Some(store);
-                self.token_dir = Some(token_dir);
             }
             Err(e) => {
-                // Failing here leaves `store` as None; all token lookups will
-                // return empty/None, which surfaces as 401/empty header upstream
-                // rather than a crash.
+                // Keep the previous watcher, if any, when replacement cannot start.
                 tracing::error!("failed to start sandbox token watcher: {}", e);
             }
         }
@@ -108,25 +108,7 @@ impl SandboxManager {
     /// An absent token is not cached, so the next lookup can observe its creation.
     pub async fn get_or_load_token(&self) -> Option<Arc<String>> {
         let store = self.store.as_ref()?;
-        if let Some(token) = store.first() {
-            return Some(token);
-        }
-        let token_dir = self.token_dir.clone()?;
-        let result = store
-            .get_or_load(move || {
-                // Use the same file discovery rules as the watcher's initial scan.
-                let file = walkdir::WalkDir::new(token_dir)
-                    .into_iter()
-                    .filter_map(Result::ok)
-                    .find(|entry| entry.file_type().is_file());
-                let Some(file) = file else {
-                    return Ok(None);
-                };
-                let path = file.path().canonicalize()?;
-                let content = std::fs::read_to_string(&path)?;
-                Ok(Some((path, content)))
-            })
-            .await;
+        let result = store.get_or_load().await;
         match result {
             Ok(token) => token,
             Err(err) => {
@@ -140,7 +122,15 @@ impl SandboxManager {
     pub fn get_sandbox_token(&self, token_key: String) -> Option<Arc<String>> {
         match self.store {
             None => None,
-            Some(ref store) => store.get(&token_key).map(|v| v),
+            Some(ref store) => store.get(&token_key),
+        }
+    }
+}
+
+impl Drop for SandboxManager {
+    fn drop(&mut self) {
+        if let Some(task) = &self.watcher_task {
+            task.abort();
         }
     }
 }
@@ -148,17 +138,41 @@ impl SandboxManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn unwatched_manager(token_dir: PathBuf) -> SandboxManager {
         SandboxManager {
             store: Some(Arc::new(FileStore::new(
+                token_dir,
                 sandbox_token_transform,
                 sandbox_token_key,
             ))),
-            token_dir: Some(token_dir),
-            _watcher_handle: None,
+            watcher_task: None,
             state: crate::test_helpers::new_proxy_state(&[], &[], &[]),
         }
+    }
+
+    #[tokio::test]
+    async fn replacing_and_dropping_manager_stops_watchers() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut manager = SandboxManager::new(crate::test_helpers::new_proxy_state(&[], &[], &[]));
+        manager.run(first.path().into(), 10).await;
+        let previous = manager.watcher_task.as_ref().unwrap().abort_handle();
+        let previous_store = Arc::downgrade(manager.store.as_ref().unwrap());
+        manager.run(second.path().into(), 10).await;
+        let current = manager.watcher_task.as_ref().unwrap().abort_handle();
+        let current_store = Arc::downgrade(manager.store.as_ref().unwrap());
+        drop(manager);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !previous.is_finished() || !current.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(previous_store.upgrade().is_none());
+        assert!(current_store.upgrade().is_none());
     }
 
     #[tokio::test]
@@ -258,8 +272,7 @@ mod tests {
 
     #[test]
     fn token_key_returns_none_for_root_path() {
-        // No file component means no sandbox id; the watcher will skip the
-        // event entirely (see FileStore::handle_change).
+        // A path without a file component has no token key.
         assert_eq!(sandbox_token_key(&PathBuf::from("/")), None);
     }
 

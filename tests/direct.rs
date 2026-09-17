@@ -13,9 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +32,6 @@ use ztunnel::identity::mock::new_secret_manager;
 use ztunnel::test_helpers::app::{self as testapp, ParsedMetrics};
 use ztunnel::test_helpers::app::{DestinationAddr, TestApp};
 use ztunnel::test_helpers::assert_eventually;
-use ztunnel::test_helpers::dns::run_dns;
 use ztunnel::test_helpers::helpers::initialize_telemetry;
 use ztunnel::test_helpers::*;
 
@@ -146,7 +144,10 @@ async fn test_shutdown_drain() {
 async fn test_shutdown_forced_drain() {
     helpers::initialize_telemetry();
 
-    let cfg = test_config();
+    let cfg = config::Config {
+        self_termination_deadline: Duration::from_millis(100),
+        ..test_config()
+    };
 
     let cert_manager = new_secret_manager(Duration::from_secs(10));
     let app = ztunnel::app::build_with_cert(Arc::new(cfg), cert_manager.clone())
@@ -223,63 +224,49 @@ fn process_metrics_assertions(metrics: &ParsedMetrics) {
     }
 }
 
-fn base_metrics_assertions(metrics: ParsedMetrics) {
-    process_metrics_assertions(&metrics);
-}
-
 async fn run_request_test(target: &str, node: &str) {
-    run_requests_test(target, node, 1, Some(base_metrics_assertions), false).await
-}
-
-async fn run_requests_test(
-    target: &str,
-    node: &str,
-    num_queries: u8,
-    metrics_assertions: Option<fn(metrics: ParsedMetrics)>,
-    dns: bool,
-) {
     initialize_telemetry();
-    // Test a round trip outbound call (via socks5)
     let echo = tcp::TestServer::new(tcp::Mode::ReadWrite, 0).await;
     let echo_addr = echo.address();
-    let mut cfg = config::Config {
+    let cfg = config::Config {
         local_node: (!node.is_empty()).then(|| node.to_string()),
         ..test_config_with_port(echo_addr.port())
     };
-    let _dns = if dns {
-        let dns_server = run_dns(HashMap::new()).await.unwrap();
-        cfg.dns_resolver_cfg = dns_server.resolver_config();
-        Some(dns_server)
-    } else {
-        None
-    };
     tokio::spawn(echo.run());
     testapp::with_app(cfg, async move |app| {
-        let dst = match SocketAddr::from_str(target) {
-            Ok(s) => DestinationAddr::Ip(s),
-            Err(_) if target.contains(':') => {
-                let (h, port) = target.split_once(':').unwrap();
-                DestinationAddr::Hostname(h.to_string(), port.parse().unwrap())
-            }
-            _ => DestinationAddr::Ip(helpers::with_ip(echo_addr, target.parse().unwrap())),
-        };
-        for _ in 0..num_queries {
-            let mut stream = app
-                .socks5_connect(dst.clone(), TEST_WORKLOAD_SOURCE.parse().unwrap())
-                .await;
-            read_write_stream(&mut stream).await;
-        }
-        if let Some(assertions) = metrics_assertions {
-            let metrics = app.metrics().await.unwrap();
-            assertions(metrics);
-        }
+        let dst = DestinationAddr::Ip(helpers::with_ip(echo_addr, target.parse().unwrap()));
+        let mut stream = app
+            .socks5_connect(dst, TEST_WORKLOAD_SOURCE.parse().unwrap())
+            .await;
+        read_write_stream(&mut stream).await;
+        process_metrics_assertions(&app.metrics().await.unwrap());
     })
     .await;
 }
 
 #[tokio::test]
-async fn test_hbone_request() {
+async fn test_hbone_capable_destination_uses_tcp() {
     run_request_test(TEST_WORKLOAD_HBONE, "").await;
+}
+
+#[tokio::test]
+async fn test_socks5_passthrough() {
+    let echo = tcp::TestServer::new(tcp::Mode::ReadWrite, 0).await;
+    let source = std::net::Ipv4Addr::LOCALHOST.into();
+    let target = helpers::with_ip(echo.address(), source);
+    tokio::spawn(echo.run());
+
+    testapp::with_app(test_config(), async move |app| {
+        timeout(Duration::from_secs(5), async {
+            let mut stream = app
+                .socks5_connect(DestinationAddr::Ip(target), source)
+                .await;
+            read_write_stream(&mut stream).await;
+        })
+        .await
+        .expect("SOCKS5 test listener forwards traffic");
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -288,64 +275,13 @@ async fn test_tcp_request() {
 }
 
 #[tokio::test]
-async fn test_vip_request() {
-    run_request_test(&format!("{TEST_VIP}:80"), "").await;
-}
-
-fn on_demand_dns_assertions(metrics: ParsedMetrics) {
-    let metric = &("istio_on_demand_dns_total");
-    let m = metrics.query(metric, &Default::default());
-    assert!(m.is_some(), "expected metric {metric}");
-    // expecting one cache hit and one cache miss
-    assert!(
-        m.to_owned().unwrap().len() == 1,
-        "expected metric {metric} to have len(1)"
-    );
-    let value = m.unwrap()[0].value.clone();
-    let expected = match *metric {
-        "istio_on_demand_dns_total" => prometheus_parse::Value::Untyped(2.0),
-        &_ => {
-            panic!("dev error; unexpected metric");
-        }
-    };
-    assert!(
-        value == expected,
-        "expected metric {metric} to be 1, was {value:?}",
-    );
-}
-
-#[tokio::test]
-async fn test_on_demand_dns_request() {
-    // first request should trigger on-demand DNS resolution
-    // second request should use cached DNS response
-    run_requests_test(
-        &format!("{TEST_VIP_DNS}:80"),
-        "",
-        2,
-        Some(on_demand_dns_assertions),
-        true,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_hbone_request_local() {
+async fn test_local_hbone_capable_destination_uses_tcp() {
     run_request_test(TEST_WORKLOAD_HBONE, "local").await;
 }
 
 #[tokio::test]
 async fn test_tcp_request_local() {
     run_request_test(TEST_WORKLOAD_TCP, "local").await;
-}
-
-#[tokio::test]
-async fn test_vip_request_local() {
-    run_request_test(&format!("{TEST_VIP}:80"), "local").await;
-}
-
-#[tokio::test]
-async fn test_hostname_request_local() {
-    run_request_test(&format!("{TEST_SERVICE_HOST}:80"), "local").await;
 }
 
 #[tokio::test]

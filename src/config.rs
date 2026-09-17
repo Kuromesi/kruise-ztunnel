@@ -89,8 +89,6 @@ const HTTP2_STREAM_WINDOW_SIZE: &str = "HTTP2_STREAM_WINDOW_SIZE";
 const HTTP2_CONNECTION_WINDOW_SIZE: &str = "HTTP2_CONNECTION_WINDOW_SIZE";
 const HTTP2_FRAME_SIZE: &str = "HTTP2_FRAME_SIZE";
 
-const UNSTABLE_ENABLE_SOCKS5: &str = "UNSTABLE_ENABLE_SOCKS5";
-
 const CRL_PATH: &str = "CRL_PATH";
 
 const DEFAULT_WORKER_THREADS: u16 = 2;
@@ -247,6 +245,8 @@ pub struct Config {
 
     pub pool_unused_release_timeout: Duration,
 
+    /// Explicit proxy listener used by integration tests.
+    #[cfg(any(test, feature = "testing"))]
     pub socks5_addr: Option<SocketAddr>,
     pub admin_addr: Address,
     /// Use a filesystem Unix socket instead of the TCP admin listener.
@@ -308,9 +308,6 @@ pub struct Config {
 
     /// If true, then use builtin fake CA with self-signed certificates.
     pub fake_ca: bool,
-    // If true, then force config to use the linux-assigned listener address:port instead
-    // of the well-known config addr:port socketaddress. Used by `direct` tests.
-    pub fake_self_inbound: bool,
     #[serde(skip_serializing)]
     pub auth: identity::AuthSource,
     // How long ztunnel should wait for in-flight requesthandlers to finish processing
@@ -679,28 +676,17 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         None => Address::Localhost(ipv6_localhost_enabled, DEFAULT_DNS_PORT),
     };
 
-    let socks5_addr = if let Some(true) = parse(UNSTABLE_ENABLE_SOCKS5)? {
-        // TODO: use Address::Localhost for dual stack binding
-        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 15080))
-    } else {
-        None
-    };
-
     let inbound_addr = SocketAddr::new(bind_wildcard, 15008);
     let inbound_plaintext_addr = SocketAddr::new(bind_wildcard, 15006);
     let outbound_addr = SocketAddr::new(bind_wildcard, 15001);
 
-    let mut illegal_ports = HashSet::from([
+    let illegal_ports = HashSet::from([
         // HBONE doesn't have redirection, so we cannot have loops, but this would allow multiple layers of HBONE.
         // This might be desirable in the future, but for now just ban it.
         inbound_addr.port(),
         inbound_plaintext_addr.port(),
         outbound_addr.port(),
     ]);
-
-    if let Some(addr) = socks5_addr {
-        illegal_ports.insert(addr.port());
-    }
 
     let proxy_mode = match parse::<String>(PROXY_MODE)? {
         Some(proxy_mode) => match proxy_mode.as_str() {
@@ -873,7 +859,8 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             DEFAULT_READINESS_PORT, // There is no config for this in ProxyConfig currently
         )),
 
-        socks5_addr,
+        #[cfg(any(test, feature = "testing"))]
+        socks5_addr: None,
         inbound_addr,
         inbound_plaintext_addr,
         outbound_addr,
@@ -964,7 +951,6 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
                 None
             }
         }),
-        fake_self_inbound: false,
         xds_headers: parse_headers(ISTIO_XDS_HEADER_PREFIX)?,
         ca_headers: parse_headers(ISTIO_CA_HEADER_PREFIX)?,
 

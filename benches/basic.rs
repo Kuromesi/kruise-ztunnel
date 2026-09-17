@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,8 +23,10 @@ use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use pprof::criterion::{Output, PProfProfiler};
 use prometheus_client::registry::Registry;
 use tokio::runtime::Runtime;
-use ztunnel::state::workload::Workload;
-use ztunnel::state::{DemandProxyState, ProxyState, ServiceResolutionMode};
+use ztunnel::state::workload::{
+    GatewayAddress, NetworkAddress, Workload, gatewayaddress::Destination,
+};
+use ztunnel::state::{DemandProxyState, ProxyState};
 use ztunnel::strng;
 use ztunnel::xds::ProxyStateUpdateMutator;
 use ztunnel::xds::istio::workload::LoadBalancing;
@@ -96,11 +99,16 @@ pub fn load_balance(c: &mut Criterion) {
         c.bench_function(name, move |b| {
             b.to_async(&rt).iter(|| async {
                 demand
-                    .fetch_upstream(
-                        "".into(),
+                    .fetch_waypoint(
+                        &GatewayAddress {
+                            destination: Destination::Address(NetworkAddress {
+                                network: "".into(),
+                                address: svc_addr.ip(),
+                            }),
+                            hbone_mtls_port: svc_addr.port(),
+                        },
                         &src_wl,
                         svc_addr,
-                        ServiceResolutionMode::Standard,
                     )
                     .await
                     .unwrap()

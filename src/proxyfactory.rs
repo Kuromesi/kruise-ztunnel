@@ -131,6 +131,7 @@ impl ProxyFactory {
         let mut result: ProxyResult = Default::default();
         let drain = proxy_drain.unwrap_or_else(|| self.drain.clone());
 
+        #[cfg(any(test, feature = "testing"))]
         let mut resolver = None;
 
         let local_workload_information = Arc::new(LocalWorkloadInformation::new(
@@ -158,7 +159,10 @@ impl ProxyFactory {
                 self.config.ipv6_enabled,
             )
             .await?;
-            resolver = Some(server.resolver());
+            #[cfg(any(test, feature = "testing"))]
+            {
+                resolver = Some(server.resolver());
+            }
             result.dns_proxy = Some(server);
         }
 
@@ -171,6 +175,7 @@ impl ProxyFactory {
                 self.state.clone(),
                 self.proxy_metrics.clone(),
                 socket_factory.clone(),
+                #[cfg(any(test, feature = "testing"))]
                 resolver,
                 local_workload_information,
                 false,
@@ -219,6 +224,7 @@ impl ProxyFactory {
                 self.state.clone(),
                 self.proxy_metrics.clone(),
                 socket_factory,
+                #[cfg(any(test, feature = "testing"))]
                 None,
                 local_workload_information,
                 true,

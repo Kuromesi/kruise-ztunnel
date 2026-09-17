@@ -18,23 +18,9 @@ package kruise.networking.extensions.v1;
 
 message WorkloadMetadata {
   map<string, string> labels = 1;
-  MeshInternalTrafficPolicy mesh_internal_traffic_policy = 2;
+  reserved 2;
+  reserved "mesh_internal_traffic_policy";
 }
-
-// MeshInternalTrafficPolicy defines how mesh-internal (east-west) traffic is
-// handled by sandbox tunnel proxies.
-enum MeshInternalTrafficPolicy {
-  // The ztunnel performs full peer identity matching and requires complete
-  // cluster workload and service information for mTLS and policy enforcement
-  // on mesh-internal traffic.
-  MESH_INTERNAL_PEER_AWARE = 0;
-
-  // Mesh-internal traffic is treated as passthrough without any peer discovery.
-  // The ztunnel skips upstream discovery, mTLS origination, and load balancing for
-  // in-cluster destinations. This significantly reduces XDS push size in sidecar mode.
-  MESH_INTERNAL_PASSTHROUGH = 1;
-}
-
 
 message EgressPolicies {
     repeated EgressPolicy egress_policies = 1;

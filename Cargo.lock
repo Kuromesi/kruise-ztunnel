@@ -5290,7 +5290,6 @@ dependencies = [
  "boring",
  "boring-rustls-provider",
  "boring-sys",
- "byteorder",
  "bytes",
  "chrono",
  "criterion",

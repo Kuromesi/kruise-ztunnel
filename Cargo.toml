@@ -47,7 +47,6 @@ anyhow = "1.0"
 async-stream = "0.3"
 async-trait = "0.1"
 base64 = "0.22"
-byteorder = "1.5"
 bytes = { version = "1.11", features = ["serde"] }
 chrono = "0.4"
 duration-str = "0.21"

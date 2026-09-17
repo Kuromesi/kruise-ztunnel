@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::TryFutureExt;
@@ -43,11 +43,9 @@ use crate::baggage::{self, Baggage};
 use crate::drain::DrainWatcher;
 use crate::drain::run_with_drain;
 use crate::proxy::h2::{H2Stream, client::WorkloadKey};
-use crate::state::service::{LoadBalancerMode, ServiceDescription};
+use crate::state::ProxyRbacContext;
 use crate::state::workload::OutboundProtocol;
-use crate::state::workload::{InboundProtocol, NetworkAddress, Workload, address::Address};
-use crate::state::{ProxyRbacContext, ServiceResolutionMode};
-use crate::xds::kruise::networking::extensions::v1::MeshInternalTrafficPolicy::MeshInternalPassthrough;
+use crate::state::workload::Workload;
 use crate::{assertions, copy, proxy, socket};
 
 pub struct Outbound {
@@ -107,7 +105,6 @@ impl Outbound {
                             pi: self.pi.clone(),
                             id: TraceParent::new(),
                             pool: pool.clone(),
-                            hbone_port: self.pi.cfg.inbound_addr.port(),
                         };
                         let span = info_span!("outbound", id=%oc.id);
                         let metrics_for_socket_close = self.pi.metrics.clone();
@@ -156,7 +153,6 @@ pub(super) struct OutboundConnection {
     pub(super) pi: Arc<ProxyInputs>,
     pub(super) id: TraceParent,
     pub(super) pool: proxy::pool::WorkloadHBONEPool,
-    pub(super) hbone_port: u16,
 }
 
 impl OutboundConnection {
@@ -175,12 +171,6 @@ impl OutboundConnection {
     ) {
         let start = Instant::now();
 
-        let illegal_call =
-            dest_addr.ip().is_loopback() && self.pi.cfg.illegal_ports.contains(&dest_addr.port());
-        if illegal_call {
-            metrics::log_early_deny(source_addr, dest_addr, Reporter::source, Error::SelfCall);
-            return;
-        }
         // First find the source workload of this traffic. If we don't know where the request is from
         // we will reject it.
         let build = self
@@ -194,7 +184,7 @@ impl OutboundConnection {
                     .sandbox_manager
                     .as_ref()
                     .and_then(|manager| manager.fetch_attested_sandbox(&source));
-                self.build_request(source, sandbox, source_addr.ip(), dest_addr)
+                self.build_request(source, sandbox, dest_addr)
             });
         let req = match Box::pin(build).await {
             Ok(req) => Box::new(req),
@@ -311,10 +301,7 @@ impl OutboundConnection {
             .method(hyper::Method::CONNECT)
             .version(hyper::Version::HTTP_2)
             .header(BAGGAGE_HEADER, baggage(req))
-            .header(
-                FORWARDED,
-                build_forwarded(remote_addr, &req.intended_destination_service),
-            )
+            .header(FORWARDED, build_forwarded(remote_addr))
             .header(TRACEPARENT_HEADER, self.id.header())
             // Identify the source pod, rather than its owning deployment.
             // This context also applies when sandbox mode is disabled.
@@ -404,184 +391,39 @@ impl OutboundConnection {
             source: Some(req.source.clone()),
             destination: req.actual_destination_workload.clone(),
             connection_security_policy: security_policy,
-            destination_service: req.intended_destination_service.clone(),
+            destination_service: None,
         }
     }
 
     // build_request computes all information about the request we should send
-    // TODO: Do we want a single lock for source and upstream...?
     async fn build_request(
         &self,
         source_workload: Arc<Workload>,
         sandbox: Option<Arc<Sandbox>>,
-        downstream: IpAddr,
         target: SocketAddr,
     ) -> Result<Request, Error> {
-        let state = &self.pi.state;
-
-        if source_workload.mesh_internal_traffic_policy == MeshInternalPassthrough {
-            if let Some(result) = self
-                .apply_egress_policy(&source_workload, &sandbox, &target)
-                .await
-            {
-                return result;
-            }
-
-            debug!("built request as passthrough;");
-            return Ok(Request {
-                protocol: OutboundProtocol::TCP,
-                source: source_workload,
-                sandbox,
-                hbone_target_destination: None,
-                actual_destination_workload: None,
-                intended_destination_service: None,
-                actual_destination: target,
-                upstream_sans: vec![],
-            });
+        if self.pi.cfg.illegal_ports.contains(&target.port())
+            && (target.ip().is_loopback() || source_workload.workload_ips.contains(&target.ip()))
+        {
+            return Err(Error::SelfCall);
         }
 
-        // If this is to-service traffic check for a service waypoint
-        // Capture result of whether this is svc addressed
-        let service = if let Some(Address::Service(target_service)) = state
-            .fetch_address(&NetworkAddress {
-                network: self.pi.cfg.network.clone(),
-                address: target.ip(),
-            })
+        if let Some(result) = self
+            .apply_egress_policy(&source_workload, &sandbox, &target)
             .await
         {
-            // if we have a waypoint for this svc, use it; otherwise route traffic normally
-            if let Some(waypoint) = state
-                .fetch_service_waypoint(&target_service, &source_workload, target)
-                .await?
-            {
-                if waypoint.workload.network != source_workload.network {
-                    return Err(Error::NoValidDestination(Box::new(
-                        (*waypoint.workload).clone(),
-                    )));
-                }
-
-                let upstream_sans = waypoint.workload_and_services_san();
-                let actual_destination = waypoint.workload_socket_addr();
-                debug!("built request to service waypoint proxy");
-                return Ok(Request {
-                    protocol: OutboundProtocol::HBONE,
-                    source: source_workload,
-                    sandbox,
-                    hbone_target_destination: Some(HboneAddress::SocketAddr(target)),
-                    actual_destination_workload: Some(waypoint.workload),
-                    intended_destination_service: Some(ServiceDescription::from(&*target_service)),
-                    actual_destination,
-                    upstream_sans,
-                });
-            }
-            // this was service addressed but we did not find a waypoint
-            Some(target_service)
-        } else {
-            // this wasn't service addressed
-            None
-        };
-
-        let Some(us) = state
-            .fetch_upstream(
-                source_workload.network.clone(),
-                &source_workload,
-                target,
-                ServiceResolutionMode::Standard,
-            )
-            .await?
-        else {
-            if let Some(service) = service
-                && service.
-                load_balancer.
-                as_ref().
-                // If we are not a passthrough service, we should have an upstream
-                map(|lb| lb.mode != LoadBalancerMode::Passthrough).
-                // If the service had no lb, we should have an upstream
-                unwrap_or(true)
-            {
-                return Err(Error::NoHealthyUpstream(target));
-            }
-
-            if let Some(result) = self
-                .apply_egress_policy(&source_workload, &sandbox, &target)
-                .await
-            {
-                return result;
-            }
-
-            debug!("built request as passthrough; no upstream found");
-            return Ok(Request {
-                protocol: OutboundProtocol::TCP,
-                source: source_workload,
-                sandbox,
-                hbone_target_destination: None,
-                actual_destination_workload: None,
-                intended_destination_service: None,
-                actual_destination: target,
-                upstream_sans: vec![],
-            });
-        };
-
-        let from_waypoint = proxy::check_from_waypoint(
-            state,
-            &us.workload,
-            Some(&source_workload.identity()),
-            &downstream,
-        )
-        .await;
-
-        // Check if we need to go through a workload addressed waypoint.
-        // Don't traverse waypoint twice if the source is sandwich-outbound.
-        // Don't traverse waypoint if traffic was addressed to a service (handled before)
-        if !from_waypoint && service.is_none() {
-            // For case upstream server has enabled waypoint
-            let waypoint = state
-                .fetch_workload_waypoint(&us.workload, &source_workload, target)
-                .await?;
-            if let Some(waypoint) = waypoint {
-                let actual_destination = waypoint.workload_socket_addr();
-                let upstream_sans = waypoint.workload_and_services_san();
-                debug!("built request to workload waypoint proxy");
-                return Ok(Request {
-                    // Always use HBONE here
-                    protocol: OutboundProtocol::HBONE,
-                    source: source_workload,
-                    sandbox,
-                    // Use the original VIP, not translated
-                    hbone_target_destination: Some(HboneAddress::SocketAddr(target)),
-                    actual_destination_workload: Some(waypoint.workload),
-                    intended_destination_service: us.destination_service.clone(),
-                    actual_destination,
-                    upstream_sans,
-                });
-            }
-            // Workload doesn't have a waypoint; send directly
+            return result;
         }
 
-        let selected_workload_ip = us.selected_workload_ip;
-
-        // only change the port if we're sending HBONE
-        let actual_destination = match us.workload.protocol {
-            InboundProtocol::HBONE => SocketAddr::from((selected_workload_ip, self.hbone_port)),
-            InboundProtocol::TCP => us.workload_socket_addr(),
-        };
-        let hbone_target_destination = match us.workload.protocol {
-            InboundProtocol::HBONE => Some(HboneAddress::SocketAddr(us.workload_socket_addr())),
-            InboundProtocol::TCP => None,
-        };
-
-        // For case no waypoint for both side and direct to remote node proxy
-        let upstream_sans = us.workload_and_services_san();
-        debug!("built request to workload");
+        debug!("built request as passthrough");
         Ok(Request {
-            protocol: OutboundProtocol::from(us.workload.protocol),
+            protocol: OutboundProtocol::TCP,
             source: source_workload,
             sandbox,
-            hbone_target_destination,
-            actual_destination_workload: Some(us.workload.clone()),
-            intended_destination_service: us.destination_service.clone(),
-            actual_destination,
-            upstream_sans,
+            hbone_target_destination: None,
+            actual_destination_workload: None,
+            actual_destination: target,
+            upstream_sans: vec![],
         })
     }
 
@@ -623,7 +465,6 @@ impl OutboundConnection {
                     sandbox: sandbox.clone(),
                     hbone_target_destination: Some(HboneAddress::SocketAddr(*target)),
                     actual_destination_workload: Some(waypoint.workload),
-                    intended_destination_service: None,
                     actual_destination,
                     upstream_sans,
                 }))
@@ -632,15 +473,8 @@ impl OutboundConnection {
     }
 }
 
-fn build_forwarded(remote_addr: SocketAddr, server: &Option<ServiceDescription>) -> String {
-    match server {
-        None => {
-            format!("for=\"{remote_addr}\"")
-        }
-        Some(svc) => {
-            format!("for=\"{remote_addr}\";host={}", svc.hostname)
-        }
-    }
+fn build_forwarded(remote_addr: SocketAddr) -> String {
+    format!("for=\"{remote_addr}\"")
 }
 
 fn baggage(r: &Request) -> String {
@@ -654,14 +488,8 @@ struct Request {
     source: Arc<Workload>,
     // Selected before routing; shared by egress policy, CONNECT headers and the pool key.
     sandbox: Option<Arc<Sandbox>>,
-    // The actual destination workload we are targeting. When proxying through a waypoint, this is the waypoint,
-    // not the original.
-    // May be unset in case of passthrough.
+    // The selected egress gateway workload, if any.
     actual_destination_workload: Option<Arc<Workload>>,
-    // The intended destination service for the request. When proxying through a waypoint, this is *not* the waypoint
-    // service, but rather the original intended service.
-    // May be unset in case of non-service traffic
-    intended_destination_service: Option<ServiceDescription>,
     // The address of the next hop, such as a workload or egress gateway.
     // When using HBONE, the `hbone_target_destination` is the inner :authority and `actual_destination` is the TCP destination.
     actual_destination: SocketAddr,
@@ -733,29 +561,15 @@ mod tests {
     use crate::state::WorkloadInfo;
     use crate::test_helpers::helpers::{initialize_telemetry, test_proxy_metrics};
     use crate::test_helpers::new_proxy_state;
+    use crate::xds::istio::workload::NetworkAddress as XdsNetworkAddress;
+    use crate::xds::istio::workload::Port;
+    use crate::xds::istio::workload::Service as XdsService;
+    use crate::xds::istio::workload::TunnelProtocol as XdsProtocol;
     use crate::xds::istio::workload::Workload as XdsWorkload;
     use crate::xds::istio::workload::address::Type as XdsAddressType;
-    use crate::xds::istio::workload::{IpFamilies, Port};
-    use crate::xds::istio::workload::{LoadBalancing, TunnelProtocol as XdsProtocol};
-    use crate::xds::istio::workload::{NetworkAddress as XdsNetworkAddress, PortList};
-    use crate::xds::istio::workload::{NetworkMode, Service as XdsService};
     use crate::{identity, xds};
 
-    async fn run_build_request(
-        from: &str,
-        to: &str,
-        xds: XdsAddressType,
-        expect: Option<ExpectedRequest<'_>>,
-    ) {
-        run_build_request_multi(from, to, vec![xds], expect).await;
-    }
-
-    async fn run_build_request_multi(
-        from: &str,
-        to: &str,
-        xds: Vec<XdsAddressType>,
-        expect: Option<ExpectedRequest<'_>>,
-    ) -> Option<Request> {
+    fn outbound_with_resources(xds: Vec<XdsAddressType>) -> OutboundConnection {
         let cfg = Arc::new(Config {
             local_node: Some("local-node".to_string()),
             ..crate::config::parse_config().unwrap()
@@ -771,28 +585,7 @@ mod tests {
             node: "local-node".to_string(),
             ..Default::default()
         };
-        let waypoint = XdsWorkload {
-            uid: "cluster1//v1/Pod/ns/waypoint-workload".to_string(),
-            name: "waypoint-workload".to_string(),
-            namespace: "ns".to_string(),
-            addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 10])],
-            node: "local-node".to_string(),
-            service_account: "waypoint-sa".to_string(),
-            ..Default::default()
-        };
-        let waypoint_dual = XdsWorkload {
-            uid: "cluster1//v1/Pod/ns/waypoint-workload-dual".to_string(),
-            name: "waypoint-workload-dual".to_string(),
-            namespace: "ns".to_string(),
-            addresses: vec![
-                Bytes::copy_from_slice(&[127, 0, 0, 11]),
-                Bytes::copy_from_slice("ff06::c5".parse::<Ipv6Addr>().unwrap().octets().as_slice()),
-            ],
-            node: "local-node".to_string(),
-            service_account: "waypoint-sa".to_string(),
-            ..Default::default()
-        };
-        let mut workloads = vec![source, waypoint, waypoint_dual];
+        let mut workloads = vec![source];
         let mut services = vec![];
         for x in xds {
             match x {
@@ -814,7 +607,7 @@ mod tests {
             state.clone(),
             identity::mock::new_secret_manager(Duration::from_secs(10)),
         ));
-        let outbound = OutboundConnection {
+        OutboundConnection {
             pi: Arc::new(ProxyInputs {
                 state: state.clone(),
                 cfg: cfg.clone(),
@@ -834,846 +627,167 @@ mod tests {
                 sock_fact,
                 local_workload_information.clone(),
             ),
-            hbone_port: cfg.inbound_addr.port(),
-        };
+        }
+    }
 
-        let local = outbound
+    #[tokio::test]
+    async fn routing_uses_source_policy_for_known_and_unknown_destinations() {
+        use crate::state::workload::{
+            GatewayAddress, NamespacedHostname, gatewayaddress::Destination,
+        };
+        let outbound = outbound_with_resources(vec![
+            XdsAddressType::Workload(XdsWorkload {
+                uid: "destination".into(),
+                addresses: vec![Bytes::from_static(&[127, 0, 0, 2])],
+                tunnel_protocol: XdsProtocol::Hbone.into(),
+                waypoint: Some(xds::istio::workload::GatewayAddress {
+                    destination: Some(xds::istio::workload::gateway_address::Destination::Address(
+                        XdsNetworkAddress {
+                            network: "remote".into(),
+                            address: vec![127, 0, 0, 99],
+                        },
+                    )),
+                    hbone_mtls_port: 15008,
+                }),
+                ..Default::default()
+            }),
+            XdsAddressType::Service(XdsService {
+                hostname: "target.ns".into(),
+                namespace: "ns".into(),
+                addresses: vec![XdsNetworkAddress {
+                    network: "".into(),
+                    address: vec![127, 0, 0, 3],
+                }],
+                ports: vec![Port {
+                    service_port: 80,
+                    target_port: 8080,
+                }],
+                waypoint: Some(xds::istio::workload::GatewayAddress {
+                    destination: Some(xds::istio::workload::gateway_address::Destination::Address(
+                        XdsNetworkAddress {
+                            network: "".into(),
+                            address: vec![127, 0, 0, 99],
+                        },
+                    )),
+                    hbone_mtls_port: 15008,
+                }),
+                ..Default::default()
+            }),
+            XdsAddressType::Workload(XdsWorkload {
+                uid: "egress-gateway".into(),
+                namespace: "ns".into(),
+                hostname: "egress.ns".into(),
+                addresses: vec![Bytes::from_static(&[127, 0, 0, 10])],
+                ..Default::default()
+            }),
+        ]);
+        let source = outbound
             .pi
             .local_workload_information
             .get_workload()
             .await
             .unwrap();
-        let req = outbound
-            .build_request(local, None, from.parse().unwrap(), to.parse().unwrap())
-            .await
-            .ok();
-        if let Some(ref r) = req {
-            assert_eq!(
-                expect,
-                Some(ExpectedRequest {
-                    protocol: r.protocol,
-                    hbone_destination: &r
-                        .hbone_target_destination
-                        .as_ref()
-                        .map(|s| s.to_string())
-                        .unwrap_or_default(),
-                    destination: &r.actual_destination.to_string(),
-                })
-            );
-        } else {
-            assert_eq!(expect, None);
-        }
-        req
-    }
+        for target in ["127.0.0.2:80", "127.0.0.3:80", "203.0.113.1:80"] {
+            let target: SocketAddr = target.parse().unwrap();
+            let direct = outbound
+                .build_request(source.clone(), None, target)
+                .await
+                .unwrap();
+            assert_eq!(direct.protocol, OutboundProtocol::TCP);
+            assert_eq!(direct.actual_destination, target);
+            assert!(direct.actual_destination_workload.is_none());
+            assert!(direct.hbone_target_destination.is_none());
 
-    #[tokio::test]
-    async fn build_request_unknown_dest() {
-        run_build_request(
-            "127.0.0.1",
-            "1.2.3.4:80",
-            XdsAddressType::Workload(XdsWorkload {
-                uid: "cluster1//v1/Pod/default/my-pod".to_string(),
-                addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-                ..Default::default()
-            }),
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::TCP,
-                hbone_destination: "",
-                destination: "1.2.3.4:80",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_wrong_network() {
-        run_build_request_multi(
-            "127.0.0.1",
-            "127.0.0.3:80",
-            vec![
-                XdsAddressType::Service(XdsService {
-                    hostname: "example.com".to_string(),
-                    addresses: vec![XdsNetworkAddress {
-                        network: "".to_string(),
-                        address: vec![127, 0, 0, 3],
-                    }],
-                    ports: vec![Port {
-                        service_port: 80,
-                        target_port: 8080,
-                    }],
-                    ..Default::default()
-                }),
-                XdsAddressType::Workload(XdsWorkload {
-                    uid: "cluster1//v1/Pod/default/remote-pod".to_string(),
-                    addresses: vec![Bytes::copy_from_slice(&[10, 0, 0, 2])],
-                    network: "remote".to_string(),
-                    services: std::collections::HashMap::from([(
-                        "/example.com".to_string(),
-                        PortList {
-                            ports: vec![Port {
-                                service_port: 80,
-                                target_port: 8080,
-                            }],
-                        },
-                    )]),
-                    ..Default::default()
-                }),
-            ],
-            None,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_does_not_failover_across_networks() {
-        let service = XdsAddressType::Service(XdsService {
-            hostname: "example.com".to_string(),
-            addresses: vec![XdsNetworkAddress {
-                network: "".to_string(),
-                address: vec![127, 0, 0, 3],
-            }],
-            ports: vec![Port {
-                service_port: 80,
-                target_port: 8080,
-            }],
-            load_balancing: Some(xds::istio::workload::LoadBalancing {
-                routing_preference: vec![
-                    xds::istio::workload::load_balancing::Scope::Network.into(),
-                ],
-                mode: xds::istio::workload::load_balancing::Mode::Failover.into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        let remote_workload = XdsAddressType::Workload(XdsWorkload {
-            uid: "Kubernetes//Pod/default/remote-example.com-pod".to_string(),
-            addresses: vec![Bytes::copy_from_slice(&[10, 22, 1, 2])],
-            network: "remote".to_string(),
-            services: std::collections::HashMap::from([(
-                "/example.com".to_string(),
-                PortList {
-                    ports: vec![Port {
-                        service_port: 80,
-                        target_port: 8080,
-                    }],
-                },
-            )]),
-            ..Default::default()
-        });
-        let healthy_local_workload = XdsAddressType::Workload(XdsWorkload {
-            uid: "Kubernetes//Pod/default/local-example.com-pod".to_string(),
-            addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-            network: "".to_string(),
-            tunnel_protocol: xds::istio::workload::TunnelProtocol::Hbone.into(),
-            services: std::collections::HashMap::from([(
-                "/example.com".to_string(),
-                PortList {
-                    ports: vec![Port {
-                        service_port: 80,
-                        target_port: 8080,
-                    }],
-                },
-            )]),
-            status: xds::istio::workload::WorkloadStatus::Healthy.into(),
-            ..Default::default()
-        });
-        let unhealthy_local_workload = XdsAddressType::Workload(XdsWorkload {
-            uid: "Kubernetes//Pod/default/local-example.com-pod".to_string(),
-            addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-            network: "".to_string(),
-            tunnel_protocol: xds::istio::workload::TunnelProtocol::Hbone.into(),
-            services: std::collections::HashMap::from([(
-                "/example.com".to_string(),
-                PortList {
-                    ports: vec![Port {
-                        service_port: 80,
-                        target_port: 8080,
-                    }],
-                },
-            )]),
-            status: xds::istio::workload::WorkloadStatus::Unhealthy.into(),
-            ..Default::default()
-        });
-
-        run_build_request_multi(
-            "127.0.0.1",
-            "127.0.0.3:80",
-            vec![
-                service.clone(),
-                remote_workload.clone(),
-                healthy_local_workload.clone(),
-            ],
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::HBONE,
-                hbone_destination: "127.0.0.2:8080",
-                destination: "127.0.0.2:15008",
-            }),
-        )
-        .await;
-
-        run_build_request_multi(
-            "127.0.0.1",
-            "127.0.0.3:80",
-            vec![
-                service.clone(),
-                remote_workload.clone(),
-                unhealthy_local_workload.clone(),
-            ],
-            None,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_known_dest_remote_node_tcp() {
-        run_build_request(
-            "127.0.0.1",
-            "127.0.0.2:80",
-            XdsAddressType::Workload(XdsWorkload {
-                uid: "cluster1//v1/Pod/ns/test-tcp".to_string(),
-                name: "test-tcp".to_string(),
-                namespace: "ns".to_string(),
-                addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-                tunnel_protocol: XdsProtocol::None as i32,
-                node: "remote-node".to_string(),
-                ..Default::default()
-            }),
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::TCP,
-                hbone_destination: "",
-                destination: "127.0.0.2:80",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_known_dest_remote_node_hbone() {
-        run_build_request(
-            "127.0.0.1",
-            "127.0.0.2:80",
-            XdsAddressType::Workload(XdsWorkload {
-                uid: "cluster1//v1/Pod/ns/test-tcp".to_string(),
-                name: "test-tcp".to_string(),
-                namespace: "ns".to_string(),
-                addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-                tunnel_protocol: XdsProtocol::Hbone as i32,
-                node: "remote-node".to_string(),
-                ..Default::default()
-            }),
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::HBONE,
-                hbone_destination: "127.0.0.2:80",
-                destination: "127.0.0.2:15008",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_known_dest_local_node_tcp() {
-        run_build_request(
-            "127.0.0.1",
-            "127.0.0.2:80",
-            XdsAddressType::Workload(XdsWorkload {
-                uid: "cluster1//v1/Pod/ns/test-tcp".to_string(),
-                name: "test-tcp".to_string(),
-                namespace: "ns".to_string(),
-                addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-                tunnel_protocol: XdsProtocol::None as i32,
-                node: "local-node".to_string(),
-                ..Default::default()
-            }),
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::TCP,
-                hbone_destination: "",
-                destination: "127.0.0.2:80",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_known_dest_local_node_hbone() {
-        run_build_request(
-            "127.0.0.1",
-            "127.0.0.2:80",
-            XdsAddressType::Workload(XdsWorkload {
-                uid: "cluster1//v1/Pod/ns/test-tcp".to_string(),
-                name: "test-tcp".to_string(),
-                namespace: "ns".to_string(),
-                addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-                tunnel_protocol: XdsProtocol::Hbone as i32,
-                node: "local-node".to_string(),
-                ..Default::default()
-            }),
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::HBONE,
-                hbone_destination: "127.0.0.2:80",
-                destination: "127.0.0.2:15008",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_source_waypoint() {
-        run_build_request(
-            "127.0.0.2",
-            "127.0.0.1:80",
-            XdsAddressType::Workload(XdsWorkload {
-                uid: "cluster1//v1/Pod/default/my-pod".to_string(),
-                addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-                waypoint: Some(xds::istio::workload::GatewayAddress {
-                    destination: Some(xds::istio::workload::gateway_address::Destination::Address(
-                        XdsNetworkAddress {
-                            network: "".to_string(),
-                            address: [127, 0, 0, 10].to_vec(),
-                        },
-                    )),
-                    hbone_mtls_port: 15008,
-                }),
-                ..Default::default()
-            }),
-            // Even though source has a waypoint, we don't use it
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::TCP,
-                hbone_destination: "",
-                destination: "127.0.0.1:80",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_destination_waypoint() {
-        run_build_request(
-            "127.0.0.1",
-            "127.0.0.2:80",
-            XdsAddressType::Workload(XdsWorkload {
-                uid: "cluster1//v1/Pod/default/my-pod".to_string(),
-                addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-                waypoint: Some(xds::istio::workload::GatewayAddress {
-                    destination: Some(xds::istio::workload::gateway_address::Destination::Address(
-                        XdsNetworkAddress {
-                            network: "".to_string(),
-                            address: [127, 0, 0, 10].to_vec(),
-                        },
-                    )),
-                    hbone_mtls_port: 15008,
-                }),
-                ..Default::default()
-            }),
-            // Should use the waypoint
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::HBONE,
-                hbone_destination: "127.0.0.2:80",
-                destination: "127.0.0.10:15008",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_destination_waypoint_mismatch_ip() {
-        run_build_request(
-            "127.0.0.1",
-            "[ff06::c3]:80",
-            XdsAddressType::Workload(XdsWorkload {
-                uid: "cluster1//v1/Pod/default/my-pod".to_string(),
-                addresses: vec![
-                    Bytes::copy_from_slice(&[127, 0, 0, 2]),
-                    Bytes::copy_from_slice(
-                        "ff06::c3".parse::<Ipv6Addr>().unwrap().octets().as_slice(),
-                    ),
-                ],
-                waypoint: Some(xds::istio::workload::GatewayAddress {
-                    destination: Some(xds::istio::workload::gateway_address::Destination::Address(
-                        XdsNetworkAddress {
-                            network: "".to_string(),
-                            address: [127, 0, 0, 11].to_vec(),
-                        },
-                    )),
-                    hbone_mtls_port: 15008,
-                }),
-                ..Default::default()
-            }),
-            // Should use the waypoint
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::HBONE,
-                hbone_destination: "[ff06::c3]:80",
-                destination: "127.0.0.11:15008",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_destination_svc_waypoint() {
-        run_build_request(
-            "127.0.0.1",
-            "127.0.0.3:80",
-            XdsAddressType::Service(XdsService {
-                addresses: vec![XdsNetworkAddress {
-                    network: "".to_string(),
-                    address: vec![127, 0, 0, 3],
-                }],
-                ports: vec![Port {
-                    service_port: 80,
-                    target_port: 8080,
-                }],
-                waypoint: Some(xds::istio::workload::GatewayAddress {
-                    destination: Some(xds::istio::workload::gateway_address::Destination::Address(
-                        XdsNetworkAddress {
-                            network: "".to_string(),
-                            address: [127, 0, 0, 10].to_vec(),
-                        },
-                    )),
-                    hbone_mtls_port: 15008,
-                }),
-                ..Default::default()
-            }),
-            // Should use the waypoint
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::HBONE,
-                hbone_destination: "127.0.0.3:80",
-                destination: "127.0.0.10:15008",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_rejects_remote_service_waypoint() {
-        run_build_request_multi(
-            "127.0.0.1",
-            "127.0.0.3:80",
-            vec![
-                XdsAddressType::Service(XdsService {
-                    hostname: "example.com".to_string(),
-                    addresses: vec![XdsNetworkAddress {
-                        network: "".to_string(),
-                        address: vec![127, 0, 0, 3],
-                    }],
-                    waypoint: Some(xds::istio::workload::GatewayAddress {
-                        destination: Some(
-                            xds::istio::workload::gateway_address::Destination::Address(
-                                XdsNetworkAddress {
-                                    network: "remote".to_string(),
-                                    address: vec![10, 22, 1, 1],
-                                },
-                            ),
-                        ),
-                        hbone_mtls_port: 15008,
-                    }),
-                    ..Default::default()
-                }),
-                XdsAddressType::Workload(XdsWorkload {
-                    uid: "cluster1//v1/Pod/default/remote-waypoint".to_string(),
-                    addresses: vec![Bytes::copy_from_slice(&[10, 22, 1, 1])],
-                    network: "remote".to_string(),
-                    ..Default::default()
-                }),
-            ],
-            None,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_empty_service() {
-        run_build_request(
-            "127.0.0.1",
-            "127.0.0.3:80",
-            XdsAddressType::Service(XdsService {
-                addresses: vec![XdsNetworkAddress {
-                    network: "".to_string(),
-                    address: vec![127, 0, 0, 3],
-                }],
-                ports: vec![Port {
-                    service_port: 80,
-                    target_port: 8080,
-                }],
-                ..Default::default()
-            }),
-            // Should use the waypoint
-            None,
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_target_port() {
-        run_build_request_multi(
-            "127.0.0.1",
-            "127.0.0.3:80",
-            vec![
-                XdsAddressType::Service(XdsService {
-                    hostname: "example.com".to_string(),
-                    addresses: vec![XdsNetworkAddress {
-                        network: "".to_string(),
-                        address: vec![127, 0, 0, 3],
-                    }],
-                    ports: vec![
-                        Port {
-                            service_port: 80,
-                            target_port: 0, // named port
-                        },
-                        Port {
-                            service_port: 8080,
-                            target_port: 0, // named port
-                        },
-                    ],
-                    ..Default::default()
-                }),
-                XdsAddressType::Workload(XdsWorkload {
-                    uid: "cluster1//v1/Pod/default/matching-pod".to_string(),
-                    addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-                    services: std::collections::HashMap::from([(
-                        "/example.com".to_string(),
-                        PortList {
-                            ports: vec![Port {
-                                service_port: 80,
-                                target_port: 1234,
-                            }],
-                        },
-                    )]),
-                    ..Default::default()
-                }),
-                // This pod does not have a port 80 defined at all
-                XdsAddressType::Workload(XdsWorkload {
-                    uid: "cluster1//v1/Pod/default/unmatching-pod".to_string(),
-                    addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 4])],
-                    services: std::collections::HashMap::from([(
-                        "/example.com".to_string(),
-                        PortList {
-                            ports: vec![Port {
-                                service_port: 8080,
-                                target_port: 9999,
-                            }],
-                        },
-                    )]),
-                    ..Default::default()
-                }),
-            ],
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::TCP,
-                hbone_destination: "",
-                destination: "127.0.0.2:1234",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_host_network() {
-        let xds = vec![
-            // Normal service
-            XdsAddressType::Service(XdsService {
-                hostname: "example.com".to_string(),
-                addresses: vec![XdsNetworkAddress {
-                    network: "".to_string(),
-                    address: vec![127, 0, 0, 3],
-                }],
-                ports: vec![Port {
-                    service_port: 80,
-                    target_port: 80,
-                }],
-                ..Default::default()
-            }),
-            // Workload is host network, so it's going to have the same IP as another workload
-            XdsAddressType::Workload(XdsWorkload {
-                uid: "cluster1//v1/Pod/default/pod1".to_string(),
-                name: "pod1".to_string(),
-                addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-                services: std::collections::HashMap::from([(
-                    "/example.com".to_string(),
-                    PortList {
-                        ports: vec![Port {
-                            service_port: 80,
-                            target_port: 80,
+            for action in [
+                EgressPolicyAction::Passthrough,
+                EgressPolicyAction::Deny,
+                EgressPolicyAction::Gateway,
+            ] {
+                let source = Arc::new(Workload {
+                    egress_policies: Some(EgressPolicies {
+                        policies: vec![EgressPolicy {
+                            namespaces: Default::default(),
+                            match_cidrs: vec![],
+                            match_ports: vec![],
+                            policy: action,
+                            gateway: Some(GatewayAddress {
+                                destination: Destination::Hostname(NamespacedHostname {
+                                    namespace: "ns".into(),
+                                    hostname: "egress.ns".into(),
+                                }),
+                                hbone_mtls_port: 15008,
+                            }),
                         }],
-                    },
-                )]),
-                network_mode: NetworkMode::HostNetwork as i32,
-                ..Default::default()
-            }),
-            XdsAddressType::Workload(XdsWorkload {
-                uid: "cluster1//v1/Pod/default/pod2".to_string(),
-                name: "pod2".to_string(),
-                addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
-                network_mode: NetworkMode::HostNetwork as i32,
-                ..Default::default()
-            }),
-        ];
-        let res = run_build_request_multi(
-            "127.0.0.1",
-            "127.0.0.3:80",
-            xds.clone(),
-            // Traffic to the service should go to the pod in the service
-            Some(ExpectedRequest {
-                destination: "127.0.0.2:80",
-                protocol: OutboundProtocol::TCP,
-                hbone_destination: "",
-            }),
-        )
-        .await
-        .expect("must resolve");
-        // Ensure it actually went to pod1, not the other pod with the same IP
-        assert_eq!(
-            res.actual_destination_workload.expect("found a dest").name,
-            "pod1"
+                    }),
+                    ..(*source).clone()
+                });
+                let result = outbound.build_request(source, None, target).await;
+                match action {
+                    EgressPolicyAction::Deny => {
+                        assert!(matches!(result, Err(Error::EgressPolicyDenied(_))))
+                    }
+                    EgressPolicyAction::Passthrough => {
+                        let request = result.unwrap();
+                        assert_eq!(request.protocol, OutboundProtocol::TCP);
+                        assert_eq!(request.actual_destination, target);
+                    }
+                    EgressPolicyAction::Gateway => {
+                        let request = result.unwrap();
+                        assert_eq!(request.protocol, OutboundProtocol::HBONE);
+                        assert_eq!(
+                            request.actual_destination,
+                            "127.0.0.10:15008".parse().unwrap()
+                        );
+                        assert_eq!(
+                            request.hbone_target_destination.unwrap().to_string(),
+                            target.to_string()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_routing_rejects_local_proxy_ports() {
+        let outbound = outbound_with_resources(vec![]);
+        let source = Arc::new(Workload {
+            workload_ips: vec!["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()],
+            ..crate::test_helpers::test_default_workload()
+        });
+        for port in [15001, 15006, 15008] {
+            for ip in ["127.0.0.1", "::1", "192.0.2.1", "2001:db8::1"] {
+                let target = SocketAddr::new(ip.parse().unwrap(), port);
+                assert!(matches!(
+                    outbound.build_request(source.clone(), None, target).await,
+                    Err(Error::SelfCall)
+                ));
+            }
+            let target = SocketAddr::new("192.0.2.2".parse().unwrap(), port);
+            assert!(
+                outbound
+                    .build_request(source.clone(), None, target)
+                    .await
+                    .is_ok()
+            );
+        }
+        assert!(
+            outbound
+                .build_request(source, None, "192.0.2.1:8080".parse().unwrap())
+                .await
+                .is_ok()
         );
-
-        // Traffic to the node directly. We should forward the request, but as passthrough, rather than
-        // associating it with a random pod.
-        let res = run_build_request_multi(
-            "127.0.0.1",
-            "127.0.0.2:80",
-            xds.clone(),
-            // Traffic to the service should go to the pod in the service
-            Some(ExpectedRequest {
-                destination: "127.0.0.2:80",
-                protocol: OutboundProtocol::TCP,
-                hbone_destination: "",
-            }),
-        )
-        .await
-        .expect("must resolve");
-        // Ensure it actually went to pod1, not the other pod with the same IP
-        assert_eq!(res.actual_destination_workload, None);
-    }
-
-    #[tokio::test]
-    async fn multiple_address_workload() {
-        let workload = XdsAddressType::Workload(XdsWorkload {
-            uid: "cluster1//v1/Pod/ns/test-tcp".to_string(),
-            name: "test-tcp".to_string(),
-            namespace: "ns".to_string(),
-            addresses: vec![
-                Bytes::copy_from_slice(&[127, 0, 0, 2]),
-                Bytes::copy_from_slice("ff06::c3".parse::<Ipv6Addr>().unwrap().octets().as_slice()),
-            ],
-            tunnel_protocol: XdsProtocol::None as i32,
-            node: "remote-node".to_string(),
-            ..Default::default()
-        });
-        // v4 goes go v4
-        run_build_request(
-            "127.0.0.1",
-            "127.0.0.2:80",
-            workload.clone(),
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::TCP,
-                hbone_destination: "",
-                destination: "127.0.0.2:80",
-            }),
-        )
-        .await;
-        // v6 goes go v6
-        run_build_request(
-            "127.0.0.1",
-            "[ff06::c3]:80",
-            workload.clone(),
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::TCP,
-                hbone_destination: "",
-                destination: "[ff06::c3]:80",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn service_ip_families() {
-        initialize_telemetry();
-        let workload = XdsAddressType::Workload(XdsWorkload {
-            uid: "cluster1//v1/Pod/default/dual".to_string(),
-            addresses: vec![
-                Bytes::copy_from_slice(&[127, 0, 0, 2]),
-                Bytes::copy_from_slice("ff06::c3".parse::<Ipv6Addr>().unwrap().octets().as_slice()),
-            ],
-            tunnel_protocol: 1,
-            services: std::collections::HashMap::from([(
-                "/example.com".to_string(),
-                PortList { ports: vec![] },
-            )]),
-            ..Default::default()
-        });
-        let svc = |f: IpFamilies| {
-            let mut s = XdsService {
-                hostname: "example.com".to_string(),
-                addresses: vec![
-                    XdsNetworkAddress {
-                        network: "".to_string(),
-                        address: vec![127, 0, 0, 3],
-                    },
-                    XdsNetworkAddress {
-                        network: "".to_string(),
-                        address: "::3".parse::<Ipv6Addr>().unwrap().octets().into(),
-                    },
-                ],
-                ports: vec![Port {
-                    service_port: 80,
-                    target_port: 80,
-                }],
-                ..Default::default()
-            };
-            s.set_ip_families(f);
-            XdsAddressType::Service(s)
-        };
-        // V6 only should always use V6 IP
-        run_build_request_multi(
-            "127.0.0.1",
-            "127.0.0.3:80",
-            vec![svc(IpFamilies::Ipv6Only), workload.clone()],
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::HBONE,
-                hbone_destination: "[ff06::c3]:80",
-                destination: "[ff06::c3]:15008",
-            }),
-        )
-        .await;
-        // V4 only should always use V4 IP
-        run_build_request_multi(
-            "127.0.0.1",
-            "127.0.0.3:80",
-            vec![svc(IpFamilies::Ipv4Only), workload.clone()],
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::HBONE,
-                hbone_destination: "127.0.0.2:80",
-                destination: "127.0.0.2:15008",
-            }),
-        )
-        .await;
-        // Dual stack should always prefer the original family (here ipv4)
-        run_build_request_multi(
-            "127.0.0.1",
-            "127.0.0.3:80",
-            vec![svc(IpFamilies::Dual), workload.clone()],
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::HBONE,
-                hbone_destination: "127.0.0.2:80",
-                destination: "127.0.0.2:15008",
-            }),
-        )
-        .await;
-        // Dual stack should always prefer the original family (here ipv6)
-        run_build_request_multi(
-            "::1",
-            "[::3]:80",
-            vec![svc(IpFamilies::Dual), workload.clone()],
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::HBONE,
-                hbone_destination: "[ff06::c3]:80",
-                destination: "[ff06::c3]:15008",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_passthrough_svc() {
-        run_build_request(
-            "127.0.0.1",
-            "1.2.3.4:80",
-            XdsAddressType::Service(XdsService {
-                hostname: "example.com".to_string(),
-                waypoint: None,
-                load_balancing: Some(LoadBalancing {
-                    mode: xds::istio::workload::load_balancing::Mode::Passthrough.into(),
-                    ..Default::default()
-                }),
-                addresses: vec![
-                    XdsNetworkAddress {
-                        network: "".to_string(),
-                        address: vec![1, 2, 3, 4],
-                    },
-                    XdsNetworkAddress {
-                        network: "".to_string(),
-                        address: vec![1, 5, 6, 7],
-                    },
-                ],
-                ports: vec![Port {
-                    service_port: 80,
-                    target_port: 80,
-                }],
-                ..Default::default()
-            }),
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::TCP,
-                hbone_destination: "",
-                destination: "1.2.3.4:80",
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn build_request_passthrough_svc_with_waypoint() {
-        run_build_request(
-            "127.0.0.1",
-            "1.2.3.4:80",
-            XdsAddressType::Service(XdsService {
-                hostname: "example.com".to_string(),
-                waypoint: Some(xds::istio::workload::GatewayAddress {
-                    destination: Some(xds::istio::workload::gateway_address::Destination::Address(
-                        XdsNetworkAddress {
-                            network: "".to_string(),
-                            address: [127, 0, 0, 10].to_vec(),
-                        },
-                    )),
-                    hbone_mtls_port: 15008,
-                }),
-                load_balancing: Some(LoadBalancing {
-                    mode: xds::istio::workload::load_balancing::Mode::Passthrough.into(),
-                    ..Default::default()
-                }),
-                addresses: vec![
-                    XdsNetworkAddress {
-                        network: "".to_string(),
-                        address: vec![1, 2, 3, 4],
-                    },
-                    XdsNetworkAddress {
-                        network: "".to_string(),
-                        address: vec![1, 5, 6, 7],
-                    },
-                ],
-                ports: vec![Port {
-                    service_port: 80,
-                    target_port: 80,
-                }],
-                ..Default::default()
-            }),
-            Some(ExpectedRequest {
-                protocol: OutboundProtocol::HBONE,
-                destination: "127.0.0.10:15008",
-                hbone_destination: "1.2.3.4:80",
-            }),
-        )
-        .await;
     }
 
     #[test]
     fn build_forwarded() {
         assert_eq!(
-            super::build_forwarded("127.0.0.1:80".parse().unwrap(), &None),
+            super::build_forwarded("127.0.0.1:80".parse().unwrap()),
             r#"for="127.0.0.1:80""#,
         );
         assert_eq!(
-            super::build_forwarded("[::1]:80".parse().unwrap(), &None),
+            super::build_forwarded("[::1]:80".parse().unwrap()),
             r#"for="[::1]:80""#,
-        );
-        assert_eq!(
-            super::build_forwarded(
-                "127.0.0.1:80".parse().unwrap(),
-                &Some(ServiceDescription {
-                    hostname: "example.com".into(),
-                    name: Default::default(),
-                    namespace: Default::default(),
-                }),
-            ),
-            r#"for="127.0.0.1:80";host=example.com"#,
         );
     }
 
@@ -1733,7 +847,6 @@ mod tests {
                 sock_fact,
                 local_workload_information.clone(),
             ),
-            hbone_port: cfg.inbound_addr.port(),
         };
 
         // Get the source workload from state
@@ -1753,7 +866,6 @@ mod tests {
                 "10.0.0.1:8080".parse().unwrap(),
             )),
             actual_destination_workload: None,
-            intended_destination_service: None,
             actual_destination: "10.0.0.1:8080".parse().unwrap(),
             upstream_sans: vec![],
         };
@@ -1763,13 +875,6 @@ mod tests {
         let request = outbound.create_hbone_request(remote_addr, &req).await;
         assert_eq!(request.headers()[WORKLOAD_NAME_HEADER], "source-workload");
         assert_eq!(request.headers()[WORKLOAD_NAMESPACE_HEADER], "ns");
-    }
-
-    #[derive(PartialEq, Debug)]
-    struct ExpectedRequest<'a> {
-        protocol: OutboundProtocol,
-        hbone_destination: &'a str,
-        destination: &'a str,
     }
 
     mod match_egress_policy_tests {
@@ -2060,7 +1165,6 @@ mod tests {
             }),
             id: TraceParent::new(),
             pool: WorkloadHBONEPool::new(cfg.clone(), socket_factory, local),
-            hbone_port: cfg.inbound_addr.port(),
         };
         // The same Workload can route through different policies once its Sandbox is selected.
         use crate::xds::agentio::sandbox::{
@@ -2121,57 +1225,47 @@ mod tests {
             .sandboxes
             .get_by_workload(&fixture.workload.uid);
         let target: SocketAddr = "10.0.0.1:443".parse().unwrap();
-        for mode in [Default::default(), MeshInternalPassthrough] {
-            let workload = Arc::new(Workload {
-                mesh_internal_traffic_policy: mode,
-                egress_policies: Some(EgressPolicies {
-                    policies: vec![EgressPolicy {
-                        namespaces: Default::default(),
-                        match_cidrs: vec![],
-                        match_ports: vec![],
-                        policy: EgressPolicyAction::Deny,
-                        gateway: None,
-                    }],
-                }),
-                ..(*fixture.workload).clone()
-            });
-            assert!(matches!(
-                outbound
-                    .build_request(workload.clone(), None, target.ip(), target)
-                    .await,
-                Err(Error::EgressPolicyDenied(_))
-            ));
-            for selected in &sandboxes {
-                let request = outbound
-                    .build_request(
-                        workload.clone(),
-                        Some(selected.clone()),
-                        target.ip(),
-                        target,
-                    )
-                    .await
-                    .unwrap();
-                assert!(Arc::ptr_eq(request.sandbox.as_ref().unwrap(), selected));
-                if selected.uid == "sandbox-a" {
-                    assert_eq!(request.protocol, OutboundProtocol::HBONE);
-                    assert_eq!(
-                        request.actual_destination,
-                        "127.0.0.10:15008".parse().unwrap()
-                    );
-                    assert_eq!(
-                        request
-                            .hbone_target_destination
-                            .as_ref()
-                            .unwrap()
-                            .to_string(),
-                        target.to_string()
-                    );
-                    let hbone = outbound.create_hbone_request(target, &request).await;
-                    assert_eq!(hbone.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
-                } else {
-                    assert_eq!(request.protocol, OutboundProtocol::TCP);
-                    assert_eq!(request.actual_destination, target);
-                }
+        let workload = Arc::new(Workload {
+            egress_policies: Some(EgressPolicies {
+                policies: vec![EgressPolicy {
+                    namespaces: Default::default(),
+                    match_cidrs: vec![],
+                    match_ports: vec![],
+                    policy: EgressPolicyAction::Deny,
+                    gateway: None,
+                }],
+            }),
+            ..(*fixture.workload).clone()
+        });
+        assert!(matches!(
+            outbound.build_request(workload.clone(), None, target).await,
+            Err(Error::EgressPolicyDenied(_))
+        ));
+        for selected in &sandboxes {
+            let request = outbound
+                .build_request(workload.clone(), Some(selected.clone()), target)
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(request.sandbox.as_ref().unwrap(), selected));
+            if selected.uid == "sandbox-a" {
+                assert_eq!(request.protocol, OutboundProtocol::HBONE);
+                assert_eq!(
+                    request.actual_destination,
+                    "127.0.0.10:15008".parse().unwrap()
+                );
+                assert_eq!(
+                    request
+                        .hbone_target_destination
+                        .as_ref()
+                        .unwrap()
+                        .to_string(),
+                    target.to_string()
+                );
+                let hbone = outbound.create_hbone_request(target, &request).await;
+                assert_eq!(hbone.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
+            } else {
+                assert_eq!(request.protocol, OutboundProtocol::TCP);
+                assert_eq!(request.actual_destination, target);
             }
         }
         // A selected but unavailable gateway fails the request without direct fallback.
@@ -2180,7 +1274,7 @@ mod tests {
         let selected = manager.fetch_attested_sandbox(&fixture.workload);
         assert!(matches!(
             outbound
-                .build_request(fixture.workload.clone(), selected, target.ip(), target)
+                .build_request(fixture.workload.clone(), selected, target)
                 .await,
             Err(Error::UnknownWaypoint(_))
         ));
@@ -2205,7 +1299,6 @@ mod tests {
                 "10.0.0.1:443".parse().unwrap(),
             )),
             actual_destination_workload: None,
-            intended_destination_service: None,
             actual_destination: "10.0.0.1:443".parse().unwrap(),
             upstream_sans: vec![],
         };
@@ -2312,15 +1405,6 @@ mod tests {
         use tokio::net::TcpListener;
 
         let fixture = Fixture::new();
-        fixture
-            .state
-            .write()
-            .unwrap()
-            .workloads
-            .insert(Arc::new(Workload {
-                mesh_internal_traffic_policy: MeshInternalPassthrough,
-                ..(*fixture.workload).clone()
-            }));
         fixture.publish("sandbox-a");
         let manager = Arc::new(fixture.manager);
         let cfg = Arc::new(crate::test_helpers::test_config());
@@ -2381,7 +1465,6 @@ mod tests {
             }),
             id: TraceParent::new(),
             pool: WorkloadHBONEPool::new(cfg.clone(), sockets, local),
-            hbone_port: cfg.inbound_addr.port(),
         };
         let inputs = outbound.pi.clone();
         let pool = outbound.pool.clone();
@@ -2440,7 +1523,6 @@ mod tests {
                     pi: inputs.clone(),
                     id: TraceParent::new(),
                     pool: pool.clone(),
-                    hbone_port: cfg.inbound_addr.port(),
                 };
                 let next_forwarding = tokio::spawn(async move {
                     next.proxy_to(source, source_addr, destination).await;
@@ -2482,7 +1564,6 @@ mod tests {
                 pi: inputs.clone(),
                 id: TraceParent::new(),
                 pool: pool.clone(),
-                hbone_port: cfg.inbound_addr.port(),
             };
             denied
                 .proxy_to(denied_source, denied_addr, destination)

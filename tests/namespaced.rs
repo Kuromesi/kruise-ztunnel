@@ -133,7 +133,7 @@ mod namespaced {
     }
 
     #[tokio::test]
-    async fn workload_waypoint() -> anyhow::Result<()> {
+    async fn egress_gateway_to_workload() -> anyhow::Result<()> {
         let mut manager = setup_netns_test!(Shared);
 
         let zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
@@ -149,11 +149,11 @@ mod namespaced {
 
         manager
             .workload_builder("server", DEFAULT_NODE)
-            .waypoint(waypoint_ip)
             .register()
             .await?;
         let client = manager
             .workload_builder("client", DEFAULT_NODE)
+            .egress_gateway(waypoint_ip)
             .register()
             .await?;
 
@@ -196,7 +196,7 @@ mod namespaced {
     }
 
     #[tokio::test]
-    async fn service_waypoint() -> anyhow::Result<()> {
+    async fn egress_gateway_to_service_vip() -> anyhow::Result<()> {
         let mut manager = setup_netns_test!(Shared);
 
         let zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
@@ -212,6 +212,7 @@ mod namespaced {
 
         let client = manager
             .workload_builder("client", DEFAULT_NODE)
+            .egress_gateway(waypoint_ip)
             .register()
             .await?;
 
@@ -222,7 +223,6 @@ mod namespaced {
                 address: TEST_VIP.parse::<IpAddr>()?,
             }])
             .ports(HashMap::from([(80u16, 80u16)]))
-            .waypoint(waypoint_ip)
             .register()
             .await?;
 
@@ -264,7 +264,7 @@ mod namespaced {
     }
 
     #[tokio::test]
-    async fn service_waypoint_hostname() -> anyhow::Result<()> {
+    async fn egress_gateway_service_hostname() -> anyhow::Result<()> {
         let mut manager = setup_netns_test!(Shared);
 
         let zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
@@ -297,11 +297,11 @@ mod namespaced {
 
         manager
             .workload_builder("server", DEFAULT_NODE)
-            .waypoint_hostname("waypoint.default.svc.cluster.local")
             .register()
             .await?;
         let client = manager
             .workload_builder("client", DEFAULT_NODE)
+            .egress_gateway_hostname("waypoint.default.svc.cluster.local")
             .register()
             .await?;
 
@@ -345,7 +345,7 @@ mod namespaced {
     }
 
     #[tokio::test]
-    async fn service_waypoint_workload_hostname() -> anyhow::Result<()> {
+    async fn egress_gateway_workload_hostname() -> anyhow::Result<()> {
         let mut manager = setup_netns_test!(Shared);
 
         let zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
@@ -365,11 +365,11 @@ mod namespaced {
 
         manager
             .workload_builder("server", DEFAULT_NODE)
-            .waypoint_hostname("waypoint.example.com")
             .register()
             .await?;
         let client = manager
             .workload_builder("client", DEFAULT_NODE)
+            .egress_gateway_hostname("waypoint.example.com")
             .register()
             .await?;
 
@@ -413,7 +413,7 @@ mod namespaced {
     }
 
     #[tokio::test]
-    async fn sandwich_waypoint_plain() -> anyhow::Result<()> {
+    async fn egress_gateway_application_tunnel_plain() -> anyhow::Result<()> {
         let mut manager = setup_netns_test!(Shared);
 
         let _zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
@@ -432,7 +432,6 @@ mod namespaced {
 
         let server = manager
             .workload_builder("server", DEFAULT_NODE)
-            .waypoint(waypoint_ip)
             .register()
             .await?;
         run_tcp_proxy_server(waypoint, SocketAddr::new(server.ip(), SERVER_PORT))?;
@@ -440,6 +439,7 @@ mod namespaced {
 
         let client = manager
             .workload_builder("client", DEFAULT_NODE)
+            .egress_gateway(waypoint_ip)
             .register()
             .await?;
 
@@ -449,7 +449,7 @@ mod namespaced {
     }
 
     #[tokio::test]
-    async fn sandwich_waypoint_proxy_protocol() -> anyhow::Result<()> {
+    async fn egress_gateway_application_tunnel_proxy_protocol() -> anyhow::Result<()> {
         let mut manager = setup_netns_test!(Shared);
 
         let _zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
@@ -484,7 +484,6 @@ mod namespaced {
 
         let server = manager
             .workload_builder("server", DEFAULT_NODE)
-            .waypoint(waypoint_ip)
             .register()
             .await?;
         run_tcp_proxy_protocol_server(waypoint)?;
@@ -492,155 +491,12 @@ mod namespaced {
 
         let client = manager
             .workload_builder("client", DEFAULT_NODE)
+            .egress_gateway(waypoint_ip)
             .register()
             .await?;
 
         let _server_ip = manager.resolver().resolve("server")?;
         run_tcp_client(client, manager.resolver(), "server")?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn service_loadbalancing() -> anyhow::Result<()> {
-        let mut manager = setup_netns_test!(Shared);
-        let local = manager.deploy_ztunnel(DEFAULT_NODE).await?;
-        let remote = manager.deploy_ztunnel(REMOTE_NODE).await?;
-        manager
-            .service_builder("service")
-            .addresses(vec![NetworkAddress {
-                network: strng::EMPTY,
-                address: TEST_VIP.parse::<IpAddr>()?,
-            }])
-            .ports(HashMap::from([(80u16, 80u16)]))
-            .register()
-            .await?;
-        run_tcp_server(
-            manager
-                .workload_builder("server1", DEFAULT_NODE)
-                .service("default/service.default.svc.cluster.local", 80, SERVER_PORT)
-                .register()
-                .await?,
-        )?;
-        run_tcp_server(
-            manager
-                .workload_builder("server2", REMOTE_NODE)
-                .hbone()
-                .service("default/service.default.svc.cluster.local", 80, SERVER_PORT)
-                .register()
-                .await?,
-        )?;
-        let client = manager
-            .workload_builder("client", DEFAULT_NODE)
-            .register()
-            .await?;
-
-        // first just send a single request
-        run_tcp_client_iters(&client, 1, manager.resolver(), &format!("{TEST_VIP}:80"))?;
-
-        let metrics = [
-            (CONNECTIONS_OPENED, 1),
-            (CONNECTIONS_CLOSED, 1),
-            // Traffic is 11 bytes sent, 22 received by the client. But Istio reports them backwards (https://github.com/istio/istio/issues/32399) .
-            (BYTES_RECV, REQ_SIZE),
-            (BYTES_SENT, REQ_SIZE * 2),
-        ];
-
-        // Ensure we picked exactly one destination
-        let local_metrics = verify_metrics(&local, &metrics, &source_labels()).await;
-        let lb_to_nodelocal = local_metrics.query_sum(
-            CONNECTIONS_OPENED,
-            &HashMap::from([(
-                "destination_principal".into(),
-                "spiffe://cluster.local/ns/default/sa/server1".into(),
-            )]),
-        ) > 0;
-        let lb_to_remote = local_metrics.query_sum(
-            CONNECTIONS_OPENED,
-            &HashMap::from([(
-                "destination_principal".into(),
-                "spiffe://cluster.local/ns/default/sa/server2".into(),
-            )]),
-        ) > 0;
-        assert!(lb_to_nodelocal || lb_to_remote);
-        if lb_to_nodelocal {
-            assert!(!lb_to_remote);
-        }
-        // Verify we report the service information in metrics as well
-        verify_metrics(
-            &local,
-            &metrics,
-            &HashMap::from([
-                ("reporter".to_string(), "source".to_string()),
-                (
-                    "destination_service".to_string(),
-                    "service.default.svc.cluster.local".to_string(),
-                ),
-                (
-                    "destination_service_name".to_string(),
-                    "service".to_string(),
-                ),
-                (
-                    "destination_service_namespace".to_string(),
-                    "default".to_string(),
-                ),
-            ]),
-        )
-        .await;
-
-        // response needed is opposite of what we got before
-        let _needed_response = match lb_to_nodelocal {
-            true => "mutual_tls".to_string(), // we got node local so need remote
-            false => "unknown".to_string(),   // we got remote so need node local
-        };
-
-        // run 50 requests so chance of flake here is small
-        run_tcp_client_iters(&client, 50, manager.resolver(), &format!("{TEST_VIP}:80"))?;
-
-        // now we should have hit both backends
-        verify_metric_exists(
-            &local,
-            CONNECTIONS_OPENED,
-            &HashMap::from([(
-                "destination_principal".into(),
-                "spiffe://cluster.local/ns/default/sa/server1".into(),
-            )]),
-        )
-        .await;
-        verify_metric_exists(
-            &local,
-            CONNECTIONS_OPENED,
-            &HashMap::from([(
-                "destination_principal".into(),
-                "spiffe://cluster.local/ns/default/sa/server2".into(),
-            )]),
-        )
-        .await;
-
-        // Now we should have hit the remote
-        verify_metric_exists(
-            &remote,
-            CONNECTIONS_OPENED,
-            &HashMap::from([
-                ("reporter".to_string(), "destination".to_string()),
-                (
-                    "destination_service".to_string(),
-                    "service.default.svc.cluster.local".to_string(),
-                ),
-                (
-                    "destination_service_name".to_string(),
-                    "service".to_string(),
-                ),
-                (
-                    "destination_service_namespace".to_string(),
-                    "default".to_string(),
-                ),
-                (
-                    "destination_principal".into(),
-                    "spiffe://cluster.local/ns/default/sa/server2".into(),
-                ),
-            ]),
-        )
-        .await;
         Ok(())
     }
 
@@ -931,7 +787,6 @@ mod namespaced {
                 (zt, 15006, Request), // Inbound: should be blocked due to recursive call
                 (zt, 15008, Request), // HBONE: Connection succeeds (ztunnel listens) but request fails due to TLS
                 // Localhost still get connection established, as ztunnel accepts anything. But they are dropped immediately.
-                (zt, 15080, Request),      // socks5: localhost
                 (zt, 15000, Request),      // admin: localhost
                 (zt, 15020, Http),         // Stats: accept connection and returns a HTTP error
                 (zt, 15021, Http),         // Readiness: accept connection and returns a HTTP error
@@ -939,7 +794,6 @@ mod namespaced {
                 (ourself, 15006, Request), // Inbound: should be blocked due to recursive call
                 (ourself, 15008, Request), // HBONE: expected TLS, reject
                 // Localhost still get connection established, as ztunnel accepts anything. But they are dropped immediately.
-                (ourself, 15080, Connection), // socks5: current disabled, so we just cannot connect
                 (ourself, 15000, Connection), // admin: doesn't exist on this network
                 (ourself, 15020, Connection), // Stats: doesn't exist on this network
                 (ourself, 15021, Connection), // Readiness: doesn't exist on this network
@@ -947,7 +801,6 @@ mod namespaced {
                 (localhost, 15006, Request),  // Inbound: should be blocked due to recursive call
                 (localhost, 15008, Request),  // HBONE: expected TLS, reject
                 // Localhost still get connection established, as ztunnel accepts anything. But they are dropped immediately.
-                (localhost, 15080, Connection), // socks5: current disabled, so we just cannot connect
                 (localhost, 15000, Connection), // admin: doesn't exist on this network
                 (localhost, 15020, Connection), // Stats: doesn't exist on this network
                 (localhost, 15021, Connection), // Readiness: doesn't exist on this network
@@ -963,7 +816,6 @@ mod namespaced {
                 (zt, 15006, Connection), // Inbound: should be blocked due to recursive call
                 (zt, 15008, Request), // HBONE: Connection succeeds (ztunnel listens) but request fails due to TLS
                 // Localhost is not accessible
-                (zt, 15080, Connection), // socks5: localhost
                 (zt, 15000, Connection), // admin: localhost
                 (zt, 15020, Http),       // Stats: accept connection and returns a HTTP error
                 (zt, 15021, Http),       // Readiness: accept connection and returns a HTTP error
@@ -971,7 +823,6 @@ mod namespaced {
                 (ourself, 15001, Request),
                 (ourself, 15006, Request),
                 (ourself, 15008, Request),
-                (ourself, 15080, Request),
                 (ourself, 15000, Request),
                 (ourself, 15020, Request),
                 (ourself, 15021, Request),
@@ -981,7 +832,7 @@ mod namespaced {
     }
 
     #[tokio::test]
-    async fn trust_domain_mismatch_rejected() -> anyhow::Result<()> {
+    async fn egress_gateway_trust_domain_mismatch_rejected() -> anyhow::Result<()> {
         let mut manager = setup_netns_test!(Shared);
         let id = identity::Identity::Spiffe {
             trust_domain: "clusterset.local".into(), // change to mismatched trustdomain
@@ -996,9 +847,11 @@ mod namespaced {
                 .register()
                 .await?,
         )?;
+        let gateway_ip = manager.resolve("server")?;
 
         let client = manager
             .workload_builder("client", DEFAULT_NODE)
+            .egress_gateway(gateway_ip)
             .identity(id)
             .register()
             .await?;
@@ -1148,14 +1001,15 @@ mod namespaced {
         // Deploy a client workload (simulating Prometheus)
         let client = manager
             .workload_builder("client", DEFAULT_NODE)
+            .egress_gateway(ztunnel_node_ip)
             .register()
             .await?;
 
         let zt_identity_str = zt.ztunnel_identity.as_ref().unwrap().to_string();
 
         // Client makes a standard HTTP GET request to ztunnel's metrics endpoint
-        // Ztunnel's outbound capture should intercept this, initiate HBONE to its own inbound,
-        // which then proxies to the internal metrics server.
+        // The explicit gateway policy sends HBONE to ztunnel's inbound listener,
+        // which proxies to the internal metrics server.
         client
             .run(move || async move {
                 info!(target=%target_metrics_url, "Client attempting standard HTTP GET to metrics endpoint");
@@ -1325,7 +1179,10 @@ mod namespaced {
             (BYTES_RECV, REQ_SIZE),
             (BYTES_SENT, REQ_SIZE * 2),
         ];
-        if let Some(ref zt) = server_ztunnel {
+        // The dedicated test harness only captures outbound traffic.
+        if let Some(ref zt) = server_ztunnel
+            && manager.mode() == Shared
+        {
             let _remote_metrics = verify_metrics(zt, &metrics, &destination_labels()).await;
             let mut want = HashMap::from([
                 ("scope", "access"),
@@ -1336,19 +1193,8 @@ mod namespaced {
                 ("direction", "inbound"),
                 ("message", "connection complete"),
             ]);
-            if client_ztunnel.is_some() {
-                want.insert(
-                    "src.identity",
-                    "spiffe://cluster.local/ns/default/sa/client",
-                );
-                want.insert(
-                    "dst.identity",
-                    "spiffe://cluster.local/ns/default/sa/server",
-                );
-            } else {
-                want.insert("src.identity", "");
-                want.insert("dst.identity", "");
-            }
+            want.insert("src.identity", "");
+            want.insert("dst.identity", "");
             telemetry::testing::assert_contains(want);
         }
         if let Some(zt) = client_ztunnel {
@@ -1356,25 +1202,14 @@ mod namespaced {
             let mut want = HashMap::from([
                 ("scope", "access"),
                 ("src.workload", "client"),
-                ("dst.workload", "server"),
+                ("dst.workload", ""),
                 ("bytes_sent", "11"),
                 ("bytes_recv", "22"),
                 ("direction", "outbound"),
                 ("message", "connection complete"),
             ]);
-            if server_ztunnel.is_some() {
-                want.insert(
-                    "src.identity",
-                    "spiffe://cluster.local/ns/default/sa/client",
-                );
-                want.insert(
-                    "dst.identity",
-                    "spiffe://cluster.local/ns/default/sa/server",
-                );
-            } else {
-                want.insert("src.identity", "");
-                want.insert("dst.identity", "");
-            }
+            want.insert("src.identity", "");
+            want.insert("dst.identity", "");
             telemetry::testing::assert_contains(want);
         }
     }
@@ -1420,28 +1255,6 @@ mod namespaced {
             );
         }
         metrics
-    }
-
-    async fn verify_metric_exists(
-        ztunnel: &TestApp,
-        want_metric: &str,
-        labels: &HashMap<String, String>,
-    ) -> ParsedMetrics {
-        // Wait for metrics to populate...
-        for i in 0..10 {
-            let m = ztunnel.metrics().await.unwrap();
-            if m.query_sum(want_metric, labels) > 0 {
-                return m;
-            }
-            tokio::time::sleep(Duration::from_millis(i * 10)).await;
-        }
-        let got = ztunnel.metrics().await.unwrap();
-        panic!(
-            "{} with {:?} failed, dump: {}",
-            want_metric,
-            labels,
-            got.dump()
-        );
     }
 
     fn resolve_target(resolver: Resolver, target: &str) -> SocketAddr {
