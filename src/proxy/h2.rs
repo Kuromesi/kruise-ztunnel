@@ -82,6 +82,24 @@ pub struct H2Stream {
     write: H2StreamWriteHalf,
 }
 
+impl H2Stream {
+    /// Write bytes consumed by TLS sniffing, using the same flow control and accounting as copy.
+    pub(super) async fn write_sniffed(
+        &mut self,
+        data: Bytes,
+        stats: &crate::proxy::ConnectionResult,
+    ) -> std::io::Result<()> {
+        copy::copy_buf(
+            &mut copy::BufReader::new(data.as_ref()),
+            &mut self.write,
+            stats,
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 pub struct H2StreamReadHalf {
     recv_stream: h2::RecvStream,
     _dropped: Option<DropCounter>,

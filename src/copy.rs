@@ -241,7 +241,7 @@ struct CopyBuf<'a, R: ?Sized, W: ?Sized> {
     amt: u64,
 }
 
-async fn copy_buf<'a, R, W>(
+pub(crate) async fn copy_buf<'a, R, W>(
     reader: &'a mut R,
     writer: &'a mut W,
     metrics: &ConnectionResult,

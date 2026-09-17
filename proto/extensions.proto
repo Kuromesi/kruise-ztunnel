@@ -67,3 +67,26 @@ message GatewayAddress {
   // Port is the port to reach the gateway at.
   uint32 port = 2;
 }
+
+// Wire-compatible with agentio/api/extensions/v1/snipolicy.proto.
+message SniTrafficPolicy {
+  // First matching rule wins, in control-plane order.
+  repeated SniRule rules = 1;
+}
+
+message SniRule {
+  SniMatch match = 1;
+  SniAction action = 2;
+}
+
+message SniMatch {
+  // ORed exact names, leading wildcards (*.example.com), or any nonempty SNI (*).
+  repeated string sni = 1;
+}
+
+enum SniAction {
+  SNI_ACTION_UNSPECIFIED = 0;
+  SNI_ACTION_TLS_TERMINATION = 1;
+  SNI_ACTION_PASSTHROUGH = 2;
+  SNI_ACTION_DENY = 3;
+}

@@ -69,6 +69,8 @@ const ZTUNNEL_WORKER_THREADS: &str = "ZTUNNEL_WORKER_THREADS";
 const ZTUNNEL_CPU_LIMIT: &str = "ZTUNNEL_CPU_LIMIT";
 const POOL_MAX_STREAMS_PER_CONNECTION: &str = "POOL_MAX_STREAMS_PER_CONNECTION";
 const POOL_UNUSED_RELEASE_TIMEOUT: &str = "POOL_UNUSED_RELEASE_TIMEOUT";
+const TLS_SNIFF_TIMEOUT: &str = "TLS_SNIFF_TIMEOUT";
+const TLS_SNIFF_MAX_BYTES: &str = "TLS_SNIFF_MAX_BYTES";
 // CONNECTION_TERMINATION_DEADLINE configures an explicit deadline
 const CONNECTION_TERMINATION_DEADLINE: &str = "CONNECTION_TERMINATION_DEADLINE";
 // TERMINATION_GRACE_PERIOD_SECONDS configures the Kubernetes terminationGracePeriodSeconds configuration.
@@ -220,6 +222,22 @@ impl serde::Serialize for MetadataVector {
 
 #[derive(serde::Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct TlsSniffingConfig {
+    pub timeout: Duration,
+    pub max_bytes: usize,
+}
+
+impl Default for TlsSniffingConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(1),
+            max_bytes: 64 * 1024,
+        }
+    }
+}
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Config {
     /// If true, the HBONE proxy will be used.
     pub proxy: bool,
@@ -244,6 +262,9 @@ pub struct Config {
     pub pool_max_streams_per_conn: u16,
 
     pub pool_unused_release_timeout: Duration,
+
+    /// ClientHello metadata collection on egress gateway routes only.
+    pub tls_sniffing: TlsSniffingConfig,
 
     /// Explicit proxy listener used by integration tests.
     #[cfg(any(test, feature = "testing"))]
@@ -758,6 +779,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
     };
 
     let socket_config_defaults = SocketConfig::default();
+    let tls_sniffing_defaults = TlsSniffingConfig::default();
 
     // Read ztunnel identity and workload info from Downward API if available
     let (ztunnel_identity, ztunnel_workload) = match (
@@ -808,6 +830,11 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             POOL_UNUSED_RELEASE_TIMEOUT,
             DEFAULT_POOL_UNUSED_RELEASE_TIMEOUT,
         )?,
+
+        tls_sniffing: TlsSniffingConfig {
+            timeout: parse_duration_default(TLS_SNIFF_TIMEOUT, tls_sniffing_defaults.timeout)?,
+            max_bytes: parse_default(TLS_SNIFF_MAX_BYTES, tls_sniffing_defaults.max_bytes)?,
+        },
 
         // window size: per-stream limit
         window_size: parse_default(HTTP2_STREAM_WINDOW_SIZE, 4 * 1024 * 1024)?,

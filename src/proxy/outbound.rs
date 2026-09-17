@@ -16,6 +16,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures_util::TryFutureExt;
 use hyper::header::FORWARDED;
 use std::time::Instant;
@@ -26,6 +27,7 @@ use tokio::sync::watch;
 use tracing::{Instrument, debug, error, info, info_span, trace_span};
 
 use crate::extensions::extensions::{EgressPolicies, EgressPolicy, EgressPolicyAction};
+use crate::extensions::sni::SniAction;
 use crate::identity::Identity;
 use crate::proxy::connection_manager::{ConnectionAttributes, ConnectionContext};
 use crate::rbac::{Connection, Direction};
@@ -34,7 +36,7 @@ use crate::sandbox::sandbox;
 
 use crate::proxy::metrics::Reporter;
 use crate::proxy::{
-    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER, TraceParent,
+    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TLS_HEADER, TRACEPARENT_HEADER, TraceParent,
     WORKLOAD_NAME_HEADER, WORKLOAD_NAMESPACE_HEADER, util,
 };
 use crate::proxy::{ConnectionOpen, ConnectionResultBuilder, DerivedWorkload, metrics};
@@ -46,6 +48,7 @@ use crate::proxy::h2::{H2Stream, client::WorkloadKey};
 use crate::state::ProxyRbacContext;
 use crate::state::workload::OutboundProtocol;
 use crate::state::workload::Workload;
+use crate::tls::sniff;
 use crate::{assertions, copy, proxy, socket};
 
 pub struct Outbound {
@@ -186,7 +189,7 @@ impl OutboundConnection {
                     .and_then(|manager| manager.fetch_attested_sandbox(&source));
                 self.build_request(source, sandbox, dest_addr)
             });
-        let req = match Box::pin(build).await {
+        let mut req = match Box::pin(build).await {
             Ok(req) => Box::new(req),
             Err(err) => {
                 metrics::log_early_deny(source_addr, dest_addr, Reporter::source, err);
@@ -249,8 +252,13 @@ impl OutboundConnection {
         let proxy_future = async {
             match req.protocol {
                 OutboundProtocol::HBONE => {
-                    self.proxy_to_hbone(source_stream, source_addr, &req, connection_result_builder)
-                        .await
+                    self.proxy_to_hbone(
+                        source_stream,
+                        source_addr,
+                        &mut req,
+                        connection_result_builder,
+                    )
+                    .await
                 }
                 OutboundProtocol::TCP => {
                     self.proxy_to_tcp(source_stream, &req, connection_result_builder)
@@ -271,14 +279,33 @@ impl OutboundConnection {
 
     async fn proxy_to_hbone(
         &mut self,
-        stream: TcpStream,
+        mut stream: TcpStream,
         remote_addr: SocketAddr,
-        req: &Request,
+        req: &mut Request,
         connection_stats_builder: Box<ConnectionResultBuilder>,
     ) {
         let connection_stats = Box::new(connection_stats_builder.build());
         let res = (async {
-            let (upgraded, _) = Box::pin(self.send_hbone_request(remote_addr, req)).await?;
+            let mut sniffed_data = Bytes::new();
+            if let Some(HboneAddress::SocketAddr(_)) = &req.hbone_target_destination {
+                let sniffing = &self.pi.cfg.tls_sniffing;
+                let sniffed = Box::pin(sniff::sniff(
+                    &mut stream,
+                    sniffing.timeout,
+                    sniffing.max_bytes,
+                ))
+                .await;
+                self.pi.metrics.record_tls_sniff(&sniffed);
+                let sniffed = sniffed?;
+                req.tls.sni = sniffed.sni;
+                sniffed_data = sniffed.data;
+            }
+            req.evaluate_sni_policy()?;
+
+            let (mut upgraded, _) = Box::pin(self.send_hbone_request(remote_addr, req)).await?;
+            upgraded
+                .write_sniffed(sniffed_data, &connection_stats)
+                .await?;
             copy::copy_bidirectional(copy::TcpStreamSplitter(stream), upgraded, &connection_stats)
                 .await
         })
@@ -308,6 +335,9 @@ impl OutboundConnection {
             .header(WORKLOAD_NAME_HEADER, req.source.name.as_str())
             .header(WORKLOAD_NAMESPACE_HEADER, req.source.namespace.as_str());
 
+        if let Some(tls) = req.tls.header_value() {
+            builder = builder.header(TLS_HEADER, tls);
+        }
         if let Some(sandbox) = &req.sandbox {
             builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox.uid.as_str());
         }
@@ -420,6 +450,7 @@ impl OutboundConnection {
             protocol: OutboundProtocol::TCP,
             source: source_workload,
             sandbox,
+            tls: TlsMetadata::default(),
             hbone_target_destination: None,
             actual_destination_workload: None,
             actual_destination: target,
@@ -463,6 +494,7 @@ impl OutboundConnection {
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload.clone(),
                     sandbox: sandbox.clone(),
+                    tls: TlsMetadata::default(),
                     hbone_target_destination: Some(HboneAddress::SocketAddr(*target)),
                     actual_destination_workload: Some(waypoint.workload),
                     actual_destination,
@@ -488,6 +520,8 @@ struct Request {
     source: Arc<Workload>,
     // Selected before routing; shared by egress policy, CONNECT headers and the pool key.
     sandbox: Option<Arc<Sandbox>>,
+    // Optional ClientHello metadata for this CONNECT stream; never part of the pool key.
+    tls: TlsMetadata,
     // The selected egress gateway workload, if any.
     actual_destination_workload: Option<Arc<Workload>>,
     // The address of the next hop, such as a workload or egress gateway.
@@ -499,6 +533,42 @@ struct Request {
     // The identity we will assert for the next hop; this may not be the same as actual_destination_workload
     // in the case of proxies along the path.
     upstream_sans: Vec<Identity>,
+}
+
+#[derive(Debug, Default)]
+struct TlsMetadata {
+    sni: Option<String>,
+    action: Option<SniAction>,
+}
+
+impl TlsMetadata {
+    /// `action=<terminate|passthrough>;sni=<name>`, omitting unknown fields.
+    fn header_value(&self) -> Option<String> {
+        let fields = [
+            self.action
+                .and_then(SniAction::header_value)
+                .map(|action| format!("action={action}")),
+            self.sni.as_ref().map(|sni| format!("sni={sni}")),
+        ];
+        let value = fields.into_iter().flatten().collect::<Vec<_>>().join(";");
+        (!value.is_empty()).then_some(value)
+    }
+}
+
+impl Request {
+    fn evaluate_sni_policy(&mut self) -> Result<(), Error> {
+        let policy = self.sandbox.as_ref().and_then(|s| s.sni_policy.as_ref());
+        let (Some(sni), Some(policy)) = (&self.tls.sni, policy) else {
+            self.tls.action = None;
+            return Ok(());
+        };
+        let action = policy.evaluate(sni);
+        if action == Some(SniAction::Deny) {
+            return Err(Error::SniPolicyDenied(sni.clone()));
+        }
+        self.tls.action = action;
+        Ok(())
+    }
 }
 
 fn match_source_egress_policy<'a>(
@@ -858,10 +928,11 @@ mod tests {
             .unwrap();
 
         // Create a minimal test request with required fields
-        let req = Request {
+        let mut req = Request {
             protocol: OutboundProtocol::HBONE,
             source: source_workload,
             sandbox: None,
+            tls: TlsMetadata::default(),
             hbone_target_destination: Some(HboneAddress::SocketAddr(
                 "10.0.0.1:8080".parse().unwrap(),
             )),
@@ -875,6 +946,56 @@ mod tests {
         let request = outbound.create_hbone_request(remote_addr, &req).await;
         assert_eq!(request.headers()[WORKLOAD_NAME_HEADER], "source-workload");
         assert_eq!(request.headers()[WORKLOAD_NAMESPACE_HEADER], "ns");
+        assert!(!request.headers().contains_key(TLS_HEADER));
+        use crate::extensions::sni::{SniRule, SniTrafficPolicy};
+        let policy = SniTrafficPolicy {
+            rules: vec![
+                SniRule {
+                    sni: vec!["first.example".into()],
+                    action: SniAction::TlsTermination,
+                },
+                SniRule {
+                    sni: vec!["blocked.example".into()],
+                    action: SniAction::Deny,
+                },
+            ],
+        };
+        // Without a Sandbox there is no policy: only the observed SNI is reported.
+        req.tls.sni = Some("blocked.example".into());
+        req.evaluate_sni_policy().unwrap();
+        let request = outbound.create_hbone_request(remote_addr, &req).await;
+        assert_eq!(request.headers()[TLS_HEADER], "sni=blocked.example");
+
+        let mut sandbox: Sandbox = crate::xds::agentio::sandbox::Sandbox {
+            uid: "sandbox-a".into(),
+            ..Default::default()
+        }
+        .try_into()
+        .unwrap();
+        sandbox.sni_policy = Some(policy);
+        req.sandbox = Some(Arc::new(sandbox));
+        for (sni, action) in [
+            ("first.example", "terminate"),
+            ("second.example", "passthrough"),
+        ] {
+            req.tls.sni = Some(sni.to_owned());
+            req.evaluate_sni_policy().unwrap();
+            let request = outbound.create_hbone_request(remote_addr, &req).await;
+            assert_eq!(
+                request.headers()[TLS_HEADER],
+                format!("action={action};sni={sni}")
+            );
+        }
+        req.tls.sni = None;
+        req.evaluate_sni_policy().unwrap();
+        let request = outbound.create_hbone_request(remote_addr, &req).await;
+        assert!(!request.headers().contains_key(TLS_HEADER));
+
+        req.tls.sni = Some("blocked.example".into());
+        assert!(matches!(
+            req.evaluate_sni_policy(),
+            Err(Error::SniPolicyDenied(_))
+        ));
     }
 
     mod match_egress_policy_tests {
@@ -949,6 +1070,7 @@ mod tests {
                     egress_routing: routing,
                     traffic_policy: Default::default(),
                     traffic_policy_refs: Vec::new(),
+                    sni_policy: None,
                 };
                 assert!(
                     match_source_egress_policy(&workload, Some(&sandbox), &target("10.0.0.1:443"))
@@ -1295,6 +1417,7 @@ mod tests {
             protocol: OutboundProtocol::HBONE,
             source: fixture.workload.clone(),
             sandbox: None,
+            tls: TlsMetadata::default(),
             hbone_target_destination: Some(HboneAddress::SocketAddr(
                 "10.0.0.1:443".parse().unwrap(),
             )),

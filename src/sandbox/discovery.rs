@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::extensions::extensions::EgressPolicies;
+use crate::extensions::sni::{SNI_POLICY_TYPE_URL, SniTrafficPolicy};
 use crate::rbac::{TrafficPolicy, TrafficPolicyStore};
 use crate::strng::Strng;
 use crate::xds::XdsResource;
@@ -46,6 +47,8 @@ pub struct Sandbox {
     pub traffic_policy: Option<TrafficPolicy>,
     #[serde(default)]
     pub traffic_policy_refs: Vec<Strng>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni_policy: Option<SniTrafficPolicy>,
 }
 
 impl TryFrom<XdsSandbox> for Sandbox {
@@ -55,6 +58,19 @@ impl TryFrom<XdsSandbox> for Sandbox {
         let workload_uid = resource
             .attester
             .map(|attester| attester.workload_uid.into());
+        let mut sni_policy: Option<SniTrafficPolicy> = None;
+        for extension in resource.extensions {
+            anyhow::ensure!(
+                extension.type_url == SNI_POLICY_TYPE_URL,
+                "unsupported Sandbox extension type: {}",
+                extension.type_url
+            );
+            let policy = SniTrafficPolicy::decode(&extension.value)?;
+            sni_policy
+                .get_or_insert_with(Default::default)
+                .rules
+                .extend(policy.rules);
+        }
         let mut traffic_policy_refs = Vec::new();
         for (type_url, reference) in resource.policy_refs {
             if reference.resource_names.is_empty() {
@@ -67,6 +83,7 @@ impl TryFrom<XdsSandbox> for Sandbox {
             traffic_policy_refs.extend(reference.resource_names.into_iter().map(Strng::from));
         }
         let sandbox = Self {
+            sni_policy,
             traffic_policy_refs,
             uid: resource.uid.into(),
             workload_uid,
@@ -99,6 +116,9 @@ impl Sandbox {
             );
         }
         if let Some(policy) = &self.traffic_policy {
+            policy.validate()?;
+        }
+        if let Some(policy) = &self.sni_policy {
             policy.validate()?;
         }
         if let Some(routing) = &self.egress_routing {
