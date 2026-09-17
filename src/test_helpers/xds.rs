@@ -125,10 +125,7 @@ impl AdsServer {
         ));
         let xds_client = xds::Config::new(Arc::new(cfg), tls_client_fetcher)
             .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, store_updater.clone())
-            .with_optional_watched_handler::<XdsTrafficPolicy>(
-                xds::TRAFFIC_POLICY_TYPE,
-                store_updater,
-            )
+            .with_watched_handler::<XdsTrafficPolicy>(xds::TRAFFIC_POLICY_TYPE, store_updater)
             .build(metrics, block_tx);
 
         (rx, xds_client, dstate, block_rx)

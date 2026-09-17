@@ -852,18 +852,13 @@ impl ProxyStateManager {
             let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(
                 config.xds_root_cert.clone(),
             ));
-            let mut builder = xds::Config::new(config.clone(), tls_client_fetcher)
+            let builder = xds::Config::new(config.clone(), tls_client_fetcher)
                 .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, updater.clone())
-                .with_optional_watched_handler::<xds::agentio::security::TrafficPolicy>(
+                .with_watched_handler::<xds::agentio::security::TrafficPolicy>(
                     xds::TRAFFIC_POLICY_TYPE,
                     updater.clone(),
-                );
-            if config.enable_sandbox_manager {
-                builder = builder.with_optional_watched_handler::<xds::agentio::sandbox::Sandbox>(
-                    xds::SANDBOX_TYPE,
-                    updater,
-                );
-            }
+                )
+                .with_watched_handler::<xds::agentio::sandbox::Sandbox>(xds::SANDBOX_TYPE, updater);
             Some(builder.build(xds_metrics, awaiting_ready))
         } else {
             None

@@ -93,7 +93,7 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
         ..
     } = original;
     let client = config
-        .with_optional_watched_handler::<Sandbox>(
+        .with_watched_handler::<Sandbox>(
             SANDBOX_TYPE,
             ProxyStateUpdater::new_no_fetch(fixture.state.clone()),
         )
@@ -113,30 +113,28 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
 
     for _ in 0..3 {
         let initial = connection.rx.recv().await.unwrap();
-        if initial.type_url == SANDBOX_TYPE || initial.type_url == TRAFFIC_POLICY_TYPE {
+        if initial.type_url == ADDRESS_TYPE && on_demand {
+            assert_eq!(initial.resource_names_subscribe, ["*"]);
+            assert_eq!(initial.resource_names_unsubscribe, ["*"]);
+        } else {
+            assert!(matches!(
+                initial.type_url.as_str(),
+                s if s == ADDRESS_TYPE || s == SANDBOX_TYPE || s == TRAFFIC_POLICY_TYPE
+            ));
             assert!(initial.resource_names_subscribe.is_empty());
             assert!(initial.resource_names_unsubscribe.is_empty());
-        } else {
-            assert!(matches!(initial.type_url.as_str(), s if s == ADDRESS_TYPE));
-            if initial.type_url == ADDRESS_TYPE && on_demand {
-                assert_eq!(initial.resource_names_subscribe, ["*"]);
-                assert_eq!(initial.resource_names_unsubscribe, ["*"]);
-            } else {
-                assert!(initial.resource_names_subscribe.is_empty());
-                assert!(initial.resource_names_unsubscribe.is_empty());
-            }
-            connection
-                .tx
-                .send(Ok(DeltaDiscoveryResponse {
-                    type_url: initial.type_url,
-                    nonce: "initial".into(),
-                    ..Default::default()
-                }))
-                .await
-                .unwrap();
         }
+        // Readiness waits for every subscribed type, so answer each even with no resources.
+        connection
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: initial.type_url,
+                nonce: "initial".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
     }
-    // No Sandbox response at all is needed for warm-pool pod readiness.
     let _ = tokio::time::timeout(Duration::from_secs(5), ready.changed())
         .await
         .unwrap();

@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::extensions::extensions::EgressPolicies;
 use crate::extensions::sni::{SNI_POLICY_TYPE_URL, SniTrafficPolicy};
@@ -60,16 +60,20 @@ impl TryFrom<XdsSandbox> for Sandbox {
             .map(|attester| attester.workload_uid.into());
         let mut sni_policy: Option<SniTrafficPolicy> = None;
         for extension in resource.extensions {
-            anyhow::ensure!(
-                extension.type_url == SNI_POLICY_TYPE_URL,
-                "unsupported Sandbox extension type: {}",
-                extension.type_url
-            );
-            let policy = SniTrafficPolicy::decode(&extension.value)?;
-            sni_policy
-                .get_or_insert_with(Default::default)
-                .rules
-                .extend(policy.rules);
+            match extension.type_url.as_str() {
+                SNI_POLICY_TYPE_URL => {
+                    let policy = SniTrafficPolicy::decode(&extension.value)?;
+                    sni_policy
+                        .get_or_insert_with(Default::default)
+                        .rules
+                        .extend(policy.rules);
+                }
+                type_url => debug!(
+                    sandbox_id = %resource.uid,
+                    type_url,
+                    "ignoring unknown Sandbox extension"
+                ),
+            }
         }
         let mut traffic_policy_refs = Vec::new();
         for (type_url, reference) in resource.policy_refs {
