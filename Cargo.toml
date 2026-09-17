@@ -82,7 +82,7 @@ prost = { version = "0.14", default-features = false }
 prost-types = { version = "0.14", default-features = false }
 rand = { version = "0.9" , features = ["small_rng"]}
 rcgen = { version = "0.14", optional = true, features = ["pem"] }
-rustls = { version = "0.23", features = ["tls12"], default-features = false }
+rustls = { version = "0.23.45", features = ["tls12"], default-features = false }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive", "rc"] }
@@ -108,7 +108,7 @@ backoff = "0.4"
 pin-project-lite = "0.2"
 pingora-pool = "0.8"
 flurry = "0.5"
-h2 = "0.4"
+h2 = "0.4.16"
 http = "1.4"
 split-iter = "0.1"
 arcstr = { version = "1.2", features = ["serde"] }
