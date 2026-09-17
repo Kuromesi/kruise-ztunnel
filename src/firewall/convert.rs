@@ -14,7 +14,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use crate::sandbox::traffic_policy::firewall_rulesets;
+use crate::rbac::firewall_rulesets;
 use crate::state::{ProxyState, WorkloadInfo};
 
 use super::types::RuleSet;

@@ -15,7 +15,7 @@
 
 use crate::identity::{Identity, SecretManager};
 use crate::proxy::{Error, OnDemandDnsLabels};
-use crate::sandbox::{discovery::Sandbox, traffic_policy};
+use crate::sandbox::discovery::Sandbox;
 use crate::state::service::{
     Endpoint, IpFamily, LoadBalancerMode, LoadBalancerScopes, ServiceStore,
 };
@@ -175,7 +175,7 @@ pub struct ProxyState {
 
     pub services: ServiceStore,
 
-    pub policies: traffic_policy::TrafficPolicyStore,
+    pub policies: rbac::TrafficPolicyStore,
 
     pub sandboxes: crate::sandbox::discovery::SandboxStore,
 }
@@ -194,7 +194,7 @@ struct ProxyStateSerialization<'a> {
 struct NamedTrafficPolicy<'a> {
     name: &'a Strng,
     #[serde(flatten)]
-    policy: &'a traffic_policy::TrafficPolicy,
+    policy: &'a rbac::TrafficPolicy,
 }
 
 impl serde::Serialize for ProxyState {
@@ -543,7 +543,7 @@ impl DemandProxyState {
             };
             configured = true;
             match rules.match_tcp(conn) {
-                Some((index, traffic_policy::Action::Allow)) => {
+                Some((index, rbac::Action::Allow)) => {
                     debug!(
                         policy = name,
                         rule = index,
@@ -551,7 +551,7 @@ impl DemandProxyState {
                     );
                     return Ok(());
                 }
-                Some((index, traffic_policy::Action::Deny)) => {
+                Some((index, rbac::Action::Deny)) => {
                     return Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
                         name.into(),
                         format!("rule-{index}").into(),

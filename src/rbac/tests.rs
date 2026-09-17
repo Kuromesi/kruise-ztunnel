@@ -14,7 +14,6 @@
 
 use super::*;
 use crate::proxy::AuthorizationRejectionError;
-use crate::rbac::Direction;
 
 fn connection(src: &str, dst: &str) -> Connection {
     Connection {

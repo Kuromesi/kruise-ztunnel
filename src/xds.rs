@@ -37,8 +37,8 @@ use xds::istio::workload::address::Type as XdsType;
 
 use crate::cert_fetcher::{CertFetcher, NoCertFetcher};
 use crate::config::ConfigSource;
+use crate::rbac::TrafficPolicy;
 use crate::sandbox::discovery::Sandbox;
-use crate::sandbox::traffic_policy::TrafficPolicy;
 use crate::state::ProxyState;
 use crate::state::service::{Endpoint, Service, ServiceStore};
 use crate::state::workload::{NamespacedHostname, Workload};

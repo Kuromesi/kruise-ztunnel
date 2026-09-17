@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use super::traffic_policy::{TrafficPolicy, TrafficPolicyStore};
 use crate::extensions::extensions::EgressPolicies;
+use crate::rbac::{TrafficPolicy, TrafficPolicyStore};
 use crate::strng::Strng;
 use crate::xds::XdsResource;
 use crate::xds::agentio::sandbox::Sandbox as XdsSandbox;

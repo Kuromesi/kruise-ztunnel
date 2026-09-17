@@ -17,8 +17,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use prost::Message;
+use ztunnel::rbac::TrafficPolicy;
 use ztunnel::sandbox::discovery::Sandbox;
-use ztunnel::sandbox::traffic_policy::TrafficPolicy;
 use ztunnel::state::workload::Workload;
 use ztunnel::xds::agentio::sandbox::Sandbox as XdsSandbox;
 use ztunnel::xds::agentio::security::TrafficPolicy as XdsTrafficPolicy;
