@@ -16,7 +16,6 @@
 #[cfg(all(test, target_os = "linux"))]
 mod namespaced {
     use bytes::Bytes;
-    use futures::future::poll_fn;
     use http_body_util::Empty;
     use std::collections::HashMap;
     use ztunnel::state::workload::ApplicationTunnel;
@@ -34,7 +33,7 @@ mod namespaced {
     use hyper_util::rt::TokioIo;
 
     use WorkloadMode::Uncaptured;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::time::timeout;
     use tracing::{error, info};
@@ -863,14 +862,16 @@ mod namespaced {
                 let mut tcp_stream = TcpStream::connect(&srv.to_string()).await?;
                 tcp_stream.write_all(b"hello world!").await?;
                 let mut buf = [0; 10];
-                let mut buf = ReadBuf::new(&mut buf);
-
-                let result = poll_fn(|cx| tcp_stream.poll_peek(cx, &mut buf)).await;
-                assert!(result.is_err()); // expect a connection reset due to TLS SAN mismatch
-                assert_eq!(
-                    result.err().unwrap().kind(),
-                    std::io::ErrorKind::ConnectionReset
-                );
+                // Rejection may close cleanly after sniffing consumes the client's data.
+                // Both EOF and reset are valid, but no application data may be returned.
+                let result = timeout(Duration::from_secs(5), tcp_stream.read(&mut buf)).await?;
+                match result {
+                    Ok(0) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    other => {
+                        panic!("expected connection closure after TLS SAN mismatch, got {other:?}")
+                    }
+                }
 
                 Ok(())
             })?
