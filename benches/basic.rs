@@ -192,8 +192,10 @@ fn build_load_balancer(
         .enable_all()
         .build()
         .unwrap();
-    let src_wl = rt
-        .block_on(demand.fetch_workload_by_uid(&"cluster1//v1/Pod/default/0".into()))
+    let src_wl = demand
+        .read()
+        .workloads
+        .find_uid(&"cluster1//v1/Pod/default/0".into())
         .unwrap();
     let svc_addr: SocketAddr = "127.0.0.3:80".parse().unwrap();
     (rt, demand, src_wl, svc_addr)

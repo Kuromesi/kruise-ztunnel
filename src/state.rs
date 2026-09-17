@@ -16,10 +16,10 @@
 use crate::identity::{Identity, SecretManager};
 use crate::proxy::{Error, OnDemandDnsLabels};
 use crate::sandbox::discovery::Sandbox;
+use crate::state::service::Service;
 use crate::state::service::{
     Endpoint, IpFamily, LoadBalancerMode, LoadBalancerScopes, ServiceStore,
 };
-use crate::state::service::{Service, ServiceDescription};
 use crate::state::workload::{
     GatewayAddress, NamespacedHostname, NetworkAddress, Workload, WorkloadStore, address::Address,
     gatewayaddress::Destination, network_addr,
@@ -66,8 +66,6 @@ pub struct Upstream {
     /// Service SANs defines SANs defined at the service level *only*. A complete view of things requires
     /// looking at workload.identity() as well.
     pub service_sans: Vec<Strng>,
-    /// If this was from a service, the service info.
-    pub destination_service: Option<ServiceDescription>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,12 +152,6 @@ fn same_sandbox_identity(left: &Option<Arc<Sandbox>>, right: &Option<Arc<Sandbox
 
 fn hash_sandbox_identity<H: std::hash::Hasher>(sandbox: &Option<Arc<Sandbox>>, state: &mut H) {
     std::hash::Hash::hash(&sandbox.as_ref().map(|s| &s.uid), state);
-}
-
-impl ProxyRbacContext {
-    pub fn into_conn(self) -> rbac::Connection {
-        self.conn
-    }
 }
 
 impl fmt::Display for ProxyRbacContext {
@@ -275,7 +267,7 @@ impl ProxyState {
     }
 
     /// Find either a workload or a service by hostname.
-    pub fn find_hostname(&self, name: &NamespacedHostname) -> Option<Address> {
+    fn find_hostname(&self, name: &NamespacedHostname) -> Option<Address> {
         // Hostnames for services are more common, so lookup service first and fallback to workload.
         self.services
             .get_by_namespaced_host(name)
@@ -731,20 +723,6 @@ impl DemandProxyState {
         self.read().workloads.find_address(addr)
     }
 
-    // only support workload
-    pub async fn fetch_workload_by_uid(&self, uid: &Strng) -> Option<Arc<Workload>> {
-        // Wait for it on-demand, *if* needed
-        debug!(%uid, "fetch workload");
-        if let Some(wl) = self.read().workloads.find_uid(uid) {
-            return Some(wl);
-        }
-        if !self.supports_on_demand() {
-            return None;
-        }
-        self.fetch_on_demand(uid.clone()).await;
-        self.read().workloads.find_uid(uid)
-    }
-
     async fn finalize_upstream(
         &self,
         source_workload: &Workload,
@@ -755,7 +733,6 @@ impl DemandProxyState {
             Some(UpstreamDestination::UpstreamParts(wl, port, svc)) => (wl, port, svc),
             None | Some(UpstreamDestination::OriginalDestination) => return Ok(None),
         };
-        let svc_desc = svc.clone().map(|s| ServiceDescription::from(s.as_ref()));
         let ip_family_restriction = svc.as_ref().and_then(|s| s.ip_families);
         let selected_workload_ip = self
             .pick_workload_destination_or_resolve(
@@ -770,7 +747,6 @@ impl DemandProxyState {
             selected_workload_ip,
             port,
             service_sans: svc.map(|s| s.subject_alt_names.clone()).unwrap_or_default(),
-            destination_service: svc_desc,
         };
         tracing::trace!(?res, "finalize_upstream");
         Ok(Some(res))
@@ -829,47 +805,6 @@ impl DemandProxyState {
         self.finalize_upstream(source_workload, target_address, res)
             .await?
             .ok_or_else(|| Error::UnknownWaypoint(format!("waypoint {gw_address:?} not found")))
-    }
-
-    /// Looks for either a workload or service by the destination. If not found locally,
-    /// attempts to fetch on-demand.
-    pub async fn fetch_destination(&self, dest: &Destination) -> Option<Address> {
-        match dest {
-            Destination::Address(addr) => self.fetch_address(addr).await,
-            Destination::Hostname(hostname) => self.fetch_hostname(hostname).await,
-        }
-    }
-
-    /// Looks for the given address to find either a workload or service by IP. If not found
-    /// locally, attempts to fetch on-demand.
-    pub async fn fetch_address(&self, network_addr: &NetworkAddress) -> Option<Address> {
-        // Wait for it on-demand, *if* needed
-        debug!(%network_addr.address, "fetch address");
-        if let Some(address) = self.read().find_address(network_addr) {
-            return Some(address);
-        }
-        if !self.supports_on_demand() {
-            return None;
-        }
-        // if both cache not found, start on demand fetch
-        self.fetch_on_demand(network_addr.to_string().into()).await;
-        self.read().find_address(network_addr)
-    }
-
-    /// Looks for the given hostname to find either a workload or service by IP. If not found
-    /// locally, attempts to fetch on-demand.
-    async fn fetch_hostname(&self, hostname: &NamespacedHostname) -> Option<Address> {
-        // Wait for it on-demand, *if* needed
-        debug!(%hostname, "fetch hostname");
-        if let Some(address) = self.read().find_hostname(hostname) {
-            return Some(address);
-        }
-        if !self.supports_on_demand() {
-            return None;
-        }
-        // if both cache not found, start on demand fetch
-        self.fetch_on_demand(hostname.to_string().into()).await;
-        self.read().find_hostname(hostname)
     }
 
     pub fn supports_on_demand(&self) -> bool {
@@ -1110,75 +1045,43 @@ mod tests {
         t.await.expect("should not fail");
     }
 
-    #[tokio::test]
-    async fn lookup_address() {
+    #[test]
+    fn lookup_address() {
         let mut state = ProxyState::new(None);
         state
             .workloads
             .insert(Arc::new(test_helpers::test_default_workload()));
         state.services.insert(test_helpers::mock_default_service());
 
-        let mut registry = Registry::default();
-        let metrics = Arc::new(crate::proxy::Metrics::new(&mut registry));
-        let mock_proxy_state = DemandProxyState::new(
-            Arc::new(RwLock::new(state)),
-            None,
-            ResolverConfig::default(),
-            ResolverOpts::default(),
-            metrics,
-        );
-
-        // Some from Address
-        let dst = Destination::Address(NetworkAddress {
-            network: strng::EMPTY,
-            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        });
-        test_helpers::assert_eventually(
-            Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
+        let by_ip = |ip: Ipv4Addr| {
+            Destination::Address(NetworkAddress {
+                network: strng::EMPTY,
+                address: IpAddr::V4(ip),
+            })
+        };
+        let by_host = |hostname: &str| {
+            Destination::Hostname(NamespacedHostname {
+                namespace: "default".into(),
+                hostname: hostname.into(),
+            })
+        };
+        assert_eq!(
+            state.find_destination(&by_ip(Ipv4Addr::LOCALHOST)),
             Some(Address::Workload(Arc::new(
                 test_helpers::test_default_workload(),
-            ))),
-        )
-        .await;
-
-        // Some from Hostname
-        let dst = Destination::Hostname(NamespacedHostname {
-            namespace: "default".into(),
-            hostname: "defaulthost".into(),
-        });
-        test_helpers::assert_eventually(
-            Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
+            )))
+        );
+        assert_eq!(
+            state.find_destination(&by_host("defaulthost")),
             Some(Address::Service(Arc::new(
                 test_helpers::mock_default_service(),
-            ))),
-        )
-        .await;
-
-        // None from Address
-        let dst = Destination::Address(NetworkAddress {
-            network: "".into(),
-            address: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
-        });
-        test_helpers::assert_eventually(
-            Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
-            None,
-        )
-        .await;
-
-        // None from Hostname
-        let dst = Destination::Hostname(NamespacedHostname {
-            namespace: "default".into(),
-            hostname: "nothost".into(),
-        });
-        test_helpers::assert_eventually(
-            Duration::from_secs(5),
-            || mock_proxy_state.fetch_destination(&dst),
-            None,
-        )
-        .await;
+            )))
+        );
+        assert_eq!(
+            state.find_destination(&by_ip(Ipv4Addr::new(127, 0, 0, 2))),
+            None
+        );
+        assert_eq!(state.find_destination(&by_host("nothost")), None);
     }
 
     enum PortMappingTestCase {
