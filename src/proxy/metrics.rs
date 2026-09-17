@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -196,26 +197,6 @@ impl CommonTrafficLabels {
         self.destination_service = w.hostname.clone().into();
         self.destination_service_name = w.name.clone().into();
         self.destination_service_namespace = w.namespace.clone().into();
-        self
-    }
-
-    fn with_derived_destination(mut self, w: Option<&DerivedWorkload>) -> Self {
-        let Some(w) = w else { return self };
-        self.destination_workload = w.workload_name.clone().into();
-        self.destination_canonical_service = w.app.clone().into();
-        self.destination_canonical_revision = w.revision.clone().into();
-        self.destination_workload_namespace = w.namespace.clone().into();
-        self.destination_app = w.workload_name.clone().into();
-        self.destination_version = w.revision.clone().into();
-        self.destination_cluster = w.cluster_id.clone().into();
-        // This is the identity from the TLS handshake; this is the most trustworthy source so use it
-        self.destination_principal = w.identity.clone().into();
-
-        let mut local = self.locality.0.unwrap_or_default();
-        local.destination_region = w.region.clone().into();
-        local.destination_zone = w.zone.clone().into();
-        self.locality = OptionallyEncode(Some(local));
-
         self
     }
 }
@@ -557,12 +538,6 @@ impl ConnectionResultBuilder {
     pub fn with_derived_source(mut self, w: &DerivedWorkload) -> Self {
         self.tl = self.tl.with_derived_source(Some(w));
         self.src.1 = w.workload_name.clone().map(RichStrng::from);
-        self
-    }
-
-    pub fn with_derived_destination(mut self, w: &DerivedWorkload) -> Self {
-        self.tl = self.tl.with_derived_destination(Some(w));
-        self.dst.1 = w.workload_name.clone().map(RichStrng::from);
         self
     }
 

@@ -709,13 +709,7 @@ mod tests {
                 })),
                 hbone_mtls_port: 15008,
             }),
-            network_gateway: Some(XdsGatewayAddress {
-                destination: Some(XdsDestination::Address(XdsNetworkAddress {
-                    network: "defaultnw".to_string(),
-                    address: [127, 0, 0, 11].to_vec(),
-                })),
-                hbone_mtls_port: 15008,
-            }),
+            network_gateway: None,
             tunnel_protocol: Default::default(),
             network_mode: Default::default(),
             uid: "uid".to_string(),

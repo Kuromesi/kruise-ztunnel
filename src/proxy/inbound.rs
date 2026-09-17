@@ -35,7 +35,7 @@ use crate::drain::DrainWatcher;
 use crate::proxy::h2::server::{H2Request, RequestParts};
 use crate::proxy::metrics::{ConnectionOpen, Reporter};
 use crate::proxy::{
-    BAGGAGE_HEADER, ProxyInputs, TRACEPARENT_HEADER, TraceParent, X_FORWARDED_NETWORK_HEADER,
+    BAGGAGE_HEADER, ProxyInputs, TRACEPARENT_HEADER, TraceParent,
     connection_manager::{ConnectionAttributes, ConnectionContext, InboundAttributes},
     metrics,
 };
@@ -430,34 +430,11 @@ impl Inbound {
             Default::default()
         };
 
-        // We assume it is from gateway if it's a hostname request.
-        // We may need a more explicit indicator in the future.
-        // Note: previously this attempted to check that the src identity was equal to the Gateway;
-        // this check is broken as the gateway only forwards an HBONE request, it doesn't initiate it itself.
-        let from_gateway = req
-            .headers()
-            .get(X_FORWARDED_NETWORK_HEADER)
-            .and_then(|h| h.to_str().ok())
-            .map(|s| !s.eq_ignore_ascii_case(&pi.cfg.network)) // If the network is different, it's from a gateway
-            .unwrap_or(false);
-
-        if from_gateway {
-            debug!("request from gateway");
-        }
-        let source = match from_gateway {
-            // we cannot lookup source workload since we don't know the network, see https://github.com/istio/ztunnel/issues/515.
-            // Instead, we will use baggage
-            true => None,
-            false => {
-                let src_network_addr = NetworkAddress {
-                    // we can assume source network is our network because we did not traverse a gateway
-                    network: rbac_ctx.conn.dst_network.clone(),
-                    address: rbac_ctx.conn.src.ip(),
-                };
-                // Find source info. We can lookup by XDS or from connection attributes
-                pi.state.fetch_workload_by_address(&src_network_addr).await
-            }
+        let src_network_addr = NetworkAddress {
+            network: rbac_ctx.conn.dst_network.clone(),
+            address: rbac_ctx.conn.src.ip(),
         };
+        let source = pi.state.fetch_workload_by_address(&src_network_addr).await;
 
         let derived_source = if pi.cfg.enable_enhanced_baggage {
             metrics::DerivedWorkload {

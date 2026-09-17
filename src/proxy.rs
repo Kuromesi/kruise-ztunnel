@@ -502,9 +502,6 @@ pub enum Error {
     #[error("unknown waypoint: {0}")]
     UnknownWaypoint(String),
 
-    #[error("unknown network gateway: {0}")]
-    UnknownNetworkGateway(String),
-
     #[error("no service or workload for hostname: {0}")]
     NoHostname(String),
 
@@ -534,9 +531,6 @@ pub enum Error {
 
     #[error("requested service {0} found, but has no IP addresses")]
     NoIPForService(String),
-
-    #[error("no service for target address: {0}")]
-    NoService(SocketAddr),
 
     #[error(
         "ip addresses were resolved for workload {0}, but valid dns response had no A/AAAA records"
@@ -613,7 +607,6 @@ pub struct TraceParent {
 
 pub const BAGGAGE_HEADER: &str = "baggage";
 pub const TRACEPARENT_HEADER: &str = "traceparent";
-pub const X_FORWARDED_NETWORK_HEADER: &str = "x-forwarded-network";
 pub const WORKLOAD_NAME_HEADER: &str = "x-agentio-workload-name";
 pub const WORKLOAD_NAMESPACE_HEADER: &str = "x-agentio-workload-namespace";
 

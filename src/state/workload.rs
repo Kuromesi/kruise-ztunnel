@@ -74,8 +74,7 @@ impl From<xds::istio::workload::TunnelProtocol> for InboundProtocol {
     }
 }
 
-// The protocol that the sender should use to send data. Can be different from ServerProtocol when there is a
-// proxy in the middle (e.g. e/w gateway with double hbone).
+// The protocol used to reach the next hop.
 #[derive(
     Default,
     Debug,
@@ -93,7 +92,6 @@ pub enum OutboundProtocol {
     #[default]
     TCP,
     HBONE,
-    DOUBLEHBONE,
 }
 
 impl From<InboundProtocol> for OutboundProtocol {
@@ -230,8 +228,6 @@ pub struct Workload {
 
     #[serde(default, skip_serializing_if = "is_default")]
     pub waypoint: Option<GatewayAddress>,
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub network_gateway: Option<GatewayAddress>,
 
     #[serde(default)]
     pub protocol: InboundProtocol,
@@ -436,11 +432,6 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
             None => None,
         };
 
-        let network_gw = match &resource.network_gateway {
-            Some(w) => Some(GatewayAddress::try_from(w)?),
-            None => None,
-        };
-
         let application_tunnel = match &resource.application_tunnel {
             Some(ap) => Some(ApplicationTunnel::try_from(ap)?),
             None => None,
@@ -482,7 +473,6 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
         let wl = Workload {
             workload_ips: addresses,
             waypoint: wp,
-            network_gateway: network_gw,
 
             protocol: InboundProtocol::from(xds::istio::workload::TunnelProtocol::try_from(
                 resource.tunnel_protocol,

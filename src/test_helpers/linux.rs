@@ -537,11 +537,6 @@ impl<'a> TestWorkloadBuilder<'a> {
         self
     }
 
-    pub fn network_gateway(mut self, network_gateway: GatewayAddress) -> Self {
-        self.w.workload.network_gateway = Some(network_gateway);
-        self
-    }
-
     /// Append a service to the workload
     pub fn service(mut self, service: &str, server_port: u16, target_port: u16) -> Self {
         self.w
@@ -590,13 +585,7 @@ impl<'a> TestWorkloadBuilder<'a> {
                 .namespaces
                 .child(&self.w.workload.node, &self.w.workload.name)?,
         };
-        if self.w.workload.network_gateway.is_some() {
-            // This is a little inefficient, because we create the
-            // namespace, but never actually use it.
-            self.w.workload.workload_ips = vec![];
-        } else {
-            self.w.workload.workload_ips = vec![network_namespace.ip()];
-        }
+        self.w.workload.workload_ips = vec![network_namespace.ip()];
         self.w.workload.uid = format!(
             "cluster1//v1/Pod/{}/{}",
             self.w.workload.namespace, self.w.workload.name,

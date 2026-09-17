@@ -202,7 +202,6 @@ pub fn test_default_workload() -> Workload {
     Workload {
         workload_ips: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
         waypoint: None,
-        network_gateway: None,
         protocol: Default::default(),
         network_mode: Default::default(),
         uid: "".into(),

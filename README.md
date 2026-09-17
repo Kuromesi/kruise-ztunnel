@@ -8,6 +8,9 @@ ztunnel is the Layer 4 traffic enforcement data plane for [Agentio](https://gith
 - **Non-TCP firewall enforcement** — translates traffic policies into inbound and outbound iptables or nftables rules for UDP, ICMP, and other supported non-TCP traffic, with automatic backend detection and live rule updates.
 - **Per-workload sidecar deployment** — runs a dedicated ztunnel alongside each sandbox workload instead of as a node-level proxy, enforcing traffic policy at the workload boundary.
 
+Traffic uses TCP or single-layer HBONE, including connections to the Agentio egress gateway.
+Cross-network routing through Istio east-west gateways (double HBONE) is unsupported.
+
 ## Sidecar admin socket
 
 By default, the admin API listens on localhost TCP port 15000. Containers in the
