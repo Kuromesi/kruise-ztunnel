@@ -561,6 +561,8 @@ pub enum Error {
     EgressPolicyDenied(SocketAddr),
     #[error("denied by SNI policy, server name: {0}")]
     SniPolicyDenied(String),
+    #[error("TLS sniffing failed: {0}")]
+    TlsSniffFailed(&'static str),
     #[error("egress policy requires gateway but none configured")]
     EgressPolicyGatewayMissing(SocketAddr),
 }

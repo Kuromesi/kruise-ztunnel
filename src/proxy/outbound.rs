@@ -293,6 +293,9 @@ impl OutboundConnection {
                 .await;
                 self.pi.metrics.record_tls_sniff(&sniffed);
                 let sniffed = sniffed?;
+                if !sniffing.fail_open && sniffed.outcome.is_failure() {
+                    return Err(Error::TlsSniffFailed(sniffed.outcome.as_str()));
+                }
                 req.tls.sni = sniffed.sni;
                 sniffed_data = sniffed.data;
             }

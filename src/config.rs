@@ -71,6 +71,7 @@ const POOL_MAX_STREAMS_PER_CONNECTION: &str = "POOL_MAX_STREAMS_PER_CONNECTION";
 const POOL_UNUSED_RELEASE_TIMEOUT: &str = "POOL_UNUSED_RELEASE_TIMEOUT";
 const TLS_SNIFF_TIMEOUT: &str = "TLS_SNIFF_TIMEOUT";
 const TLS_SNIFF_MAX_BYTES: &str = "TLS_SNIFF_MAX_BYTES";
+const TLS_SNIFF_FAIL_OPEN: &str = "TLS_SNIFF_FAIL_OPEN";
 // CONNECTION_TERMINATION_DEADLINE configures an explicit deadline
 const CONNECTION_TERMINATION_DEADLINE: &str = "CONNECTION_TERMINATION_DEADLINE";
 // TERMINATION_GRACE_PERIOD_SECONDS configures the Kubernetes terminationGracePeriodSeconds configuration.
@@ -225,6 +226,8 @@ impl serde::Serialize for MetadataVector {
 pub struct TlsSniffingConfig {
     pub timeout: Duration,
     pub max_bytes: usize,
+    /// Continue without TLS metadata on parse errors, timeout or size limit.
+    pub fail_open: bool,
 }
 
 impl Default for TlsSniffingConfig {
@@ -232,6 +235,7 @@ impl Default for TlsSniffingConfig {
         Self {
             timeout: Duration::from_secs(1),
             max_bytes: 64 * 1024,
+            fail_open: false,
         }
     }
 }
@@ -834,6 +838,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         tls_sniffing: TlsSniffingConfig {
             timeout: parse_duration_default(TLS_SNIFF_TIMEOUT, tls_sniffing_defaults.timeout)?,
             max_bytes: parse_default(TLS_SNIFF_MAX_BYTES, tls_sniffing_defaults.max_bytes)?,
+            fail_open: parse_default(TLS_SNIFF_FAIL_OPEN, tls_sniffing_defaults.fail_open)?,
         },
 
         // window size: per-stream limit
@@ -1235,6 +1240,42 @@ pub mod tests {
     use super::*;
 
     static SANDBOX_WATCHER_DEBOUNCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn tls_sniff_fail_open_environment() {
+        // Use subprocesses so environment changes cannot race other Config tests.
+        const CASE: &str = "ZTUNNEL_TEST_TLS_SNIFF_FAIL_OPEN";
+        if let Ok(case) = env::var(CASE) {
+            let result = construct_config(ProxyConfig::default());
+            if case == "invalid" {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap().tls_sniffing.fail_open, case == "true");
+            }
+            return;
+        }
+        for case in ["default", "false", "true", "invalid"] {
+            let mut command = std::process::Command::new(env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "config::tests::tls_sniff_fail_open_environment",
+                    "--nocapture",
+                ])
+                .env(CASE, case)
+                .env_remove(TLS_SNIFF_FAIL_OPEN);
+            if case != "default" {
+                command.env(TLS_SNIFF_FAIL_OPEN, case);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "case {case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn admin_unix_socket_environment() {

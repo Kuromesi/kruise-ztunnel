@@ -660,7 +660,7 @@ impl ConnectionResult {
         // Try to downcast the error itself to proxy::Error
         if let Some(proxy_err) = (err as &dyn Any).downcast_ref::<proxy::Error>() {
             return match proxy_err {
-                proxy::Error::Tls(_) => ResponseFlags::TlsFailure,
+                proxy::Error::Tls(_) | proxy::Error::TlsSniffFailed(_) => ResponseFlags::TlsFailure,
                 proxy::Error::Http2Handshake(_) | proxy::Error::H2(_) => {
                     ResponseFlags::Http2HandshakeFailure
                 }

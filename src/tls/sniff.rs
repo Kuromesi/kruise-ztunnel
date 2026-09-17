@@ -36,6 +36,10 @@ pub(crate) enum Outcome {
 }
 
 impl Outcome {
+    pub(crate) fn is_failure(self) -> bool {
+        matches!(self, Self::ParseError | Self::Timeout | Self::TooLarge)
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::SniFound => "sni_found",
@@ -157,6 +161,7 @@ mod tests {
                 .unwrap();
             let expected_sni = (name != "127.0.0.1").then_some(name);
             assert_eq!(result.sni.as_deref(), expected_sni);
+            assert!(!result.outcome.is_failure());
             assert_eq!(
                 result.outcome,
                 if expected_sni.is_some() {
@@ -192,6 +197,7 @@ mod tests {
             metrics.record_tls_sniff(&result);
             let result = result.unwrap();
             assert_eq!(result.outcome, outcome);
+            assert_eq!(result.outcome.is_failure(), outcome != Outcome::NotTls);
             assert!(result.sni.is_none());
             assert!(result.data.len() <= max_bytes);
             client.shutdown().await.unwrap();
