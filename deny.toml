@@ -1,0 +1,82 @@
+[graph]
+# Test supported features and targets
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+features = ["tls-boring", "tls-ring", "tls-aws-lc", "tls-openssl" ]
+
+[advisories]
+version = 2
+ignore = [
+    { id = "RUSTSEC-2025-0012", reason = "backoff 0.4 has no maintained compatible release; review by 2026-10-01" },
+    { id = "RUSTSEC-2024-0384", reason = "instant is pulled in by backoff 0.4 and has no compatible maintained release; review by 2026-10-01" },
+    { id = "RUSTSEC-2024-0436", reason = "paste is a transitive dependency with no security vulnerability; review by 2026-10-01" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is a transitive dependency with no security vulnerability; review by 2026-10-01" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile remains API-compatible and has no security vulnerability; review by 2026-10-01" },
+]
+
+
+[licenses]
+version = 2
+allow = ["Apache-2.0",
+    "CC-BY-3.0",
+    "ISC",
+    "AFL-2.1",
+    "AFL-3.0",
+    "Artistic-1.0",
+    "Artistic-2.0",
+    "Apache-1.1",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "CC0-1.0",
+    "FTL",
+    "LPL-1.02",
+    "MS-PL",
+    "MIT",
+    "NCSA",
+    "OpenSSL",
+    "PHP-3.0",
+    "TCP-wrappers",
+    "Unicode-3.0",
+    "W3C",
+    "Xnet",
+    "Zlib",
+    "Unicode-DFS-2016"]
+unused-allowed-license = "allow"
+
+
+# Deny cannot detect ring properly. Directly assign
+[[licenses.clarify]]
+name = "ring"
+version = "*"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+[bans]
+skip = [
+    { crate = "rand_core", version = "0.5.1", reason = "acceptable duplicate" },
+    { crate = "rand", version = "0.7.3", reason = "acceptable duplicate" },
+    { crate = "regex-syntax", version = "0.6.29", reason = "acceptable duplicate" },
+    { crate = "regex-automata", version = "0.1.10", reason = "acceptable duplicate" },
+    { crate = "rand_chacha", version = "0.2.2", reason = "acceptable duplicate" },
+    { crate = "thiserror-impl", version = "1.0.69", reason = "acceptable duplicate" },
+    { crate = "thiserror", version = "1.0.69", reason = "acceptable duplicate" },
+    { crate = "base64" },
+    { crate = "bitflags" },
+    { crate = "fastrand" },
+    { crate = "getrandom" },
+    { crate = "itertools" },
+    { crate = "memoffset" },
+    { crate = "nix" },
+]
+
+[sources]
+
+allow-git = [
+    "https://github.com/janrueth/boring-rustls-provider",
+]

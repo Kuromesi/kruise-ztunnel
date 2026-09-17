@@ -1,0 +1,80 @@
+include common/Makefile.common.mk
+
+FEATURES ?=
+ifeq ($(TLS_MODE), boring)
+	FEATURES:=--no-default-features -F tls-boring
+else ifeq ($(TLS_MODE), aws-lc)
+	FEATURES:=--no-default-features -F tls-aws-lc
+else ifeq ($(TLS_MODE), openssl)
+	FEATURES:=--no-default-features -F tls-openssl
+endif
+
+test:
+	RUST_BACKTRACE=1 cargo test --benches --tests --bins $(FEATURES)
+
+coverage:
+	FEATURES=$(FEATURES) ./scripts/test-with-coverage.sh 
+
+build:
+	cargo build $(FEATURES)
+
+# Build the inpodserver example
+inpodserver:
+	cargo build --example inpodserver
+
+# Test that all important features build
+check-features:
+	cargo check --no-default-features -F tls-boring
+	cargo check --no-default-features -F tls-aws-lc
+	cargo check --no-default-features -F tls-openssl
+	cargo check -F jemalloc
+	(cd fuzz; RUSTFLAGS="--cfg fuzzing" cargo check)
+
+# target in common/Makefile.common.mk doesn't handle our third party vendored files; only check golang and rust codes
+lint-copyright:
+	@${FINDFILES} \( -name '*.go' -o -name '*.rs' \) \( ! \( -name '*.gen.go' -o -name '*.pb.go' -o -name '*_pb2.py' \) \) -print0 |\
+		${XARGS} common/scripts/lint_copyright_banner.sh
+
+COPYRIGHT_BASE ?= 67cd1e1958ac4ce7e1233e7f0cb7ab1c706176c0
+
+lint-copyright-kruise:
+	@./scripts/lint_copyright_kruise.sh "${COPYRIGHT_BASE}"
+
+fix-copyright-kruise:
+	@./scripts/fix_copyright_kruise.sh "${COPYRIGHT_BASE}"
+
+lint: lint-scripts lint-yaml lint-markdown lint-licenses lint-copyright lint-copyright-kruise
+	cargo clippy --benches --tests --bins $(FEATURES)
+
+check:
+	cargo check $(FEATURES)
+
+cve-check:
+	cargo deny check advisories $(FEATURES)
+
+license-check:
+	cargo deny check licenses $(FEATURES)
+
+fix: fix-copyright-banner fix-copyright-kruise
+	cargo clippy --fix --allow-staged --allow-dirty $(FEATURES)
+	cargo fmt
+
+format:
+	cargo fmt
+
+release:
+	./scripts/release.sh
+
+gen: format
+	(cd fuzz; cargo update ztunnel 2>/dev/null || true)
+
+gen-check: gen check-clean-repo
+
+presubmit: export RUSTFLAGS = -D warnings
+presubmit: check-features test lint gen-check
+
+clean:
+	cargo clean $(FEATURES)
+
+rust-version:
+	./common/scripts/run.sh /usr/bin/rustc -vV

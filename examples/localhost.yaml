@@ -1,0 +1,64 @@
+# Copyright Istio Authors
+# Modifications Copyright 2026 The Kruise Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This shows an example local config for ztunnel that adds a workload for localhost.
+# This allows local testing by sending requests through the local ztunnel to other servers running on localhost.
+workloads:
+- uid: cluster1//v1/Pod/default/local
+  name: local
+  namespace: default
+  serviceAccount: default
+  workloadIps: ["127.0.0.1"]
+  protocol: HBONE
+  node: local
+  network: ""
+  services:
+    "default/example.com":
+      80: 8080
+    "default/example2.com":
+      80: 8080
+# Define another local address, but this one uses TCP. This allows testing HBONE and TCP with one config.
+- uid: cluster1//v1/Pod/default/local-tcp
+  name: local-tcp
+  namespace: default
+  serviceAccount: default
+  workloadIps: ["127.0.0.2"]
+  protocol: TCP
+  node: local
+  network: ""
+  services:
+    "default/example.com":
+      80: 8080
+    "default/example2.com":
+      80: 8080
+services:
+- name: local
+  namespace: default
+  hostname: example.com
+  vips:
+    - /127.10.0.1
+  ports:
+    80: 8080
+  subjectAltNames:
+   - spiffe://cluster.local/ns/default/sa/local
+  canonical: true
+- name: remote
+  namespace: default
+  hostname: example2.com
+  vips:
+    - remote/127.10.0.2
+  ports:
+    80: 8080
+  canonical: true

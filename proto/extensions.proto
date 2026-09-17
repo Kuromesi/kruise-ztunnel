@@ -1,0 +1,83 @@
+// Copyright 2026 The Kruise Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package kruise.networking.extensions.v1;
+
+message WorkloadMetadata {
+  map<string, string> labels = 1;
+  MeshInternalTrafficPolicy mesh_internal_traffic_policy = 2;
+}
+
+// MeshInternalTrafficPolicy defines how mesh-internal (east-west) traffic is
+// handled by sandbox tunnel proxies.
+enum MeshInternalTrafficPolicy {
+  // The ztunnel performs full peer identity matching and requires complete
+  // cluster workload and service information for mTLS and policy enforcement
+  // on mesh-internal traffic.
+  MESH_INTERNAL_PEER_AWARE = 0;
+
+  // Mesh-internal traffic is treated as passthrough without any peer discovery.
+  // The ztunnel skips upstream discovery, mTLS origination, and load balancing for
+  // in-cluster destinations. This significantly reduces XDS push size in sidecar mode.
+  MESH_INTERNAL_PASSTHROUGH = 1;
+}
+
+
+message EgressPolicies {
+    repeated EgressPolicy egress_policies = 1;
+}
+
+// EgressPolicyAction defines the action for matching egress traffic.
+enum EgressPolicyAction {
+  // Passthrough allows traffic to flow directly to the destination.
+  PASSTHROUGH = 0;
+  // Deny blocks the traffic.
+  DENY = 1;
+  // Gateway forwards traffic through the specified egress gateway.
+  GATEWAY = 2;
+}
+
+// EgressPolicy defines a rule for handling egress traffic.
+// Traffic is evaluated in order; the first matching policy applies.
+message EgressPolicy {
+  // Namespaces restricts this policy to traffic originating from these namespaces.
+  // If empty, the policy applies to all namespaces.
+  repeated string namespaces = 1;
+
+  // MatchCidrs specifies the destination CIDR ranges to match.
+  // If empty, matches any destination.
+  repeated string match_cidrs = 2;
+
+  // MatchPorts specifies the destination ports to match. Each entry is a
+  // single port number as a decimal string (e.g. "443", "8080"). If empty,
+  // matches any destination port. A traffic flow matches the policy only
+  // when both match_cidrs and match_ports match (empty means wildcard on
+  // that dimension).
+  repeated string match_ports = 5;
+
+  // Policy defines the action to take for matching traffic.
+  EgressPolicyAction policy = 3;
+
+  // Gateway is the egress gateway address to forward traffic to (when policy is GATEWAY).
+  GatewayAddress gateway = 4;
+}
+
+// GatewayAddress represents the address of a gateway.
+message GatewayAddress {
+  string service = 1;
+  // Port is the port to reach the gateway at.
+  uint32 port = 2;
+}

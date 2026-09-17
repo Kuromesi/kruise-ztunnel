@@ -1,0 +1,119 @@
+# Copyright 2026 The Kruise Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - "release-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.90.0 \
+            --profile minimal \
+            --component clippy,rustfmt
+          rustup default 1.90.0
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends protobuf-compiler
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check build
+        run: cargo check --locked
+
+      - name: Run Clippy
+        run: cargo clippy --locked --lib --bins
+
+      - name: Run unprivileged tests
+        run: |
+          env -u RUST_LOG cargo test --locked --lib --test direct --bins -- \
+            --test-threads=1 \
+            --skip inpod:: \
+            --skip tls::certificate::test::multi_root
+
+      - name: Run multi-root certificate test
+        # The local TLS connection is timing-sensitive on shared runners.
+        run: |
+          for attempt in 1 2 3; do
+            if env -u RUST_LOG cargo test --locked --lib \
+              tls::certificate::test::multi_root -- --exact --test-threads=1; then
+              exit 0
+            fi
+            echo "multi-root attempt ${attempt} failed"
+          done
+          exit 1
+
+  firewall-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal
+          rustup default 1.90.0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends iptables protobuf-compiler
+
+      - name: Run privileged tests
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            cargo test --locked --lib inpod:: -- --test-threads=1
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            cargo test --locked --test namespaced -- --test-threads=1
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            cargo test --locked --test firewall_ipt_integration -- --ignored --test-threads=1

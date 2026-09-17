@@ -1,0 +1,176 @@
+[package]
+name = "ztunnel"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+
+[features]
+default = ["tls-aws-lc"]
+jemalloc = ["dep:tikv-jemallocator", "dep:jemalloc_pprof"]
+tls-boring = ["dep:boring", "dep:boring-sys", "boring-rustls-provider/fips-only"]
+tls-ring = ["dep:ring", "rustls/ring", "tokio-rustls/ring", "hyper-rustls/ring", "dep:rcgen"]
+tls-aws-lc = ["dep:ring", "rustls/aws_lc_rs", "tokio-rustls/aws_lc_rs", "hyper-rustls/aws-lc-rs", "dep:rcgen", "rcgen/aws_lc_rs"]
+tls-openssl = ["dep:rustls-openssl", "dep:openssl" ]
+testing = ["dep:rcgen", "rcgen/x509-parser"] # Enables utilities supporting tests.
+
+[lib]
+path = "src/lib.rs"
+bench = false
+
+[[bin]]
+name = "ztunnel"
+path = "src/main.rs"
+bench = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "basic"
+harness = false
+
+[dependencies]
+# Enabled with 'tls-boring'
+boring-rustls-provider = { git = "https://github.com/janrueth/boring-rustls-provider", optional = true } #
+boring = { version = "4", optional = true }
+boring-sys = { version = "4", optional = true }
+
+# Enabled with 'tls-ring'
+ring = { version = "0.17", optional = true }
+
+# Enabled with 'tls-openssl'
+rustls-openssl = { version = "0.3", optional = true, features = ["tls12"]}
+openssl = { version = "0.10", optional = true }
+
+anyhow = "1.0"
+async-stream = "0.3"
+async-trait = "0.1"
+base64 = "0.22"
+byteorder = "1.5"
+bytes = { version = "1.11", features = ["serde"] }
+chrono = "0.4"
+duration-str = "0.21"
+futures = "0.3"
+futures-core = "0.3"
+futures-util = "0.3"
+jemalloc_pprof = { version = "0.8", optional = true, features = ["symbolize"] }
+tikv-jemallocator = { version = "0.6.0", features = ["profiling", "unprefixed_malloc_on_supported_platforms"], optional = true }
+hashbrown = "0.17"
+hickory-net = "0.26.1"
+hickory-proto = "0.26.1"
+hickory-resolver = { version = "0.26.1", features = ["serde"] }
+hickory-server = { version = "0.26.1", features = [ "resolver" ]}
+http-body = { version = "1" }
+http-body-util = "0.1"
+hyper = { version = "1.10", features = ["full"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["logging", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["full"] }
+ipnet = { version = "2.12", features = ["serde"] }
+itertools = "0.15"
+keyed_priority_queue = "0.4"
+libc = "0.2"
+log = "0.4"
+nix = { version = "0.31", features = ["socket", "sched", "uio", "fs", "ioctl", "user", "net", "mount", "resource" ] }
+notify = "8.2"
+notify-debouncer-full = "0.7"
+once_cell = "1.21"
+num_cpus = "1.16"
+ppp = "2.3"
+prometheus-client = { version = "0.25" }
+prometheus-parse = "0.2"
+prost = { version = "0.14", default-features = false }
+prost-types = { version = "0.14", default-features = false }
+rand = { version = "0.9" , features = ["small_rng"]}
+rcgen = { version = "0.14", optional = true, features = ["pem"] }
+rustls = { version = "0.23", features = ["tls12"], default-features = false }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2.2"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+socket2 = { version = "0.6", features = ["all"] }
+textnonce = { version = "1.0" }
+thiserror = "2.0"
+tls-listener = { version = "0.11" }
+tokio = { version = "1.52", features = ["full", "test-util"] }
+tokio-rustls = { version = "0.26", default-features = false }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "transport"] }
+tonic-prost = { version = "0.14", default-features = false }
+tower = { version = "0.5", features = ["full"] }
+tracing = { version = "0.1"}
+tracing-subscriber = { version = "0.3", features = ["registry", "env-filter", "json"] }
+url = "2.5"
+x509-parser = { version = "0.18", default-features = false }
+rustls-webpki = { version = "0.103", default-features = false, features = ["alloc"] }
+tracing-log = "0.2"
+backoff = "0.4"
+pin-project-lite = "0.2"
+pingora-pool = "0.8"
+flurry = "0.5"
+h2 = "0.4"
+http = "1.4"
+split-iter = "0.1"
+arcstr = { version = "1.2", features = ["serde"] }
+tracing-core = "0.1"
+tracing-appender = "0.2"
+tokio-util = { version = "0.7", features = ["io-util"] }
+educe = "0.6"
+reqwest = "0.13.2"
+regex = "1.12.3"
+tonic-health = "0.14.5"
+arc-swap = "1.9.1"
+walkdir = "2.5.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+netns-rs = "0.2"
+pprof = { version = "0.15", features = ["protobuf", "protobuf-codec", "criterion"] }
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14", default-features = false }
+anyhow = "1.0"
+rustc_version = "0.4"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+
+[profile.bench]
+inherits = "quick-release"
+
+[profile.symbols-release]
+inherits = "release"
+debug = true
+
+# Release optimized but without as many dependencies, suitable for incremental development
+[profile.quick-release]
+inherits = "release"
+codegen-units = 16
+lto = false
+incremental = true
+
+[dev-dependencies]
+# Enable testing utils on this crate.
+ztunnel = { version = "0.0.0", path = ".", default-features = false, features = ["testing"] }
+
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+diff = "0.1"
+local-ip-address = "0.6"
+matches = "0.1"
+test-case = "3.3"
+oid-registry = "0.8"
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+x509-parser = { version = "0.18", default-features = false, features = ["verify"] }
+time = "0.3"
+ctor = "1.0"
+tempfile = "3.27"
+proptest = "1"
+
+[lints.clippy]
+# This rule makes code more confusing
+assigning_clones = "allow"
+# This doesn't understand `strng` which we use everywhere
+borrow_interior_mutable_const = "allow"
+declare_interior_mutable_const = "allow"

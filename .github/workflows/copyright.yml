@@ -1,0 +1,50 @@
+# Copyright 2026 The Kruise Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: copyright
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - "release-*"
+
+permissions:
+  contents: read
+
+env:
+  # Immutable commit for the upstream istio/ztunnel 1.29.5 tag.
+  UPSTREAM_BASE: 67cd1e1958ac4ce7e1233e7f0cb7ab1c706176c0
+
+jobs:
+  copyright:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch and verify upstream baseline
+        run: |
+          git fetch --no-tags --depth=1 \
+            https://github.com/istio/ztunnel.git \
+            refs/tags/1.29.5
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$UPSTREAM_BASE"
+
+      - name: Check copyright headers
+        run: make BUILD_WITH_CONTAINER=0 lint-copyright-kruise COPYRIGHT_BASE="$UPSTREAM_BASE"

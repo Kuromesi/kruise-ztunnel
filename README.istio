@@ -1,54 +1,32 @@
 # Ztunnel
 
-ztunnel is the Layer 4 traffic enforcement data plane for [Agentio](https://github.com/openkruise/agentio).
+Ztunnel provides an implementation of the ztunnel component of
+[ambient mesh](https://istio.io/latest/blog/2022/introducing-ambient-mesh/).
 
-## How does it differ from Istio ztunnel?
+## Feature Scope
 
-- **Sandbox traffic policies** — discovers native Sandbox and TrafficPolicy resources, enforcing inline rules followed by shared policy references ordered by the control plane.
-- **Non-TCP firewall enforcement** — translates traffic policies into inbound and outbound iptables or nftables rules for UDP, ICMP, and other supported non-TCP traffic, with automatic backend detection and live rule updates.
-- **Per-workload sidecar deployment** — runs a dedicated ztunnel alongside each sandbox workload instead of as a node-level proxy, enforcing traffic policy at the workload boundary.
+Ztunnel is intended to be a purpose built implementation of the node proxy in [ambient mesh](https://istio.io/latest/blog/2022/introducing-ambient-mesh/).
+Part of the goals of this included keeping a narrow feature set, implementing only the bare minimum requirements for ambient.
+This ensures the project remains simple and high performance.
 
-## Sidecar admin socket
+Explicitly out of scope for ztunnel include:
+* Terminating user HTTP traffic
+* Terminating user HTTP traffic (its worth repeating)
+* Generic extensibility such as `ext_authz`, WASM, linked-in extensions, Lua, etc.
 
-By default, the admin API listens on localhost TCP port 15000. Containers in the
-same Pod can access this listener. To use a filesystem Unix socket instead, set
-these environment variables on the ztunnel container:
+In general, ztunnel does not aim to be a generic extensible proxy; Envoy is better suited for that task.
+If a feature is not directly used to implement the node proxy component in ambient mesh, it is unlikely to be accepted.
 
-```yaml
-env:
-  - name: ENABLE_ADMIN_UNIX_SOCKET
-    value: "true"
-  - name: ADMIN_UNIX_SOCKET_PATH
-    value: /var/run/ztunnel/admin.sock
-```
-
-`ENABLE_ADMIN_UNIX_SOCKET` defaults to `false`. `ADMIN_UNIX_SOCKET_PATH` defaults
-to `/var/run/ztunnel/admin.sock` and must be an absolute file path when enabled.
-In Unix socket mode, the TCP admin listener is disabled entirely; readiness and
-metrics keep their existing listeners.
-
-The parent directory must be writable by ztunnel and private to its container.
-For a read-only root filesystem, mount a writable volume there **only in the
-ztunnel container**, not in application containers. Newly created directories
-use mode `0700`; the socket uses mode `0600`. Existing directory permissions are
-not changed. Run admin clients as the ztunnel user (or an appropriately privileged
-operator) inside the sidecar:
-
-```shell
-curl --unix-socket /var/run/ztunnel/admin.sock http://localhost/config_dump
-curl --unix-socket /var/run/ztunnel/admin.sock -X POST http://localhost/quitquitquit
-```
-
-Update lifecycle hooks and diagnostic tools that call the TCP admin API to use
-the socket; TCP port-forwarding cannot reach it. Normal shutdown removes the
-socket, and startup reclaims stale socket files left by a crashed process.
-An active socket, regular file, or symlink at the configured path causes startup
-to fail instead of being replaced. Keep the parent directory under the sidecar's
-control so other processes cannot replace files there.
+The details of architecture is [here](./ARCHITECTURE.md).
 
 ## Building
 
-Use Rust 1.90.0, matching [CI](.github/workflows/ci.yml), and install `protoc` before running `cargo build --locked`.
+Please use the same Rust version as the [`build-tools`](https://github.com/istio/tools/tree/master/docker/build-tools) image.
+You can determine the version that the `build-tools` image uses by running the below command:
+
+```shell
+$ BUILD_WITH_CONTAINER=1 make rust-version
+```
 
 ### TLS/Crypto provider
 
@@ -110,7 +88,7 @@ This manual twiddling of environment vars is not ideal but given that the altern
 
 Note that the Dockerfiles used to build these vendored `boringssl` builds may be found in the respective vendor directories, and can serve as a reference for the build environment needed to generate FIPS-compliant ztunnel builds.
 
-A release build with this option can be built with `cargo build --release --no-default-features --features tls-boring`.
+A release build with this option can be built with `TLS_MODE=boring ./scripts/release.sh`.
 
 ## Development
 
@@ -181,11 +159,3 @@ Access logs are emitted upon _completion_ of each connection.
 Logs for connect _establishment_ are also logged (with less information) at `debug` level.
 
 Currently, the access log format is considered unstable and subject to changes.
-
-## License & Attribution
-
-ztunnel is licensed under the [Apache License 2.0](LICENSE).
-
-ztunnel is a modified derivative of [Istio ztunnel](https://github.com/istio/ztunnel) (Copyright Istio Authors, Apache License 2.0). The original Istio README is preserved at [README.istio](README.istio). Files derived from Istio that have been modified for this project carry a `Modifications Copyright 2026 The Kruise Authors` notice.
-
-**Trademark notice:** "Istio" is a trademark of its respective owners. ztunnel is an independent project and is not affiliated with, sponsored by, or endorsed by the Istio project. References to Istio describe the origin of the code only.

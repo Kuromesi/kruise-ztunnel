@@ -1,0 +1,36 @@
+[package]
+name = "ztunnel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+hyper = "1.1"
+libfuzzer-sys = "0.4"
+prost = { version = "0.14", default-features = false }
+anyhow = "1.0"
+
+[dependencies.ztunnel]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "protobuf"
+path = "fuzz_targets/protobuf.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "baggage"
+path = "fuzz_targets/baggage.rs"
+test = false
+doc = false

@@ -1,0 +1,40 @@
+# Copyright 2026 The Kruise Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Allow all TCP (no port specified).
+# NOTE: control plane sends PortRange{start:0, end:0, protocol:TCP}
+#       which means port=0 in RBAC matching. This is a known control
+#       plane limitation — use explicit ports instead.
+# Expected:
+#   - DNS blocked (UDP, default deny)
+#   - ICMP blocked (default deny)
+apiVersion: agents.kruise.io/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: tp-allow-all-tcp
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: sleep
+  egress:
+    rules:
+    - action: allow
+      ports:
+      - protocol: TCP
+  ingress:
+    rules:
+    - action: allow
+      ports:
+      - protocol: TCP

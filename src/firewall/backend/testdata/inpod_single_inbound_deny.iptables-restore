@@ -1,0 +1,14 @@
+*filter
+-F ISTIO_FW_FILTER_IN
+-F ISTIO_FW_FILTER_OUT
+-A ISTIO_FW_FILTER_IN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A ISTIO_FW_FILTER_OUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A ISTIO_FW_FILTER_IN -i lo -j ACCEPT
+-A ISTIO_FW_FILTER_OUT -o lo -j ACCEPT
+-A ISTIO_FW_FILTER_OUT -m mark --mark 1337 -j RETURN
+-A ISTIO_FW_FILTER_OUT -p udp -m conntrack --ctorigdstport 53 --ctdir ORIGINAL -j ACCEPT
+-A ISTIO_FW_FILTER_IN -s 10.0.0.0/8 -p udp --dport 80 -j REJECT
+-A ISTIO_FW_FILTER_IN -s 10.0.0.0/8 -p sctp --dport 80 -j REJECT
+-A ISTIO_FW_FILTER_IN ! -p tcp -j REJECT
+-A ISTIO_FW_FILTER_OUT ! -p tcp -j REJECT
+COMMIT

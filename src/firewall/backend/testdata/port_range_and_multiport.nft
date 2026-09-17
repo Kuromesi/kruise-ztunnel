@@ -1,0 +1,18 @@
+add table inet ztunnel
+delete table inet ztunnel
+table inet ztunnel {
+  chain zt_policy_input {
+    type filter hook input priority -150; policy accept;
+    ct state established,related accept
+    iif lo accept
+    meta l4proto { udp, sctp } th dport 8000-8080 reject comment "port-range-rule"
+  }
+  chain zt_policy_output {
+    type filter hook output priority -150; policy accept;
+    ct state established,related accept
+    oif lo accept
+    meta skuid 1337 return
+    meta skgid 1337 return
+    meta l4proto { udp, sctp } th dport { 80, 443, 9000-9100 } accept comment "multi-port-rule"
+  }
+}

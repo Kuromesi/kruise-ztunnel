@@ -1,0 +1,45 @@
+# Copyright 2026 The Kruise Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Allow TCP 80 and 443 both directions.
+# Expected:
+#   - TCP 80/443 allowed by RBAC (userspace proxy handles TCP)
+#   - DNS blocked (UDP, default deny in firewall)
+#   - ICMP blocked (default deny in firewall)
+#   - curl to hostname fails because DNS is blocked; use direct IP to verify TCP
+apiVersion: agents.kruise.io/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: tp-allow-tcp-web
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: sleep
+  egress:
+    rules:
+    - action: allow
+      ports:
+      - port: 80
+        protocol: TCP
+      - port: 443
+        protocol: TCP
+  ingress:
+    rules:
+    - action: allow
+      ports:
+      - port: 80
+        protocol: TCP
+      - port: 443
+        protocol: TCP
