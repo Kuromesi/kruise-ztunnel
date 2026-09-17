@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use super::*;
-use crate::sandbox::sandbox::SandboxManager;
-use crate::state::ProxyState;
 use crate::state::workload::Workload;
+use crate::state::{DemandProxyState, ProxyState};
 use crate::test_helpers::test_default_workload;
 use crate::xds::agentio::sandbox::SandboxState;
 use crate::xds::agentio::sandbox::sandbox::Attester;
@@ -23,7 +22,7 @@ use std::sync::RwLock;
 
 pub(crate) struct Fixture {
     pub state: Arc<RwLock<ProxyState>>,
-    pub manager: SandboxManager,
+    pub demand: DemandProxyState,
     pub workload: Arc<Workload>,
 }
 
@@ -38,7 +37,7 @@ impl Fixture {
         });
         let state = Arc::new(RwLock::new(ProxyState::new(None)));
         state.write().unwrap().workloads.insert(workload.clone());
-        let manager = SandboxManager::new(crate::state::DemandProxyState::new(
+        let demand = DemandProxyState::new(
             state.clone(),
             None,
             Default::default(),
@@ -46,10 +45,10 @@ impl Fixture {
             Arc::new(crate::proxy::Metrics::new(
                 &mut prometheus_client::registry::Registry::default(),
             )),
-        ));
+        );
         Self {
             state,
-            manager,
+            demand,
             workload,
         }
     }
@@ -169,14 +168,14 @@ fn sandboxes_are_grouped_by_workload_uid() {
         .sandboxes
         .update(resource("sandbox-b", &second.uid))
         .unwrap();
-    assert!(f.manager.fetch_attested_sandbox(&f.workload).is_none());
+    assert!(f.demand.fetch_sandbox(&f.workload).is_none());
     f.publish("sandbox-a");
-    let sandbox = f.manager.fetch_attested_sandbox(&f.workload).unwrap();
+    let sandbox = f.demand.fetch_sandbox(&f.workload).unwrap();
     assert_eq!(sandbox.uid, "sandbox-a");
     assert_eq!(sandbox.workload_uid.as_ref(), Some(&f.workload.uid));
     assert_eq!(
-        f.manager
-            .fetch_attested_sandbox(&second)
+        f.demand
+            .fetch_sandbox(&second)
             .map(|sandbox| sandbox.uid.clone())
             .as_deref(),
         Some("sandbox-b")
@@ -191,8 +190,8 @@ fn multiple_sandboxes_use_the_first_discovered_binding() {
     // Ordinary updates preserve selection order and do not duplicate bindings.
     f.publish("sandbox-a");
     assert_eq!(
-        f.manager
-            .fetch_attested_sandbox(&f.workload)
+        f.demand
+            .fetch_sandbox(&f.workload)
             .map(|sandbox| sandbox.uid.clone())
             .as_deref(),
         Some("sandbox-a")
@@ -214,8 +213,8 @@ fn multiple_sandboxes_use_the_first_discovered_binding() {
         .sandboxes
         .remove(&"sandbox-a".into());
     assert_eq!(
-        f.manager
-            .fetch_attested_sandbox(&f.workload)
+        f.demand
+            .fetch_sandbox(&f.workload)
             .map(|sandbox| sandbox.uid.clone())
             .as_deref(),
         Some("sandbox-b")
@@ -247,8 +246,8 @@ fn invalid_update_preserves_previous_resource_and_binding() {
         previous
     );
     assert_eq!(
-        f.manager
-            .fetch_attested_sandbox(&f.workload)
+        f.demand
+            .fetch_sandbox(&f.workload)
             .map(|sandbox| sandbox.uid.clone())
             .as_deref(),
         Some("sandbox-a")
@@ -270,8 +269,8 @@ fn lifecycle_updates_do_not_remove_identity() {
         changed.resource.state = state;
         f.state.write().unwrap().sandboxes.update(changed).unwrap();
         assert_eq!(
-            f.manager
-                .fetch_attested_sandbox(&f.workload)
+            f.demand
+                .fetch_sandbox(&f.workload)
                 .map(|sandbox| sandbox.uid.clone())
                 .as_deref(),
             Some("sandbox-a")
@@ -284,7 +283,7 @@ fn routing_updates_preserve_snapshots_and_reject_invalid_rebinding() {
     use crate::xds::agentio::sandbox::{EgressRouting, egress_routing};
     let f = Fixture::new();
     f.publish("sandbox-a");
-    let original = f.manager.fetch_attested_sandbox(&f.workload).unwrap();
+    let original = f.demand.fetch_sandbox(&f.workload).unwrap();
     let mut update = resource("sandbox-a", "workload-uid");
     update.resource.egress_routing = Some(EgressRouting {
         routes: vec![egress_routing::Route::default()],
@@ -295,7 +294,7 @@ fn routing_updates_preserve_snapshots_and_reject_invalid_rebinding() {
         .sandboxes
         .update(update.clone())
         .unwrap();
-    let accepted = f.manager.fetch_attested_sandbox(&f.workload).unwrap();
+    let accepted = f.demand.fetch_sandbox(&f.workload).unwrap();
     assert!(original.egress_routing.is_none());
     assert_eq!(accepted.egress_routing.as_ref().unwrap().policies.len(), 1);
 
@@ -304,7 +303,7 @@ fn routing_updates_preserve_snapshots_and_reject_invalid_rebinding() {
     assert!(f.state.write().unwrap().sandboxes.update(update).is_err());
     assert!(Arc::ptr_eq(
         &accepted,
-        &f.manager.fetch_attested_sandbox(&f.workload).unwrap()
+        &f.demand.fetch_sandbox(&f.workload).unwrap()
     ));
     assert!(
         f.state

@@ -182,11 +182,7 @@ impl OutboundConnection {
             .get_workload()
             .and_then(|source| {
                 // Select once before routing; policy, headers and pooling use this snapshot.
-                let sandbox = self
-                    .pi
-                    .sandbox_manager
-                    .as_ref()
-                    .and_then(|manager| manager.fetch_attested_sandbox(&source));
+                let sandbox = self.pi.state.fetch_sandbox(&source);
                 self.build_request(source, sandbox, dest_addr)
             });
         let mut req = match Box::pin(build).await {
@@ -1250,7 +1246,7 @@ mod tests {
             test_proxy_metrics(),
         );
         let wi = WorkloadInfo::new("pod".into(), "ns".into(), "default".into());
-        let mut manager = sandbox::SandboxManager::new(state.clone());
+        let mut manager = sandbox::SandboxManager::default();
         let local = Arc::new(LocalWorkloadInformation::new(
             Arc::new(wi),
             state.clone(),
@@ -1393,7 +1389,7 @@ mod tests {
         // A selected but unavailable gateway fails the request without direct fallback.
         routes.routes[0].gateway.as_mut().unwrap().service = "missing.ns".into();
         publish_routing("sandbox-a", routes);
-        let selected = manager.fetch_attested_sandbox(&fixture.workload);
+        let selected = state.fetch_sandbox(&fixture.workload);
         assert!(matches!(
             outbound
                 .build_request(fixture.workload.clone(), selected, target)
@@ -1433,13 +1429,13 @@ mod tests {
             "Y29ycmVjdC10b2tlbg=="
         );
         fixture.publish("sandbox-a");
-        request.sandbox = manager.fetch_attested_sandbox(&request.source);
+        request.sandbox = state.fetch_sandbox(&request.source);
         let discovered = outbound.create_hbone_request(source, &request).await;
         assert_eq!(
             discovered.headers()[sandbox::SANDBOX_ID_HEADER],
             "sandbox-a"
         );
-        let captured_a = manager.fetch_attested_sandbox(&request.source).unwrap();
+        let captured_a = state.fetch_sandbox(&request.source).unwrap();
         request.sandbox = Some(captured_a.clone());
         let hbone = outbound.create_hbone_request(source, &request).await;
         assert_eq!(hbone.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
@@ -1449,8 +1445,8 @@ mod tests {
         );
         fixture.publish("sandbox-b");
         assert_eq!(
-            manager
-                .fetch_attested_sandbox(&request.source)
+            state
+                .fetch_sandbox(&request.source)
                 .map(|sandbox| sandbox.uid.clone())
                 .unwrap(),
             captured_a.uid
@@ -1483,14 +1479,14 @@ mod tests {
             .workloads
             .insert(foreign.clone());
         request.source = foreign;
-        request.sandbox = manager.fetch_attested_sandbox(&request.source);
+        request.sandbox = state.fetch_sandbox(&request.source);
         let foreign_request = outbound.create_hbone_request(source, &request).await;
         assert!(
             !foreign_request
                 .headers()
                 .contains_key(sandbox::SANDBOX_ID_HEADER)
         );
-        assert!(manager.fetch_attested_sandbox(&request.source).is_none());
+        assert!(state.fetch_sandbox(&request.source).is_none());
         request.source = fixture.workload.clone();
         request.sandbox = Some(captured_a.clone());
         fixture
@@ -1502,7 +1498,7 @@ mod tests {
         // An already-started connection keeps its captured label after a Sandbox update.
         let captured = outbound.create_hbone_request(source, &request).await;
         assert_eq!(captured.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
-        let current = manager.fetch_attested_sandbox(&request.source).unwrap();
+        let current = state.fetch_sandbox(&request.source).unwrap();
         assert_eq!(current.uid, "sandbox-b");
         request.sandbox = Some(current);
         let next = outbound.create_hbone_request(source, &request).await;
@@ -1514,8 +1510,8 @@ mod tests {
             .sandboxes
             .remove(&"sandbox-b".into());
         // Removing the last binding leaves new connections without a Sandbox label.
-        assert!(manager.fetch_attested_sandbox(&request.source).is_none());
-        request.sandbox = manager.fetch_attested_sandbox(&request.source);
+        assert!(state.fetch_sandbox(&request.source).is_none());
+        request.sandbox = state.fetch_sandbox(&request.source);
         let unlabeled = outbound.create_hbone_request(source, &request).await;
         assert!(!unlabeled.headers().contains_key(sandbox::SANDBOX_ID_HEADER));
     }
@@ -1529,7 +1525,6 @@ mod tests {
 
         let fixture = Fixture::new();
         fixture.publish("sandbox-a");
-        let manager = Arc::new(fixture.manager);
         let cfg = Arc::new(crate::test_helpers::test_config());
         let state = DemandProxyState::new(
             fixture.state.clone(),
@@ -1583,7 +1578,7 @@ mod tests {
                 resolver: None,
                 disable_inbound_freebind: false,
                 crl_manager: None,
-                sandbox_manager: Some(manager.clone()),
+                sandbox_manager: None,
                 firewall_metrics: None,
             }),
             id: TraceParent::new(),

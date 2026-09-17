@@ -15,7 +15,6 @@
 use super::*;
 use crate::proxy::AuthorizationRejectionError;
 use crate::rbac::{Connection, Direction};
-use crate::sandbox::sandbox::SandboxManager;
 use crate::state::{DemandProxyState, ProxyRbacContext};
 
 const CONFIG: &str = include_str!("../../examples/sandbox.yaml");
@@ -76,9 +75,7 @@ async fn local_file_loads_sandbox_inline_and_shared_policies() {
     .unwrap();
     let state = proxy_state(&client);
     let ctx = context(&client, 8080);
-    let sandbox = SandboxManager::new(state.clone())
-        .fetch_attested_sandbox(&ctx.workload)
-        .unwrap();
+    let sandbox = state.fetch_sandbox(&ctx.workload).unwrap();
     assert_eq!(sandbox.uid.as_str(), "workload:local");
     assert_eq!(sandbox.traffic_policy_refs, vec![Strng::from(POLICY)]);
     assert_eq!(state.assert_rbac(&ctx).await, Ok(()));

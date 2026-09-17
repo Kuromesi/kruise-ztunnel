@@ -129,7 +129,7 @@ pub async fn build_with_cert(
 
     let mut sandbox_manager = None;
     if config.enable_sandbox_manager {
-        let mut manager = sandbox::SandboxManager::new(state.clone());
+        let mut manager = sandbox::SandboxManager::default();
         manager
             .run(
                 config.sandbox_token_path.clone().into(),

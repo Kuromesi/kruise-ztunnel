@@ -415,10 +415,7 @@ impl Inbound {
         };
 
         let rbac_ctx = ProxyRbacContext {
-            sandbox: pi
-                .sandbox_manager
-                .as_ref()
-                .and_then(|manager| manager.fetch_attested_sandbox(&destination_workload)),
+            sandbox: pi.state.fetch_sandbox(&destination_workload),
             conn,
             workload: destination_workload.clone(),
         };

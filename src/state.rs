@@ -507,6 +507,16 @@ impl DemandProxyState {
         self.state.read().unwrap()
     }
 
+    /// The Workload's first discovered Sandbox.
+    /// TODO: Support multiple Sandboxes per Workload, and select the correct one for each connection.
+    pub fn fetch_sandbox(&self, workload: &Workload) -> Option<Arc<Sandbox>> {
+        self.read()
+            .sandboxes
+            .get_by_workload(&workload.uid)
+            .first()
+            .cloned()
+    }
+
     pub async fn assert_rbac(
         &self,
         ctx: &ProxyRbacContext,

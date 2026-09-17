@@ -104,7 +104,7 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
         .build(metrics, block_ready.unwrap());
     let demander = client.demander();
     assert_eq!(demander.is_some(), on_demand);
-    let manager = &fixture.manager;
+    let demand = &fixture.demand;
     let client_task = tokio::spawn(client.run());
     let mut connection = tokio::time::timeout(Duration::from_secs(5), connections.recv())
         .await
@@ -190,7 +190,7 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
         );
     }
 
-    assert!(manager.fetch_attested_sandbox(&fixture.workload).is_none());
+    assert!(demand.fetch_sandbox(&fixture.workload).is_none());
     let mut malformed = resource();
     malformed.resource.as_mut().unwrap().value = vec![0xff];
     connection
@@ -200,14 +200,14 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
         .unwrap();
     let nack = next_matching(&mut connection, |r| r.response_nonce == "initial-malformed").await;
     assert!(nack.error_detail.is_some());
-    assert!(manager.fetch_attested_sandbox(&fixture.workload).is_none());
+    assert!(demand.fetch_sandbox(&fixture.workload).is_none());
     connection
         .tx
         .send(Ok(response("missing", vec![], vec!["sandbox-a".into()])))
         .await
         .unwrap();
     next_matching(&mut connection, |r| r.response_nonce == "missing").await;
-    assert!(manager.fetch_attested_sandbox(&fixture.workload).is_none());
+    assert!(demand.fetch_sandbox(&fixture.workload).is_none());
     connection
         .tx
         .send(Ok(response("found", vec![resource()], vec![])))
@@ -216,8 +216,8 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
     next_matching(&mut connection, |r| r.response_nonce == "found").await;
 
     assert_eq!(
-        manager
-            .fetch_attested_sandbox(&fixture.workload)
+        demand
+            .fetch_sandbox(&fixture.workload)
             .map(|sandbox| sandbox.uid.clone())
             .as_deref(),
         Some("sandbox-a")
@@ -230,7 +230,7 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
         .await
         .unwrap();
     next_matching(&mut connection, |r| r.response_nonce == "removed").await;
-    assert!(manager.fetch_attested_sandbox(&fixture.workload).is_none());
+    assert!(demand.fetch_sandbox(&fixture.workload).is_none());
     connection
         .tx
         .send(Ok(response("republished", vec![resource()], vec![])))
@@ -238,8 +238,8 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
         .unwrap();
     next_matching(&mut connection, |r| r.response_nonce == "republished").await;
     assert_eq!(
-        manager
-            .fetch_attested_sandbox(&fixture.workload)
+        demand
+            .fetch_sandbox(&fixture.workload)
             .map(|sandbox| sandbox.uid.clone())
             .as_deref(),
         Some("sandbox-a")
@@ -255,8 +255,8 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
     let nack = next_matching(&mut connection, |r| r.response_nonce == "malformed").await;
     assert!(nack.error_detail.is_some());
     assert_eq!(
-        manager
-            .fetch_attested_sandbox(&fixture.workload)
+        demand
+            .fetch_sandbox(&fixture.workload)
             .map(|sandbox| sandbox.uid.clone()),
         Some("sandbox-a".into())
     );
@@ -267,7 +267,7 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
         .await
         .unwrap();
     next_matching(&mut connection, |r| r.response_nonce == "withdrawn").await;
-    assert!(manager.fetch_attested_sandbox(&fixture.workload).is_none());
+    assert!(demand.fetch_sandbox(&fixture.workload).is_none());
 
     connection
         .tx
@@ -297,7 +297,7 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
         }
     }
     connection = reconnected;
-    assert!(manager.fetch_attested_sandbox(&fixture.workload).is_none());
+    assert!(demand.fetch_sandbox(&fixture.workload).is_none());
     connection
         .tx
         .send(Ok(response("repaired", vec![resource()], vec![])))
@@ -306,8 +306,8 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
     let ack = next_matching(&mut connection, |r| r.response_nonce == "repaired").await;
     assert!(ack.error_detail.is_none());
     assert_eq!(
-        manager
-            .fetch_attested_sandbox(&fixture.workload)
+        demand
+            .fetch_sandbox(&fixture.workload)
             .map(|sandbox| sandbox.uid.clone())
             .as_deref(),
         Some("sandbox-a")

@@ -159,10 +159,7 @@ impl InboundPassthrough {
         let upstream_services = pi.state.get_services_by_workload(&upstream_workload);
 
         let rbac_ctx = crate::state::ProxyRbacContext {
-            sandbox: pi
-                .sandbox_manager
-                .as_ref()
-                .and_then(|manager| manager.fetch_attested_sandbox(&upstream_workload)),
+            sandbox: pi.state.fetch_sandbox(&upstream_workload),
             conn: rbac::Connection {
                 src_identity: None,
                 src: source_addr,

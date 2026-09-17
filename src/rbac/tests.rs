@@ -347,7 +347,7 @@ async fn sandbox_rbac_tracks_current_policies_and_binding() {
         .sandboxes
         .update(resource.clone())
         .unwrap();
-    ctx.sandbox = f.manager.fetch_attested_sandbox(&f.workload);
+    ctx.sandbox = f.demand.fetch_sandbox(&f.workload);
     assert!(state.assert_rbac(&ctx).await.is_ok());
     assert!(state.assert_rbac(&before_discovery).await.is_ok());
 
@@ -364,7 +364,7 @@ async fn sandbox_rbac_tracks_current_policies_and_binding() {
 
     // Keep connection tracking separate for different Sandbox identities, not policy versions.
     let mut updated = ctx.clone();
-    updated.sandbox = f.manager.fetch_attested_sandbox(&f.workload);
+    updated.sandbox = f.demand.fetch_sandbox(&f.workload);
     assert!(!Arc::ptr_eq(
         ctx.sandbox.as_ref().unwrap(),
         updated.sandbox.as_ref().unwrap()
@@ -378,7 +378,7 @@ async fn sandbox_rbac_tracks_current_policies_and_binding() {
     assert_eq!(contexts.len(), 2);
 
     // Invalid policy + binding changes leave the accepted resource and binding intact.
-    let accepted = f.manager.fetch_attested_sandbox(&f.workload).unwrap();
+    let accepted = f.demand.fetch_sandbox(&f.workload).unwrap();
     let mut invalid = resource.clone();
     invalid.resource.attester.as_mut().unwrap().workload_uid = "different-workload".into();
     invalid
@@ -394,7 +394,7 @@ async fn sandbox_rbac_tracks_current_policies_and_binding() {
     assert!(f.state.write().unwrap().sandboxes.update(invalid).is_err());
     assert!(Arc::ptr_eq(
         &accepted,
-        &f.manager.fetch_attested_sandbox(&f.workload).unwrap()
+        &f.demand.fetch_sandbox(&f.workload).unwrap()
     ));
     assert!(state.assert_rbac(&ctx).await.is_err());
 
@@ -791,7 +791,7 @@ async fn shared_policy_updates_recheck_sandbox_context_without_replacing_sandbox
             })
             .unwrap();
     }
-    let sandbox = f.manager.fetch_attested_sandbox(&f.workload).unwrap();
+    let sandbox = f.demand.fetch_sandbox(&f.workload).unwrap();
     let ctx = ProxyRbacContext {
         conn: connection("10.1.0.1:1234", "192.0.2.1:443"),
         workload: f.workload.clone(),
@@ -841,7 +841,7 @@ async fn shared_policy_updates_recheck_sandbox_context_without_replacing_sandbox
     assert!(state.assert_rbac(&ctx).await.is_err());
     assert!(Arc::ptr_eq(
         &sandbox,
-        &f.manager.fetch_attested_sandbox(&f.workload).unwrap()
+        &f.demand.fetch_sandbox(&f.workload).unwrap()
     ));
     let updated_hash =
         crate::firewall::convert::resolve_workload_firewall(&f.state.read().unwrap(), &info, None)
