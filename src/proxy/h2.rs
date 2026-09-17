@@ -26,6 +26,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::trace;
 
+pub mod capsule;
 pub mod client;
 pub mod server;
 

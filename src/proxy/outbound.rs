@@ -159,6 +159,60 @@ pub(super) struct OutboundConnection {
 }
 
 impl OutboundConnection {
+    pub(super) async fn connect_udp(
+        &mut self,
+        source_addr: SocketAddr,
+        dest_addr: SocketAddr,
+        gateway: &mut Option<SocketAddr>,
+    ) -> Result<H2Stream, Error> {
+        let source = self.pi.local_workload_information.get_workload().await?;
+        let sandbox = self.pi.state.fetch_sandbox(&source);
+        let req = self.build_request(source, sandbox, dest_addr).await?;
+        if req.protocol != OutboundProtocol::HBONE {
+            return Err(Error::UnsupportedFeature(
+                "CONNECT-UDP PoC requires an HBONE gateway route".to_string(),
+            ));
+        }
+        // Record the selected peer before opening the stream so failed or cancelled
+        // handshakes still identify the attempted gateway in the UDP session log.
+        *gateway = Some(req.actual_destination);
+        let request = self.create_connect_udp_request(source_addr, &req).await?;
+
+        let pool_key = WorkloadKey {
+            src_id: req.source.identity(),
+            dst_id: req.upstream_sans.clone(),
+            sandbox_id: req.sandbox.as_ref().map(|sandbox| sandbox.uid.clone()),
+            src: source_addr.ip(),
+            dst: req.actual_destination,
+        };
+        let (stream, _) = self
+            .pool
+            .send_request_pooled(&pool_key, request)
+            .instrument(trace_span!("outbound connect-udp"))
+            .await?;
+        Ok(stream)
+    }
+
+    async fn create_connect_udp_request(
+        &self,
+        source_addr: SocketAddr,
+        req: &Request,
+    ) -> Result<http::Request<()>, Error> {
+        let path = connect_udp_masque_path(req.hbone_target_destination.as_ref())?;
+        // Reuse the current HBONE source and Sandbox headers for UDP as well.
+        let mut request = self.create_hbone_request(source_addr, req).await;
+        *request.uri_mut() = format!("https://{}{path}", req.actual_destination)
+            .parse()
+            .expect("CONNECT-UDP request uses validated addresses");
+        request
+            .headers_mut()
+            .insert("capsule-protocol", http::HeaderValue::from_static("?1"));
+        request
+            .extensions_mut()
+            .insert(h2::ext::Protocol::from_static("connect-udp"));
+        Ok(request)
+    }
+
     async fn proxy(&mut self, source_stream: TcpStream) {
         let source_addr =
             socket::to_canonical(source_stream.peer_addr().expect("must receive peer addr"));
@@ -501,6 +555,19 @@ impl OutboundConnection {
                 }))
             }
         }
+    }
+}
+
+fn connect_udp_masque_path(
+    hbone_target_destination: Option<&HboneAddress>,
+) -> Result<String, Error> {
+    match hbone_target_destination {
+        Some(HboneAddress::SocketAddr(SocketAddr::V4(target))) if target.port() != 0 => Ok(
+            format!("/.well-known/masque/udp/{}/{}/", target.ip(), target.port(),),
+        ),
+        _ => Err(Error::UnsupportedFeature(
+            "CONNECT-UDP egress policy requires a numeric IPv4 target".to_string(),
+        )),
     }
 }
 
@@ -860,6 +927,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn connect_udp_masque_path_uses_egress_policy_ipv4_target_without_service() {
+        let target = HboneAddress::SocketAddr("10.0.0.8:9000".parse().unwrap());
+
+        let path = connect_udp_masque_path(Some(&target)).unwrap();
+
+        assert_eq!(path, "/.well-known/masque/udp/10.0.0.8/9000/");
+    }
+
+    #[test]
+    fn connect_udp_masque_path_rejects_unsupported_numeric_targets() {
+        let ipv6 = HboneAddress::SocketAddr("[2001:db8::1]:9000".parse().unwrap());
+        let zero_port = HboneAddress::SocketAddr("10.0.0.8:0".parse().unwrap());
+
+        for target in [None, Some(&ipv6), Some(&zero_port)] {
+            assert!(matches!(
+                connect_udp_masque_path(target),
+                Err(Error::UnsupportedFeature(_))
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn hbone_request_carries_workload_headers() {
         initialize_telemetry();
@@ -946,6 +1035,28 @@ mod tests {
         assert_eq!(request.headers()[WORKLOAD_NAME_HEADER], "source-workload");
         assert_eq!(request.headers()[WORKLOAD_NAMESPACE_HEADER], "ns");
         assert!(!request.headers().contains_key(TLS_HEADER));
+        let udp = outbound
+            .create_connect_udp_request(remote_addr, &req)
+            .await
+            .unwrap();
+        assert_eq!(udp.method(), hyper::Method::CONNECT);
+        assert_eq!(udp.version(), hyper::Version::HTTP_2);
+        assert_eq!(
+            udp.uri(),
+            "https://10.0.0.1:8080/.well-known/masque/udp/10.0.0.1/8080/"
+        );
+        assert_eq!(udp.headers()["capsule-protocol"], "?1");
+        assert_eq!(udp.headers()[WORKLOAD_NAME_HEADER], "source-workload");
+        assert_eq!(udp.headers()[WORKLOAD_NAMESPACE_HEADER], "ns");
+        assert_eq!(udp.headers()[FORWARDED], r#"for="127.0.0.1:12345""#);
+        assert_eq!(
+            udp.extensions()
+                .get::<h2::ext::Protocol>()
+                .unwrap()
+                .as_str(),
+            "connect-udp"
+        );
+        assert!(!udp.headers().contains_key(TLS_HEADER));
         use crate::extensions::sni::{SniRule, SniTrafficPolicy};
         let policy = SniTrafficPolicy {
             rules: vec![
@@ -1235,8 +1346,26 @@ mod tests {
         }
     }
 
+    #[test_case::test_case(false; "tcp")]
+    #[test_case::test_case(true; "udp")]
     #[tokio::test]
-    async fn hbone_uses_discovered_sandbox_routing_and_independent_token() {
+    async fn hbone_uses_discovered_sandbox_routing_and_independent_token(udp: bool) {
+        async fn create_request(
+            outbound: &OutboundConnection,
+            source: SocketAddr,
+            request: &Request,
+            udp: bool,
+        ) -> http::Request<()> {
+            if udp {
+                outbound
+                    .create_connect_udp_request(source, request)
+                    .await
+                    .unwrap()
+            } else {
+                outbound.create_hbone_request(source, request).await
+            }
+        }
+
         use crate::sandbox::discovery::tests::Fixture;
         use crate::state::DemandProxyState;
         let fixture = Fixture::new();
@@ -1270,7 +1399,7 @@ mod tests {
         .await
         .unwrap();
         let manager = Arc::new(manager);
-        let outbound = OutboundConnection {
+        let mut outbound = OutboundConnection {
             pi: Arc::new(ProxyInputs {
                 state: state.clone(),
                 cfg: cfg.clone(),
@@ -1298,6 +1427,7 @@ mod tests {
             .workloads
             .insert(Arc::new(Workload {
                 uid: "egress-gateway".into(),
+                name: "egress-gateway".into(),
                 hostname: "egress.ns".into(),
                 workload_ips: vec!["127.0.0.10".parse().unwrap()],
                 ..(*fixture.workload).clone()
@@ -1382,7 +1512,7 @@ mod tests {
                         .to_string(),
                     target.to_string()
                 );
-                let hbone = outbound.create_hbone_request(target, &request).await;
+                let hbone = create_request(&outbound, target, &request, udp).await;
                 assert_eq!(hbone.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
             } else {
                 assert_eq!(request.protocol, OutboundProtocol::TCP);
@@ -1425,7 +1555,7 @@ mod tests {
             upstream_sans: vec![],
         };
         let source = "127.0.0.1:12345".parse().unwrap();
-        let before = outbound.create_hbone_request(source, &request).await;
+        let before = create_request(&outbound, source, &request, udp).await;
         assert!(!before.headers().contains_key(sandbox::SANDBOX_ID_HEADER));
         assert_eq!(
             before.headers()[sandbox::SANDBOX_TOKEN_HEADER],
@@ -1433,14 +1563,14 @@ mod tests {
         );
         fixture.publish("sandbox-a");
         request.sandbox = state.fetch_sandbox(&request.source);
-        let discovered = outbound.create_hbone_request(source, &request).await;
+        let discovered = create_request(&outbound, source, &request, udp).await;
         assert_eq!(
             discovered.headers()[sandbox::SANDBOX_ID_HEADER],
             "sandbox-a"
         );
         let captured_a = state.fetch_sandbox(&request.source).unwrap();
         request.sandbox = Some(captured_a.clone());
-        let hbone = outbound.create_hbone_request(source, &request).await;
+        let hbone = create_request(&outbound, source, &request, udp).await;
         assert_eq!(hbone.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
         assert_eq!(
             hbone.headers()[sandbox::SANDBOX_TOKEN_HEADER],
@@ -1464,7 +1594,7 @@ mod tests {
                 .get_by_workload(&request.source.uid)
                 .into_iter()
                 .find(|sandbox| sandbox.uid == id);
-            let hbone = outbound.create_hbone_request(source, &request).await;
+            let hbone = create_request(&outbound, source, &request, udp).await;
             assert_eq!(hbone.headers()[sandbox::SANDBOX_ID_HEADER], id);
             assert_eq!(
                 hbone.headers()[sandbox::SANDBOX_TOKEN_HEADER],
@@ -1473,6 +1603,7 @@ mod tests {
         }
         let foreign = Arc::new(Workload {
             uid: "foreign".into(),
+            name: "foreign".into(),
             ..(*fixture.workload).clone()
         });
         fixture
@@ -1483,7 +1614,7 @@ mod tests {
             .insert(foreign.clone());
         request.source = foreign;
         request.sandbox = state.fetch_sandbox(&request.source);
-        let foreign_request = outbound.create_hbone_request(source, &request).await;
+        let foreign_request = create_request(&outbound, source, &request, udp).await;
         assert!(
             !foreign_request
                 .headers()
@@ -1499,12 +1630,12 @@ mod tests {
             .sandboxes
             .remove(&"sandbox-a".into());
         // An already-started connection keeps its captured label after a Sandbox update.
-        let captured = outbound.create_hbone_request(source, &request).await;
+        let captured = create_request(&outbound, source, &request, udp).await;
         assert_eq!(captured.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
         let current = state.fetch_sandbox(&request.source).unwrap();
         assert_eq!(current.uid, "sandbox-b");
         request.sandbox = Some(current);
-        let next = outbound.create_hbone_request(source, &request).await;
+        let next = create_request(&outbound, source, &request, udp).await;
         assert_eq!(next.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-b");
         fixture
             .state
@@ -1515,8 +1646,29 @@ mod tests {
         // Removing the last binding leaves new connections without a Sandbox label.
         assert!(state.fetch_sandbox(&request.source).is_none());
         request.sandbox = state.fetch_sandbox(&request.source);
-        let unlabeled = outbound.create_hbone_request(source, &request).await;
+        let unlabeled = create_request(&outbound, source, &request, udp).await;
         assert!(!unlabeled.headers().contains_key(sandbox::SANDBOX_ID_HEADER));
+        if udp {
+            let mut gateway = None;
+            // UDP never falls back to a direct TCP connection when no gateway is selected.
+            assert!(matches!(
+                outbound.connect_udp(source, target, &mut gateway).await,
+                Err(Error::UnsupportedFeature(_))
+            ));
+            fixture.state.write().unwrap().workloads.insert(workload);
+            assert!(matches!(
+                outbound.connect_udp(source, target, &mut gateway).await,
+                Err(Error::EgressPolicyDenied(destination)) if destination == target
+            ));
+            // A discovered Sandbox owns routing even without routes or a token-derived ID.
+            // It must not fall back to the Workload's deny policy.
+            fixture.publish("sandbox-passthrough");
+            assert!(matches!(
+                outbound.connect_udp(source, target, &mut gateway).await,
+                Err(Error::UnsupportedFeature(_))
+            ));
+            assert!(gateway.is_none());
+        }
     }
 
     #[tokio::test]
