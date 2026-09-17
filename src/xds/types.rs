@@ -44,9 +44,6 @@ pub mod istio {
     pub mod workload {
         tonic::include_proto!("istio.workload");
     }
-    pub mod security {
-        tonic::include_proto!("istio.security");
-    }
     pub mod ca {
         tonic::include_proto!("istio.v1.auth");
     }

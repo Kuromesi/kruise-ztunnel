@@ -35,7 +35,6 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tracing::info;
 
-use ztunnel::rbac::{Authorization, RbacMatch, StringMatch};
 use ztunnel::state::workload::{InboundProtocol, Workload};
 use ztunnel::state::{DemandProxyState, ProxyRbacContext, ProxyState};
 use ztunnel::test_helpers::app::{DestinationAddr, TestApp};
@@ -43,6 +42,9 @@ use ztunnel::test_helpers::linux::{TestMode, WorkloadManager};
 use ztunnel::test_helpers::tcp::Mode;
 use ztunnel::test_helpers::{helpers, tcp, test_default_workload};
 use ztunnel::xds::LocalWorkload;
+use ztunnel::xds::agentio::sandbox::{PolicyReference, Sandbox as XdsSandbox, sandbox::Attester};
+use ztunnel::xds::agentio::security::{TrafficPolicy as XdsTrafficPolicy, traffic_policy};
+use ztunnel::xds::{TRAFFIC_POLICY_TYPE, XdsResource};
 use ztunnel::{app, identity, metrics, proxy, rbac, setup_netns_test, strng, test_helpers};
 
 const KB: usize = 1024;
@@ -53,53 +55,36 @@ const MAX_HBONE_WORKLOADS: u8 = 64;
 
 const N_RULES: usize = 10;
 const N_POLICIES: usize = 10_000;
-const DUMMY_NETWORK: &str = "198.51.100.0/24";
 
 #[ctor::ctor(unsafe)]
 fn initialize_namespace_tests() {
     ztunnel::test_helpers::namespaced::initialize_namespace_tests();
 }
 
-fn create_test_policies() -> Vec<Authorization> {
-    let mut policies: Vec<Authorization> = vec![];
-    let mut rules = vec![];
-    for _ in 0..N_RULES {
-        rules.push(vec![vec![RbacMatch {
-            namespaces: vec![
-                StringMatch::Prefix("random-prefix-2b123".into()),
-                StringMatch::Suffix("random-postix-2b723".into()),
-                StringMatch::Exact("random-exac-2bc13".into()),
-            ],
-            not_namespaces: vec![],
-            service_accounts: vec![],
-            not_service_accounts: vec![],
-            principals: vec![
-                StringMatch::Prefix("random-prefix-2b123".into()),
-                StringMatch::Suffix("random-postix-2b723".into()),
-                StringMatch::Exact("random-exac-2bc13".into()),
-            ],
-            not_principals: vec![],
-            source_ips: vec![DUMMY_NETWORK.parse().unwrap()],
-            not_source_ips: vec![],
-            destination_ips: vec![DUMMY_NETWORK.parse().unwrap()],
-            not_destination_ips: vec![],
-            destination_ports: vec![0],
-            not_destination_ports: vec![],
-        }]]);
-    }
-
-    for i in 0..N_POLICIES {
-        policies.push(Authorization {
-            name: strng::format!("policy {i}"),
-            action: ztunnel::rbac::RbacAction::Deny,
-            scope: ztunnel::rbac::RbacScope::Global,
-            namespace: "default".into(),
-            rules: rules.clone(),
-            dry_run: false,
-        });
-    }
-
-    policies
+fn create_test_policies() -> Vec<XdsResource<XdsTrafficPolicy>> {
+    let rules = (0..N_RULES)
+        .map(|_| traffic_policy::Rule {
+            action: traffic_policy::Action::Deny.into(),
+            r#match: Some(traffic_policy::Match {
+                source_ips: vec![traffic_policy::Address {
+                    address: vec![198, 51, 100, 0],
+                    length: 24,
+                }],
+                ..Default::default()
+            }),
+        })
+        .collect::<Vec<_>>();
+    (0..N_POLICIES)
+        .map(|i| XdsResource {
+            name: strng::format!("trafficPolicies/policy-{i}"),
+            resource: XdsTrafficPolicy {
+                egress: Some(traffic_policy::RuleSet {
+                    rules: rules.clone(),
+                }),
+                ..Default::default()
+            },
+        })
+        .collect()
 }
 
 fn run_async_blocking<Fut, O>(f: Fut) -> O
@@ -370,9 +355,32 @@ pub fn connections(c: &mut Criterion) {
 pub fn rbac(c: &mut Criterion) {
     let policies = create_test_policies();
     let mut state = ProxyState::new(None);
+    let workload = Arc::new(test_default_workload());
+    let names = policies.iter().map(|p| p.name.to_string()).collect();
     for p in policies {
-        state.policies.insert(p.to_key(), p);
+        state.policies.update(p).unwrap();
     }
+    state.workloads.insert(workload.clone());
+    state
+        .sandboxes
+        .update(XdsResource {
+            name: "workload:benchmark".into(),
+            resource: XdsSandbox {
+                uid: "workload:benchmark".into(),
+                attester: Some(Attester {
+                    workload_uid: workload.uid.to_string(),
+                }),
+                policy_refs: std::collections::HashMap::from([(
+                    TRAFFIC_POLICY_TYPE.to_string(),
+                    PolicyReference {
+                        resource_names: names,
+                    },
+                )]),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let sandbox = state.sandboxes.get(&"workload:benchmark".into());
 
     let mut registry = Registry::default();
     let metrics = Arc::new(crate::proxy::Metrics::new(&mut registry));
@@ -389,8 +397,10 @@ pub fn rbac(c: &mut Criterion) {
             dst: "127.0.0.2:12345".parse().unwrap(),
             src_identity: None,
             dst_network: "".into(),
+            direction: rbac::Direction::Outbound,
         },
-        workload: Arc::new(test_default_workload()),
+        workload,
+        sandbox,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -486,8 +496,8 @@ fn hbone_connection_config() -> ztunnel::config::ConfigSource {
 
     let lc = ztunnel::xds::LocalConfig {
         workloads,
-        policies: vec![],
         services: vec![],
+        ..Default::default()
     };
     let mut b = bytes::BytesMut::new().writer();
     serde_yaml::to_writer(&mut b, &lc).ok();

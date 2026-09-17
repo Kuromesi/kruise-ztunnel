@@ -16,7 +16,7 @@
 use crate::identity::Identity;
 
 use crate::baggage::Baggage;
-use crate::extensions::extensions::{AuthExtension, EgressPolicies, EgressPolicyError};
+use crate::extensions::extensions::{EgressPolicies, EgressPolicyError, WorkloadExtension};
 use crate::state::WorkloadInfo;
 use crate::strng::Strng;
 use crate::xds::istio::workload::{Port, PortList};
@@ -270,9 +270,6 @@ pub struct Workload {
     #[serde(default, skip_serializing_if = "is_default")]
     pub application_tunnel: Option<ApplicationTunnel>,
 
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub authorization_policies: Vec<Strng>,
-
     #[serde(default)]
     pub status: HealthStatus,
 
@@ -474,10 +471,10 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
         let mut egress_policies: Option<EgressPolicies> = None;
 
         for extension in resource.extensions.into_iter() {
-            let extension = AuthExtension::try_from(extension)?;
+            let extension = WorkloadExtension::try_from(extension)?;
             match extension {
-                AuthExtension::WorkloadMetadata(m) => metadata = Some(m),
-                AuthExtension::EgressPolicies(policies) => egress_policies = Some(policies),
+                WorkloadExtension::WorkloadMetadata(m) => metadata = Some(m),
+                WorkloadExtension::EgressPolicies(policies) => egress_policies = Some(policies),
                 _ => {}
             }
         }
@@ -527,12 +524,6 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
 
             native_tunnel: resource.native_tunnel,
             application_tunnel,
-
-            authorization_policies: resource
-                .authorization_policies
-                .iter()
-                .map(strng::new)
-                .collect(),
 
             locality: resource.locality.map(Locality::from).unwrap_or_default(),
 

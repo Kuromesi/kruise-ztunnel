@@ -20,7 +20,7 @@ use crate::state::workload::InboundProtocol::{HBONE, TCP};
 use crate::state::workload::{GatewayAddress, NetworkAddress, Workload, gatewayaddress};
 use crate::state::workload::{HealthStatus, InboundProtocol};
 use crate::state::{DemandProxyState, ProxyState};
-use crate::xds::istio::security::Authorization as XdsAuthorization;
+use crate::xds::agentio::sandbox::Sandbox as XdsSandbox;
 use crate::xds::istio::workload::Address as XdsAddress;
 use crate::xds::istio::workload::Service as XdsService;
 use crate::xds::istio::workload::Workload as XdsWorkload;
@@ -74,7 +74,7 @@ pub fn can_run_privilged_test() -> bool {
 pub fn test_config_with_waypoint(addr: IpAddr) -> config::Config {
     config::Config {
         local_xds_config: Some(ConfigSource::Static(
-            local_xds_config(80, Some(addr), vec![]).unwrap(),
+            local_xds_config(80, Some(addr)).unwrap(),
         )),
         ..test_config()
     }
@@ -107,9 +107,7 @@ pub fn test_config_with_port_xds_addr_and_root_cert(
         },
         local_xds_config: match xds_config {
             Some(c) => Some(c),
-            None => Some(ConfigSource::Static(
-                local_xds_config(port, None, vec![]).unwrap(),
-            )),
+            None => Some(ConfigSource::Static(local_xds_config(port, None).unwrap())),
         },
         // Switch all addressed to localhost (so we don't make a bunch of ports expose on public internet when someone runs a test),
         // and port 0 (to avoid port conflicts)
@@ -223,7 +221,6 @@ pub fn test_default_workload() -> Workload {
         cluster_id: "Kubernetes".into(),
         capacity: 1,
 
-        authorization_policies: Vec::new(),
         native_tunnel: false,
         application_tunnel: None,
         locality: Default::default(),
@@ -298,11 +295,7 @@ fn test_custom_svc(
     })
 }
 
-pub fn local_xds_config(
-    echo_port: u16,
-    waypoint_ip: Option<IpAddr>,
-    policies: Vec<crate::rbac::Authorization>,
-) -> anyhow::Result<Bytes> {
+pub fn local_xds_config(echo_port: u16, waypoint_ip: Option<IpAddr>) -> anyhow::Result<Bytes> {
     let default_svc = test_custom_svc(
         TEST_SERVICE_NAME,
         TEST_SERVICE_HOST,
@@ -377,8 +370,8 @@ pub fn local_xds_config(
     let svcs: Vec<Service> = vec![default_svc, dns_svc];
     let lc = LocalConfig {
         workloads: res,
-        policies,
         services: svcs,
+        ..Default::default()
     };
     let mut b = bytes::BytesMut::new().writer();
     serde_yaml::to_writer(&mut b, &lc)?;
@@ -426,7 +419,7 @@ where
 pub fn new_proxy_state(
     xds_workloads: &[XdsWorkload],
     xds_services: &[XdsService],
-    xds_authorizations: &[XdsAuthorization],
+    xds_sandboxes: &[XdsSandbox],
 ) -> DemandProxyState {
     let state = Arc::new(RwLock::new(ProxyState::new(None)));
     let updater = ProxyStateUpdater::new_no_fetch(state.clone());
@@ -455,12 +448,12 @@ pub fn new_proxy_state(
             .handle(Box::new(&mut vec![XdsUpdate::Update(res)].into_iter()))
             .unwrap();
     }
-    for a in xds_authorizations {
+    for sandbox in xds_sandboxes {
         let res = XdsResource {
-            name: a.name.as_str().into(),
-            resource: a.clone(),
+            name: sandbox.uid.as_str().into(),
+            resource: sandbox.clone(),
         };
-        let handler = &updater as &dyn Handler<XdsAuthorization>;
+        let handler = &updater as &dyn Handler<XdsSandbox>;
         handler
             .handle(Box::new(&mut vec![XdsUpdate::Update(res)].into_iter()))
             .unwrap();

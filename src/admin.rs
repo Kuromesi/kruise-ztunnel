@@ -473,14 +473,8 @@ mod tests {
     use crate::identity;
     use crate::strng;
     use crate::test_helpers::{get_response_str, helpers, new_proxy_state};
-    use crate::xds::istio::security::Address as XdsAddress;
-    use crate::xds::istio::security::Authorization as XdsAuthorization;
-    use crate::xds::istio::security::Clause as XdsClause;
-    use crate::xds::istio::security::Match as XdsMatch;
-    use crate::xds::istio::security::Rule as XdsRule;
-    use crate::xds::istio::security::ServiceAccountMatch as XdsServiceAccountMatch;
-    use crate::xds::istio::security::StringMatch as XdsStringMatch;
-    use crate::xds::istio::security::string_match::MatchType as XdsMatchType;
+    use crate::xds::agentio::sandbox::{Sandbox as XdsSandbox, sandbox::Attester};
+    use crate::xds::agentio::security::{TrafficPolicy as XdsTrafficPolicy, traffic_policy};
     use crate::xds::istio::workload::GatewayAddress as XdsGatewayAddress;
     use crate::xds::istio::workload::LoadBalancing as XdsLoadBalancing;
     use crate::xds::istio::workload::Locality as XdsLocality;
@@ -783,67 +777,34 @@ mod tests {
             canonical: true,
         };
 
-        let auth = XdsAuthorization {
-            name: "svc1".to_string(),
-            namespace: "ns".to_string(),
-            scope: 0,
-            action: 0,
-            rules: vec![XdsRule {
-                clauses: vec![XdsClause {
-                    matches: vec![XdsMatch {
-                        destination_ports: vec![80],
-                        not_destination_ports: vec![8080],
-                        source_ips: vec![XdsAddress {
-                            address: Bytes::copy_from_slice(&[127, 0, 0, 2]),
-                            length: 32,
-                        }],
-                        not_source_ips: vec![XdsAddress {
-                            address: Bytes::copy_from_slice(&[127, 0, 0, 1]),
-                            length: 32,
-                        }],
-                        destination_ips: vec![XdsAddress {
-                            address: Bytes::copy_from_slice(&[127, 0, 0, 3]),
-                            length: 32,
-                        }],
-                        not_destination_ips: vec![XdsAddress {
-                            address: Bytes::copy_from_slice(&[127, 0, 0, 4]),
-                            length: 32,
-                        }],
-                        namespaces: vec![XdsStringMatch {
-                            match_type: Some(XdsMatchType::Exact("ns".to_string())),
-                        }],
-                        not_namespaces: vec![XdsStringMatch {
-                            match_type: Some(XdsMatchType::Exact("not-ns".to_string())),
-                        }],
-                        service_accounts: vec![XdsServiceAccountMatch {
-                            namespace: "ns".into(),
-                            service_account: "sa".into(),
-                        }],
-                        not_service_accounts: vec![XdsServiceAccountMatch {
-                            namespace: "ns".into(),
-                            service_account: "sa".into(),
-                        }],
-                        principals: vec![XdsStringMatch {
-                            match_type: Some(XdsMatchType::Exact(
-                                "spiffe://cluster.local/ns/ns/sa/sa".to_string(),
-                            )),
-                        }],
-                        not_principals: vec![XdsStringMatch {
-                            match_type: Some(XdsMatchType::Exact(
-                                "spiffe://cluster.local/ns/ns/sa/not-sa".to_string(),
-                            )),
-                        }],
-                        destination_port_ranges: vec![],
-                        not_destination_port_ranges: vec![],
+        let sandbox = XdsSandbox {
+            uid: "workload:pod-uid".into(),
+            attester: Some(Attester {
+                workload_uid: wl.uid.clone(),
+            }),
+            traffic_policy: Some(XdsTrafficPolicy {
+                egress: Some(traffic_policy::RuleSet {
+                    rules: vec![traffic_policy::Rule {
+                        action: traffic_policy::Action::Allow.into(),
+                        r#match: Some(traffic_policy::Match {
+                            source_ips: vec![traffic_policy::Address {
+                                address: vec![127, 0, 0, 2],
+                                length: 32,
+                            }],
+                            ports: vec![traffic_policy::PortMatch {
+                                protocol: traffic_policy::Protocol::Tcp.into(),
+                                port: Some(80),
+                                end_port: None,
+                            }],
+                            ..Default::default()
+                        }),
                     }],
-                }],
-            }],
-            dry_run: false,
-            auth_extensions: vec![],
-            // ..Default::default() // intentionally don't default. we want all fields populated
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
-
-        let proxy_state = new_proxy_state(&[wl], &[svc], &[auth]);
+        let proxy_state = new_proxy_state(&[wl], &[svc], &[sandbox]);
 
         let default_config = construct_config(ProxyConfig::default())
             .expect("could not build Config without ProxyConfig");
@@ -878,6 +839,13 @@ mod tests {
         // most of the value of this test is ensuring that we can serialize
         // the config dump at all from our internal types
         assert!(resp_str.contains("127.0.0.2"), "{resp_str}");
+        let json: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+        assert_eq!(json["sandboxes"][0]["uid"], "workload:pod-uid");
+        assert_eq!(
+            json["sandboxes"][0]["trafficPolicy"]["egress"]["rules"][0]["ports"][0]["protocol"],
+            "TCP"
+        );
+        assert!(json.get("policies").is_none());
         // Check a waypoint
         assert!(resp_str.contains(
             r#"waypoint": {

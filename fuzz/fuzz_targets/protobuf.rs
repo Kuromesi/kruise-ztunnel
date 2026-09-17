@@ -16,14 +16,17 @@
 
 use libfuzzer_sys::fuzz_target;
 use prost::Message;
-use ztunnel::rbac::Authorization;
+use ztunnel::sandbox::discovery::Sandbox;
+use ztunnel::sandbox::traffic_policy::TrafficPolicy;
 use ztunnel::state::workload::Workload;
-use ztunnel::xds::istio::security::Authorization as XdsAuthorization;
+use ztunnel::xds::agentio::sandbox::Sandbox as XdsSandbox;
+use ztunnel::xds::agentio::security::TrafficPolicy as XdsTrafficPolicy;
 use ztunnel::xds::istio::workload::Workload as XdsWorkload;
 
 fuzz_target!(|data: &[u8]| {
     let _ = run_workload(data);
-    let _ = run_rbac(data);
+    let _ = run_sandbox(data);
+    let _ = run_traffic_policy(data);
 });
 
 fn run_workload(data: &[u8]) -> anyhow::Result<()> {
@@ -31,7 +34,12 @@ fn run_workload(data: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_rbac(data: &[u8]) -> anyhow::Result<()> {
-    Authorization::try_from(XdsAuthorization::decode(data)?)?;
+fn run_sandbox(data: &[u8]) -> anyhow::Result<()> {
+    Sandbox::try_from(XdsSandbox::decode(data)?)?;
+    Ok(())
+}
+
+fn run_traffic_policy(data: &[u8]) -> anyhow::Result<()> {
+    TrafficPolicy::try_from(XdsTrafficPolicy::decode(data)?)?;
     Ok(())
 }

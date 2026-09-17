@@ -31,7 +31,7 @@ pub fn resolve_workload_firewall(
     if let Some(sandbox) = state.sandboxes.get_by_workload(&wl.uid).first() {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         sandbox.uid.hash(&mut hasher);
-        for policy in sandbox.traffic_policies(&state.traffic_policies) {
+        for policy in sandbox.traffic_policies(&state.policies) {
             policy.hash(&mut hasher);
         }
         let hash = hasher.finish();
@@ -39,7 +39,7 @@ pub fn resolve_workload_firewall(
             return None;
         }
         return Some((
-            firewall_rulesets(sandbox.traffic_policies(&state.traffic_policies)),
+            firewall_rulesets(sandbox.traffic_policies(&state.policies)),
             hash,
         ));
     }

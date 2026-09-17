@@ -16,11 +16,6 @@ syntax = "proto3";
 
 package kruise.networking.extensions.v1;
 
-message TrafficPolicyExtension {
-  int32 priority = 1;
-  TrafficPolicyMode mode = 2;
-}
-
 message WorkloadMetadata {
   map<string, string> labels = 1;
   MeshInternalTrafficPolicy mesh_internal_traffic_policy = 2;
@@ -40,11 +35,6 @@ enum MeshInternalTrafficPolicy {
   MESH_INTERNAL_PASSTHROUGH = 1;
 }
 
-
-enum TrafficPolicyMode {
-  SERVER = 0;
-  CLIENT = 1;
-}
 
 message EgressPolicies {
     repeated EgressPolicy egress_policies = 1;

@@ -14,7 +14,6 @@
 // limitations under the License.
 
 use crate::config::{ConfigSource, ProxyMode};
-use crate::rbac::Authorization;
 use crate::state::service::{Endpoint, Service};
 use crate::state::workload::{HealthStatus, NamespacedHostname, Workload, gatewayaddress};
 use crate::strng::Strng;
@@ -52,8 +51,6 @@ pub struct WorkloadManager {
     workloads: Vec<LocalWorkload>,
     /// services that we have constructed. VIP -> SVC
     services: HashMap<NamespacedHostname, Service>,
-    /// Configured policies
-    policies: Vec<Authorization>,
     mode: TestMode,
     tmp_dir: PathBuf,
     drops: Vec<ShutdownTrigger>,
@@ -101,7 +98,6 @@ impl WorkloadManager {
             namespaces: netns::NamespaceManager::new(name)?,
             workloads: vec![],
             services: HashMap::new(),
-            policies: vec![],
             drops: vec![],
         })
     }
@@ -195,8 +191,8 @@ impl WorkloadManager {
         let ip = ns.ip();
         let initial_config = LocalConfig {
             workloads: self.workloads.clone(),
-            policies: self.policies.clone(),
             services: self.services.values().cloned().collect_vec(),
+            ..Default::default()
         };
         let (mut tx_cfg, rx_cfg) = mpsc_ack(1);
         tx_cfg.send(initial_config).await?;
@@ -316,8 +312,8 @@ impl WorkloadManager {
         for node in self.ztunnels.values_mut() {
             let new_config = LocalConfig {
                 workloads: self.workloads.clone(),
-                policies: self.policies.clone(),
                 services: self.services.values().cloned().collect_vec(),
+                ..Default::default()
             };
             node.config_sender.send_and_wait(new_config).await?;
         }
@@ -373,12 +369,6 @@ impl WorkloadManager {
             })
             .register()
             .await
-    }
-
-    pub async fn add_policy(&mut self, p: Authorization) -> anyhow::Result<()> {
-        self.policies.push(p);
-        self.refresh_config().await?;
-        Ok(())
     }
 
     pub fn resolver(&self) -> Resolver {

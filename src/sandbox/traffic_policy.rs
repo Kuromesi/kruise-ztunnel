@@ -23,35 +23,51 @@ use crate::xds::XdsResource;
 
 use anyhow::{Context, ensure};
 use ipnet::IpNet;
+use tokio::sync::watch;
 
-use crate::proxy::AuthorizationRejectionError;
-use crate::rbac::{Connection, Direction, RbacAction, RbacDecision};
+use crate::rbac::{Connection, Direction};
 use crate::state::workload::byte_to_ip;
 use crate::xds::agentio::security::{TrafficPolicy as XdsTrafficPolicy, traffic_policy as proto};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrafficPolicy {
     ingress: Option<RuleSet>,
     egress: Option<RuleSet>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
-struct RuleSet {
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuleSet {
+    #[serde(default)]
     rules: Vec<Rule>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Action {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Rule {
-    action: RbacAction,
+    action: Action,
+    #[serde(default)]
     source_ips: Vec<IpNet>,
+    #[serde(default)]
     destination_ips: Vec<IpNet>,
+    #[serde(default)]
     ports: Vec<PortMatch>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PortMatch {
-    #[serde(serialize_with = "serialize_protocol")]
+    #[serde(
+        serialize_with = "serialize_protocol",
+        deserialize_with = "deserialize_protocol"
+    )]
     protocol: proto::Protocol,
     range: Option<RangeInclusive<u16>>,
 }
@@ -61,6 +77,16 @@ where
     S: serde::Serializer,
 {
     serializer.serialize_str(protocol.as_str_name())
+}
+
+fn deserialize_protocol<'de, D>(deserializer: D) -> Result<proto::Protocol, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+    proto::Protocol::from_str_name(&name).ok_or_else(|| {
+        serde::de::Error::unknown_variant(&name, &["ALL", "TCP", "UDP", "ICMP", "SCTP"])
+    })
 }
 
 impl Rule {
@@ -83,12 +109,31 @@ impl Rule {
 }
 
 /// Shared compiled bodies, replaced atomically after validation.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TrafficPolicyStore {
     resources: HashMap<Strng, Arc<TrafficPolicy>>,
+    notifier: watch::Sender<()>,
+}
+
+impl Default for TrafficPolicyStore {
+    fn default() -> Self {
+        Self {
+            resources: Default::default(),
+            notifier: watch::channel(()).0,
+        }
+    }
 }
 
 impl TrafficPolicyStore {
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        self.notifier.subscribe()
+    }
+
+    /// Notify after accepted changes to policy bodies or Sandbox policy bindings.
+    pub fn send(&self) {
+        self.notifier.send_replace(());
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&Strng, &TrafficPolicy)> {
         self.resources
             .iter()
@@ -100,84 +145,68 @@ impl TrafficPolicyStore {
     }
 
     pub fn update(&mut self, update: XdsResource<XdsTrafficPolicy>) -> anyhow::Result<bool> {
-        let validation = (|| {
-            ensure!(
-                !update.name.is_empty() && update.name != "*",
-                "empty or wildcard TrafficPolicy name"
-            );
-            TrafficPolicy::try_from(update.resource)
+        let result = (|| {
+            let policy = TrafficPolicy::try_from(update.resource)?;
+            self.insert(update.name.clone(), policy)
         })();
-        let policy = validation.map_err(|error| {
+        result.map_err(|error| {
             tracing::warn!(name = %update.name, %error, "ignoring invalid TrafficPolicy update; retaining last accepted resource");
             error
-        })?;
-        if self.get(&update.name) == Some(&policy) {
+        })
+    }
+
+    pub(crate) fn insert(&mut self, name: Strng, policy: TrafficPolicy) -> anyhow::Result<bool> {
+        ensure!(
+            !name.is_empty() && name != "*",
+            "empty or wildcard TrafficPolicy name"
+        );
+        if self.get(&name) == Some(&policy) {
             return Ok(false);
         }
-        self.resources.insert(update.name, Arc::new(policy));
+        self.resources.insert(name, Arc::new(policy));
         Ok(true)
     }
 
     pub fn remove(&mut self, name: &Strng) -> bool {
         self.resources.remove(name).is_some()
     }
+
+    /// Replace the resource snapshot while preserving existing subscriptions.
+    pub(crate) fn replace(&mut self, next: Self) {
+        self.resources = next.resources;
+    }
 }
 
-#[cfg(test)]
-fn assert_tcp(
-    policy: &TrafficPolicy,
-    conn: &Connection,
-) -> Result<RbacDecision, AuthorizationRejectionError> {
-    assert_tcp_policies(std::iter::once(("inline", Some(policy))), conn)
-}
-
-/// Evaluate inline rules followed by ordered shared policies. A missing body is
-/// a deny barrier; preceding explicit decisions remain terminal.
-/// NoMatch means no policy configures this direction.
-pub fn assert_tcp_policies<'a>(
-    policies: impl IntoIterator<Item = (&'a str, Option<&'a TrafficPolicy>)>,
-    conn: &Connection,
-) -> Result<RbacDecision, AuthorizationRejectionError> {
-    let deny = |name: String| {
-        AuthorizationRejectionError::ExplicitlyDenied(crate::strng::EMPTY, name.into())
-    };
-    let mut configured = false;
-    for (name, policy) in policies {
-        let policy = policy.ok_or_else(|| {
-            AuthorizationRejectionError::ExplicitlyDenied(name.into(), "policy-unavailable".into())
-        })?;
-        let rules = match conn.direction {
-            Direction::Inbound => &policy.ingress,
-            Direction::Outbound => &policy.egress,
-        };
-        let Some(rules) = rules else {
-            continue;
-        };
-        configured = true;
-        for (index, rule) in rules.rules.iter().enumerate() {
-            if !rule.matches_tcp(conn) {
-                continue;
-            }
-            return match rule.action {
-                RbacAction::Allow => {
-                    tracing::debug!(
-                        policy = name,
-                        rule = index,
-                        "TrafficPolicy allowed connection"
-                    );
-                    Ok(RbacDecision::Allow)
+impl TrafficPolicy {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        for (direction, rules) in [("ingress", &self.ingress), ("egress", &self.egress)] {
+            if let Some(rules) = rules {
+                for (index, rule) in rules.rules.iter().enumerate() {
+                    for port in &rule.ports {
+                        port.validate()
+                            .with_context(|| format!("TrafficPolicy {direction} rule {index}"))?;
+                    }
                 }
-                RbacAction::Deny => Err(AuthorizationRejectionError::ExplicitlyDenied(
-                    name.into(),
-                    format!("rule-{index}").into(),
-                )),
-            };
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rules_for(&self, direction: Direction) -> Option<&RuleSet> {
+        match direction {
+            Direction::Inbound => self.ingress.as_ref(),
+            Direction::Outbound => self.egress.as_ref(),
         }
     }
-    if configured {
-        Err(deny("DEFAULT-DENY".into()))
-    } else {
-        Ok(RbacDecision::NoMatch)
+}
+
+impl RuleSet {
+    pub(crate) fn match_tcp(&self, conn: &Connection) -> Option<(usize, Action)> {
+        self.rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.matches_tcp(conn))
+            .map(|(index, rule)| (index, rule.action))
     }
 }
 
@@ -239,8 +268,8 @@ pub fn firewall_rulesets<'a>(
                 rules.push(FirewallRule {
                     name: format!("{name}/rule-{index}").into(),
                     action: match rule.action {
-                        RbacAction::Allow => RuleAction::Allow,
-                        RbacAction::Deny => RuleAction::Deny,
+                        Action::Allow => RuleAction::Allow,
+                        Action::Deny => RuleAction::Deny,
                     },
                     direction,
                     // The shared backend sorts rules. Preserve control-plane order.
@@ -286,7 +315,7 @@ impl TryFrom<XdsTrafficPolicy> for TrafficPolicy {
     type Error = anyhow::Error;
 
     fn try_from(resource: XdsTrafficPolicy) -> Result<Self, Self::Error> {
-        Ok(Self {
+        let policy = Self {
             ingress: resource
                 .ingress
                 .map(RuleSet::try_from)
@@ -297,7 +326,9 @@ impl TryFrom<XdsTrafficPolicy> for TrafficPolicy {
                 .map(RuleSet::try_from)
                 .transpose()
                 .context("TrafficPolicy egress")?,
-        })
+        };
+        policy.validate()?;
+        Ok(policy)
     }
 }
 
@@ -321,8 +352,8 @@ impl TryFrom<proto::Rule> for Rule {
 
     fn try_from(value: proto::Rule) -> Result<Self, Self::Error> {
         let action = match proto::Action::try_from(value.action)? {
-            proto::Action::Allow => RbacAction::Allow,
-            proto::Action::Deny => RbacAction::Deny,
+            proto::Action::Allow => Action::Allow,
+            proto::Action::Deny => Action::Deny,
         };
         let matches = value
             .r#match
@@ -358,28 +389,33 @@ impl TryFrom<proto::PortMatch> for PortMatch {
 
     fn try_from(value: proto::PortMatch) -> Result<Self, Self::Error> {
         let protocol = proto::Protocol::try_from(value.protocol)?;
-        let port = value.port.map(parse_port).transpose()?;
-        let end_port = value.end_port.map(parse_port).transpose()?;
-        ensure!(
-            protocol != proto::Protocol::Icmp || (port.is_none() && end_port.is_none()),
-            "ICMP cannot have a port constraint"
-        );
+        let port = value.port.map(u16::try_from).transpose()?;
+        let end_port = value.end_port.map(u16::try_from).transpose()?;
         let range = match (port, end_port) {
             (None, None) => None,
             (Some(port), None) => Some(port..=port),
             (None, Some(end)) => Some(1..=end),
-            (Some(start), Some(end)) => {
-                ensure!(start <= end, "reversed port range");
-                Some(start..=end)
-            }
+            (Some(start), Some(end)) => Some(start..=end),
         };
         Ok(Self { protocol, range })
     }
 }
 
-fn parse_port(port: u32) -> anyhow::Result<u16> {
-    ensure!(port > 0, "port must be in 1..65535");
-    Ok(port.try_into()?)
+impl PortMatch {
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(range) = &self.range {
+            ensure!(
+                self.protocol != proto::Protocol::Icmp,
+                "ICMP cannot have a port constraint"
+            );
+            ensure!(
+                *range.start() > 0 && *range.end() > 0,
+                "port must be in 1..65535"
+            );
+            ensure!(range.start() <= range.end(), "reversed port range");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

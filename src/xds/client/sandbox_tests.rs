@@ -183,7 +183,7 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
                 .state
                 .read()
                 .unwrap()
-                .traffic_policies
+                .policies
                 .get(&policy_name.into())
                 .is_some(),
             present

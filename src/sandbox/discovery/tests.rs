@@ -110,7 +110,7 @@ fn config_dump_includes_sandbox_bindings_and_named_traffic_policies() {
     let names = ["trafficPolicies/z", "trafficPolicies/a"];
     for name in names {
         state
-            .traffic_policies
+            .policies
             .update(XdsResource {
                 name: name.into(),
                 resource: policy.clone(),
@@ -148,7 +148,7 @@ fn config_dump_includes_sandbox_bindings_and_named_traffic_policies() {
     assert_eq!(dump["trafficPolicies"][0]["egress"]["rules"][0], rule);
 
     state.sandboxes.remove(&"sandbox-a".into());
-    state.traffic_policies.remove(&names[1].into());
+    state.policies.remove(&names[1].into());
     let dump = serde_json::to_value(&state).unwrap();
     assert_eq!(dump["sandboxes"].as_array().unwrap().len(), 1);
     assert_eq!(dump["sandboxes"][0]["uid"], "sandbox-z");

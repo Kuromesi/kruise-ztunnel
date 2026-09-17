@@ -25,7 +25,6 @@ fn main() -> Result<(), anyhow::Error> {
     let proto_files = [
         "proto/xds.proto",
         "proto/workload.proto",
-        "proto/authorization.proto",
         "proto/citadel.proto",
         "proto/zds.proto",
         "proto/extensions.proto",
@@ -48,7 +47,6 @@ fn main() -> Result<(), anyhow::Error> {
             ".istio.workload.Service",
             ".istio.workload.GatewayAddress",
             ".istio.workload.Address",
-            ".istio.security.Address",
         ]);
         c
     };

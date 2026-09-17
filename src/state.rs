@@ -15,9 +15,7 @@
 
 use crate::identity::{Identity, SecretManager};
 use crate::proxy::{Error, OnDemandDnsLabels};
-use crate::rbac::Authorization;
 use crate::sandbox::{discovery::Sandbox, traffic_policy};
-use crate::state::policy::PolicyStore;
 use crate::state::service::{
     Endpoint, IpFamily, LoadBalancerMode, LoadBalancerScopes, ServiceStore,
 };
@@ -53,7 +51,6 @@ use tracing::{debug, trace, warn};
 
 use self::workload::ApplicationTunnel;
 
-pub mod policy;
 pub mod service;
 pub mod workload;
 
@@ -193,11 +190,9 @@ pub struct ProxyState {
 
     pub services: ServiceStore,
 
-    pub policies: PolicyStore,
+    pub policies: traffic_policy::TrafficPolicyStore,
 
     pub sandboxes: crate::sandbox::discovery::SandboxStore,
-
-    pub traffic_policies: traffic_policy::TrafficPolicyStore,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -205,7 +200,6 @@ pub struct ProxyState {
 struct ProxyStateSerialization<'a> {
     workloads: Vec<Arc<Workload>>,
     services: Vec<Arc<Service>>,
-    policies: Vec<Authorization>,
     sandboxes: Vec<&'a crate::sandbox::discovery::Sandbox>,
     traffic_policies: Vec<NamedTrafficPolicy<'a>>,
     staged_services: &'a HashMap<NamespacedHostname, HashMap<Strng, Endpoint>>,
@@ -241,18 +235,9 @@ impl serde::Serialize for ProxyState {
             .map(|k| k.1)
             .cloned()
             .collect();
-        let policies: Vec<_> = self
-            .policies
-            .by_key
-            .iter()
-            .sorted_by_key(|k| k.0)
-            .map(|k| k.1)
-            .cloned()
-            .collect();
         let serializable = ProxyStateSerialization {
             workloads,
             services,
-            policies,
             sandboxes: self
                 .sandboxes
                 .iter()
@@ -260,7 +245,7 @@ impl serde::Serialize for ProxyState {
                 .sorted_by(|a, b| a.uid.cmp(&b.uid))
                 .collect(),
             traffic_policies: self
-                .traffic_policies
+                .policies
                 .iter()
                 .sorted_by_key(|(name, _)| *name)
                 .map(|(name, policy)| NamedTrafficPolicy { name, policy })
@@ -278,7 +263,6 @@ impl ProxyState {
             services: Default::default(),
             policies: Default::default(),
             sandboxes: Default::default(),
-            traffic_policies: Default::default(),
         }
     }
 
@@ -600,13 +584,46 @@ impl DemandProxyState {
                 .first()
                 .cloned(),
         };
-        match sandbox {
-            Some(sandbox) => traffic_policy::assert_tcp_policies(
-                sandbox.traffic_policies(&state.traffic_policies),
-                conn,
-            )
-            .map(|_| ()),
-            None => Ok(()),
+        let Some(sandbox) = sandbox else {
+            return Ok(());
+        };
+        let mut configured = false;
+        for (name, policy) in sandbox.traffic_policies(&state.policies) {
+            let policy = policy.ok_or_else(|| {
+                proxy::AuthorizationRejectionError::ExplicitlyDenied(
+                    name.into(),
+                    "policy-unavailable".into(),
+                )
+            })?;
+            let Some(rules) = policy.rules_for(conn.direction) else {
+                continue;
+            };
+            configured = true;
+            match rules.match_tcp(conn) {
+                Some((index, traffic_policy::Action::Allow)) => {
+                    debug!(
+                        policy = name,
+                        rule = index,
+                        "TrafficPolicy allowed connection"
+                    );
+                    return Ok(());
+                }
+                Some((index, traffic_policy::Action::Deny)) => {
+                    return Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
+                        name.into(),
+                        format!("rule-{index}").into(),
+                    ));
+                }
+                None => continue,
+            }
+        }
+        if configured {
+            Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
+                strng::EMPTY,
+                "DEFAULT-DENY".into(),
+            ))
+        } else {
+            Ok(())
         }
     }
 

@@ -28,15 +28,6 @@ workloads:
       80: 8080
     "default/example2.com":
       80: 8080
-policies:
-  - action: Allow
-    rules:
-    - - - notDestinationPorts:
-          - 9999
-    name: deny-9999
-    namespace: default
-    scope: Namespace
-    dryRun: false
 services:
 - name: local
   namespace: default

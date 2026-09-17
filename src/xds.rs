@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error as StdErr;
 use std::fmt;
 use std::fmt::Formatter;
@@ -29,7 +29,6 @@ use tracing::{debug, info, instrument, trace, warn};
 pub use client::*;
 pub use metrics::*;
 pub use types::*;
-use xds::istio::security::Authorization as XdsAuthorization;
 use xds::istio::workload::Address as XdsAddress;
 use xds::istio::workload::PortList;
 use xds::istio::workload::Service as XdsService;
@@ -38,12 +37,13 @@ use xds::istio::workload::address::Type as XdsType;
 
 use crate::cert_fetcher::{CertFetcher, NoCertFetcher};
 use crate::config::ConfigSource;
-use crate::rbac::Authorization;
+use crate::sandbox::discovery::Sandbox;
+use crate::sandbox::traffic_policy::TrafficPolicy;
 use crate::state::ProxyState;
 use crate::state::service::{Endpoint, Service, ServiceStore};
-use crate::state::workload::{NamespacedHostname, Workload, WorkloadStore};
+use crate::state::workload::{NamespacedHostname, Workload};
+use crate::strng;
 use crate::strng::Strng;
-use crate::{rbac, strng};
 use crate::{tls, xds};
 
 use self::service::discovery::v3::DeltaDiscoveryRequest;
@@ -263,29 +263,6 @@ impl ProxyStateUpdateMutator {
         state.services.insert(service);
         Ok(())
     }
-
-    pub fn insert_authorization(
-        &self,
-        state: &mut ProxyState,
-        xds_name: Strng,
-        r: XdsAuthorization,
-    ) -> anyhow::Result<()> {
-        info!("handling RBAC update {}", r.name);
-
-        let rbac = rbac::Authorization::try_from(r)?;
-        trace!(
-            "insert policy {}, {}",
-            xds_name,
-            serde_json::to_string(&rbac)?
-        );
-        state.policies.insert(xds_name, rbac);
-        Ok(())
-    }
-
-    pub fn remove_authorization(&self, state: &mut ProxyState, xds_name: Strng) {
-        info!("handling RBAC delete {}", xds_name);
-        state.policies.remove(xds_name);
-    }
 }
 
 impl Handler<XdsWorkload> for ProxyStateUpdater {
@@ -369,8 +346,8 @@ impl Handler<agentio::security::TrafficPolicy> for ProxyStateUpdater {
         let mut changed = false;
         let result = handle_single_resource(updates, |update| {
             changed |= match update {
-                XdsUpdate::Update(resource) => state.traffic_policies.update(resource)?,
-                XdsUpdate::Remove(name) => state.traffic_policies.remove(&name),
+                XdsUpdate::Update(resource) => state.policies.update(resource)?,
+                XdsUpdate::Remove(name) => state.policies.remove(&name),
             };
             Ok(())
         });
@@ -402,43 +379,6 @@ fn insert_service_endpoints(
     Ok(())
 }
 
-impl Handler<XdsAuthorization> for ProxyStateUpdater {
-    fn no_on_demand(&self) -> bool {
-        true
-    }
-
-    fn handle(
-        &self,
-        updates: Box<&mut dyn Iterator<Item = XdsUpdate<XdsAuthorization>>>,
-    ) -> Result<(), Vec<RejectedConfig>> {
-        let mut state = self.state.write().unwrap();
-        let handle = |res: XdsUpdate<XdsAuthorization>| {
-            match res {
-                XdsUpdate::Update(w) => self
-                    .updater
-                    .insert_authorization(&mut state, w.name, w.resource)?,
-                XdsUpdate::Remove(name) => self.updater.remove_authorization(&mut state, name),
-            }
-            Ok(())
-        };
-        let mut len_updates = 0;
-        let updates = updates.inspect(|_| len_updates += 1);
-        match handle_single_resource(updates, handle) {
-            Ok(()) => {
-                state.policies.send();
-                Ok(())
-            }
-            Err(e) => {
-                if e.len() < len_updates {
-                    // not all config was rejected, we have _some_ valide update
-                    state.policies.send();
-                }
-                Err(e)
-            }
-        }
-    }
-}
-
 /// LocalClient serves as a local file reader alternative for XDS. This is intended for testing.
 pub struct LocalClient {
     pub cfg: ConfigSource,
@@ -455,15 +395,17 @@ pub struct LocalWorkload {
     pub services: HashMap<String, HashMap<u16, u16>>,
 }
 
-#[derive(Default, Debug, Eq, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocalConfig {
     #[serde(default)]
     pub workloads: Vec<LocalWorkload>,
     #[serde(default)]
-    pub policies: Vec<Authorization>,
-    #[serde(default)]
     pub services: Vec<Service>,
+    #[serde(default)]
+    pub sandboxes: Vec<Sandbox>,
+    #[serde(default)]
+    pub policies: BTreeMap<String, TrafficPolicy>,
 }
 
 impl LocalClient {
@@ -510,19 +452,28 @@ impl LocalClient {
             "load local config: {}",
             serde_yaml::to_string(&r).unwrap_or_default()
         );
-        let mut state = self.state.write().unwrap();
-        // Clear the state
-        state.workloads = WorkloadStore::new(self.local_node.clone());
-        state.services = Default::default();
-        // Policies have some channels, so we don't want to reset it entirely
-        state.policies.clear_all_policies();
+        let mut next = ProxyState::new(self.local_node.clone());
         let num_workloads = r.workloads.len();
+        let num_sandboxes = r.sandboxes.len();
         let num_policies = r.policies.len();
+        for (name, policy) in r.policies {
+            policy.validate()?;
+            next.policies.insert(name.into(), policy)?;
+        }
+        for sandbox in r.sandboxes {
+            sandbox.validate()?;
+            anyhow::ensure!(
+                next.sandboxes.get(&sandbox.uid).is_none(),
+                "duplicate Sandbox uid: {}",
+                sandbox.uid
+            );
+            next.sandboxes.insert(sandbox);
+        }
         for wl in r.workloads {
             trace!("inserting local workload {}", &wl.workload.uid);
             self.cert_fetcher.prefetch_cert(&wl.workload);
             let w = Arc::new(wl.workload);
-            state.workloads.insert(w.clone());
+            next.workloads.insert(w.clone());
 
             let services: HashMap<String, PortList> = wl
                 .services
@@ -530,16 +481,21 @@ impl LocalClient {
                 .map(|(k, v)| (k, PortList::from(v)))
                 .collect();
 
-            insert_service_endpoints(&w, &services, &mut state.services)?;
-        }
-        for rbac in r.policies {
-            let xds_name = rbac.to_key();
-            state.policies.insert(xds_name, rbac);
+            insert_service_endpoints(&w, &services, &mut next.services)?;
         }
         for svc in r.services {
-            state.services.insert(svc);
+            next.services.insert(svc);
         }
-        info!(%num_workloads, %num_policies, "local config initialized");
+        let mut state = self.state.write().unwrap();
+        state.workloads = next.workloads;
+        state.services = next.services;
+        state.sandboxes = next.sandboxes;
+        state.policies.replace(next.policies);
+        state.policies.send();
+        info!(%num_workloads, %num_sandboxes, %num_policies, "local config initialized");
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod local_tests;
