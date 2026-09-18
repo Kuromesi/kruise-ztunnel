@@ -85,11 +85,11 @@ const HTTP2_CONNECTION_WINDOW_SIZE: &str = "HTTP2_CONNECTION_WINDOW_SIZE";
 const HTTP2_FRAME_SIZE: &str = "HTTP2_FRAME_SIZE";
 
 const UNSTABLE_ENABLE_SOCKS5: &str = "UNSTABLE_ENABLE_SOCKS5";
-const UNSTABLE_ENABLE_UDP_PROXY: &str = "UNSTABLE_ENABLE_UDP_PROXY";
-const UNSTABLE_UDP_MAX_SESSIONS: &str = "UNSTABLE_UDP_MAX_SESSIONS";
-const UNSTABLE_UDP_SESSION_IDLE_TIMEOUT: &str = "UNSTABLE_UDP_SESSION_IDLE_TIMEOUT";
-const UNSTABLE_UDP_MAX_BUFFERED_DATAGRAMS: &str = "UNSTABLE_UDP_MAX_BUFFERED_DATAGRAMS";
-const UNSTABLE_UDP_MAX_BUFFERED_BYTES: &str = "UNSTABLE_UDP_MAX_BUFFERED_BYTES";
+const ENABLE_UDP_PROXY: &str = "ENABLE_UDP_PROXY";
+const UDP_MAX_SESSIONS: &str = "UDP_MAX_SESSIONS";
+const UDP_SESSION_IDLE_TIMEOUT: &str = "UDP_SESSION_IDLE_TIMEOUT";
+const UDP_MAX_BUFFERED_DATAGRAMS: &str = "UDP_MAX_BUFFERED_DATAGRAMS";
+const UDP_MAX_BUFFERED_BYTES: &str = "UDP_MAX_BUFFERED_BYTES";
 
 const CRL_PATH: &str = "CRL_PATH";
 
@@ -719,7 +719,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
     let inbound_plaintext_addr = SocketAddr::new(bind_wildcard, 15006);
     let outbound_addr = SocketAddr::new(bind_wildcard, 15001);
     let outbound_udp_addr = SocketAddr::new(bind_wildcard, 15002);
-    let udp_proxy = parse_default(UNSTABLE_ENABLE_UDP_PROXY, false)?;
+    let udp_proxy = parse_default(ENABLE_UDP_PROXY, false)?;
 
     let mut illegal_ports = HashSet::from([
         // HBONE doesn't have redirection, so we cannot have loops, but this would allow multiple layers of HBONE.
@@ -909,17 +909,17 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         outbound_addr,
         outbound_udp_addr,
         udp_proxy,
-        udp_max_sessions: parse_default(UNSTABLE_UDP_MAX_SESSIONS, DEFAULT_UDP_MAX_SESSIONS)?,
+        udp_max_sessions: parse_default(UDP_MAX_SESSIONS, DEFAULT_UDP_MAX_SESSIONS)?,
         udp_session_idle_timeout: parse_duration_default(
-            UNSTABLE_UDP_SESSION_IDLE_TIMEOUT,
+            UDP_SESSION_IDLE_TIMEOUT,
             DEFAULT_UDP_SESSION_IDLE_TIMEOUT,
         )?,
         udp_max_buffered_datagrams: parse_default(
-            UNSTABLE_UDP_MAX_BUFFERED_DATAGRAMS,
+            UDP_MAX_BUFFERED_DATAGRAMS,
             DEFAULT_UDP_MAX_BUFFERED_DATAGRAMS,
         )?,
         udp_max_buffered_bytes: parse_default(
-            UNSTABLE_UDP_MAX_BUFFERED_BYTES,
+            UDP_MAX_BUFFERED_BYTES,
             DEFAULT_UDP_MAX_BUFFERED_BYTES,
         )?,
         dns_proxy_addr,
@@ -1070,12 +1070,12 @@ fn validate_config(cfg: Config) -> Result<Config, Error> {
     // since no session could ever be admitted or could ever outlive its first idle check.
     if cfg.udp_max_sessions == 0 {
         return Err(Error::ProxyConfig(anyhow!(
-            "{UNSTABLE_UDP_MAX_SESSIONS} must be greater than zero"
+            "{UDP_MAX_SESSIONS} must be greater than zero"
         )));
     }
     if cfg.udp_session_idle_timeout.is_zero() {
         return Err(Error::ProxyConfig(anyhow!(
-            "{UNSTABLE_UDP_SESSION_IDLE_TIMEOUT} must be greater than zero"
+            "{UDP_SESSION_IDLE_TIMEOUT} must be greater than zero"
         )));
     }
 
