@@ -623,12 +623,15 @@ impl TlsMetadata {
 
 impl Request {
     fn evaluate_sni_policy(&mut self) -> Result<(), Error> {
-        let policy = self.sandbox.as_ref().and_then(|s| s.sni_policy.as_ref());
-        let (Some(sni), Some(policy)) = (&self.tls.sni, policy) else {
+        let Some(sni) = &self.tls.sni else {
             self.tls.action = None;
             return Ok(());
         };
-        let action = policy.evaluate(sni);
+        let action = self
+            .sandbox
+            .as_ref()
+            .and_then(|s| s.sni_policy.as_ref())
+            .map_or(Some(SniAction::Passthrough), |policy| policy.evaluate(sni));
         if action == Some(SniAction::Deny) {
             return Err(Error::SniPolicyDenied(sni.clone()));
         }
@@ -1031,6 +1034,7 @@ mod tests {
 
         let remote_addr = "127.0.0.1:12345".parse().unwrap();
 
+        req.evaluate_sni_policy().unwrap();
         let request = outbound.create_hbone_request(remote_addr, &req).await;
         assert_eq!(request.headers()[WORKLOAD_NAME_HEADER], "source-workload");
         assert_eq!(request.headers()[WORKLOAD_NAMESPACE_HEADER], "ns");
@@ -1070,11 +1074,14 @@ mod tests {
                 },
             ],
         };
-        // Without a Sandbox there is no policy: only the observed SNI is reported.
+        // Without a Sandbox there is no policy: explicitly pass observed TLS through.
         req.tls.sni = Some("blocked.example".into());
         req.evaluate_sni_policy().unwrap();
         let request = outbound.create_hbone_request(remote_addr, &req).await;
-        assert_eq!(request.headers()[TLS_HEADER], "sni=blocked.example");
+        assert_eq!(
+            request.headers()[TLS_HEADER],
+            "action=passthrough;sni=blocked.example"
+        );
 
         let mut sandbox: Sandbox = crate::xds::agentio::sandbox::Sandbox {
             uid: "sandbox-a".into(),
@@ -1082,6 +1089,19 @@ mod tests {
         }
         .try_into()
         .unwrap();
+        // A selected Sandbox without an SNI policy has the same default decision.
+        req.sandbox = Some(Arc::new(sandbox.clone()));
+        req.evaluate_sni_policy().unwrap();
+        let request = outbound.create_hbone_request(remote_addr, &req).await;
+        assert_eq!(
+            request.headers()[TLS_HEADER],
+            "action=passthrough;sni=blocked.example"
+        );
+        req.tls.sni = None;
+        req.evaluate_sni_policy().unwrap();
+        let request = outbound.create_hbone_request(remote_addr, &req).await;
+        assert!(!request.headers().contains_key(TLS_HEADER));
+
         sandbox.sni_policy = Some(policy);
         req.sandbox = Some(Arc::new(sandbox));
         for (sni, action) in [
