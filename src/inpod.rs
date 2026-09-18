@@ -29,7 +29,7 @@ use crate::proxyfactory::ProxyFactory;
 use self::config::InPodConfig;
 
 pub mod admin;
-mod config;
+pub(crate) mod config;
 pub mod metrics;
 pub mod netns;
 pub mod packet;

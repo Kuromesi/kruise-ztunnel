@@ -92,6 +92,12 @@ const HTTP2_STREAM_WINDOW_SIZE: &str = "HTTP2_STREAM_WINDOW_SIZE";
 const HTTP2_CONNECTION_WINDOW_SIZE: &str = "HTTP2_CONNECTION_WINDOW_SIZE";
 const HTTP2_FRAME_SIZE: &str = "HTTP2_FRAME_SIZE";
 
+const ENABLE_UDP_PROXY: &str = "ENABLE_UDP_PROXY";
+const UDP_MAX_SESSIONS: &str = "UDP_MAX_SESSIONS";
+const UDP_SESSION_IDLE_TIMEOUT: &str = "UDP_SESSION_IDLE_TIMEOUT";
+const UDP_MAX_BUFFERED_DATAGRAMS: &str = "UDP_MAX_BUFFERED_DATAGRAMS";
+const UDP_MAX_BUFFERED_BYTES: &str = "UDP_MAX_BUFFERED_BYTES";
+
 const CRL_PATH: &str = "CRL_PATH";
 
 const DEFAULT_WORKER_THREADS: u16 = 2;
@@ -107,6 +113,25 @@ const DEFAULT_POOL_UNUSED_RELEASE_TIMEOUT: Duration = Duration::from_secs(60 * 5
 const DEFAULT_POOL_MAX_STREAMS_PER_CONNECTION: u16 = 100; //Go: 100, Hyper: 200, Envoy: 2147483647 (lol), Spec recommended minimum 100
 const DEFAULT_SANDBOX_TOKEN_PATH: &str = "/var/opt/sandbox/agent-token/";
 const DEFAULT_SANDBOX_WATCHER_DEBOUNCE_MS: u64 = 500;
+
+// Envoy's udp_proxy has no session cap of its own; it gates every new session on the cluster
+// circuit breaker's max_connections (udp_proxy_filter.cc), which defaults to 1024
+// (source/common/upstream/upstream_impl.cc). Envoy's budget is per cluster, ours is a single
+// per-pod pool shared across every destination, so this is the tighter of the two.
+const DEFAULT_UDP_MAX_SESSIONS: usize = 1024;
+// Envoy's udp_proxy idle_timeout defaults to 1 minute. We keep 30s deliberately: because our
+// session pool is per pod rather than per cluster, reclaiming faster buys back some of the headroom
+// Envoy gets from having a separate budget per upstream. UDP has no FIN, so this timeout is the
+// only thing that frees a slot, which makes the cap really "sessions seen in the last 30s".
+const DEFAULT_UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+// Both match Envoy's UdpTunnelingConfig.BufferOptions defaults.
+const DEFAULT_UDP_MAX_BUFFERED_DATAGRAMS: usize = 1024;
+const DEFAULT_UDP_MAX_BUFFERED_BYTES: usize = 16 * 1024;
+// The worst-case queued payload per proxy is the product of these two, and one process hosts a
+// proxy per pod. Raising either default should be a deliberate decision about that ceiling rather
+// than a side effect of retuning one knob, so fail the build instead of discovering it in prod.
+const _: () =
+    assert!(DEFAULT_UDP_MAX_SESSIONS * DEFAULT_UDP_MAX_BUFFERED_BYTES <= 16 * 1024 * 1024);
 
 const DEFAULT_INPOD_MARK: u32 = 1337;
 
@@ -282,6 +307,22 @@ pub struct Config {
     pub inbound_addr: SocketAddr,
     pub inbound_plaintext_addr: SocketAddr,
     pub outbound_addr: SocketAddr,
+    /// The transparent UDP listener used by the experimental CONNECT-UDP proxy.
+    pub outbound_udp_addr: SocketAddr,
+    /// Enables the experimental transparent UDP proxy, independently of its transport mode.
+    pub udp_proxy: bool,
+    /// Maximum number of concurrent CONNECT-UDP sessions, counted per proxy (so per pod in-pod).
+    /// Datagrams opening a new flow beyond this are dropped and counted as `session_limit`.
+    pub udp_max_sessions: usize,
+    /// How long a CONNECT-UDP session survives without datagrams in either direction. UDP has no
+    /// close, so this is what frees a slot in the `udp_max_sessions` pool.
+    pub udp_session_idle_timeout: Duration,
+    /// Per-session queue bounds for datagrams read from the application but not yet written to the
+    /// HBONE stream. Only this direction is buffered; responses are written straight to the socket.
+    /// Worst-case queued memory is `udp_max_sessions * udp_max_buffered_bytes` per proxy, so raising
+    /// either knob raises that ceiling, and one process hosts a proxy per pod.
+    pub udp_max_buffered_datagrams: usize,
+    pub udp_max_buffered_bytes: usize,
     /// The socket address for the DNS proxy. Only applies if `dns_proxy` is true.
     pub dns_proxy_addr: Address,
     /// Populated with the internal ports of all the proxy handlers defined above.
@@ -704,6 +745,8 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
     let inbound_addr = SocketAddr::new(bind_wildcard, 15008);
     let inbound_plaintext_addr = SocketAddr::new(bind_wildcard, 15006);
     let outbound_addr = SocketAddr::new(bind_wildcard, 15001);
+    let outbound_udp_addr = SocketAddr::new(bind_wildcard, 15002);
+    let udp_proxy = parse_default(ENABLE_UDP_PROXY, false)?;
 
     let illegal_ports = HashSet::from([
         // HBONE doesn't have redirection, so we cannot have loops, but this would allow multiple layers of HBONE.
@@ -712,6 +755,10 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         inbound_plaintext_addr.port(),
         outbound_addr.port(),
     ]);
+    // outbound_udp_addr is deliberately absent: illegal_ports has no protocol dimension and every
+    // consumer is TCP (inbound, outbound, inbound_passthrough), so adding the UDP listener's port
+    // here would make an application's TCP service on that port unreachable. The UDP listener
+    // guards its own port in `outbound_udp::is_illegal_call`.
 
     let proxy_mode = match parse::<String>(PROXY_MODE)? {
         Some(proxy_mode) => match proxy_mode.as_str() {
@@ -896,6 +943,21 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         inbound_addr,
         inbound_plaintext_addr,
         outbound_addr,
+        outbound_udp_addr,
+        udp_proxy,
+        udp_max_sessions: parse_default(UDP_MAX_SESSIONS, DEFAULT_UDP_MAX_SESSIONS)?,
+        udp_session_idle_timeout: parse_duration_default(
+            UDP_SESSION_IDLE_TIMEOUT,
+            DEFAULT_UDP_SESSION_IDLE_TIMEOUT,
+        )?,
+        udp_max_buffered_datagrams: parse_default(
+            UDP_MAX_BUFFERED_DATAGRAMS,
+            DEFAULT_UDP_MAX_BUFFERED_DATAGRAMS,
+        )?,
+        udp_max_buffered_bytes: parse_default(
+            UDP_MAX_BUFFERED_BYTES,
+            DEFAULT_UDP_MAX_BUFFERED_BYTES,
+        )?,
         dns_proxy_addr,
 
         illegal_ports,
@@ -976,8 +1038,16 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             )?,
         },
         packet_mark: parse(PACKET_MARK)?.or_else(|| {
-            if proxy_mode == ProxyMode::Shared {
-                // For inpod, mark is required so default it
+            // Two separate reasons to default this:
+            //  - Shared mode runs in-pod, where a mark is required.
+            //  - udp_proxy needs one in *any* mode: the CONNECT-UDP response socket gets its mark
+            //    from SocketFactory::new_udp_v*, and in dedicated mode the factory is only a
+            //    MarkSocketFactory when packet_mark is set. Without it the response socket is
+            //    unmarked and its replies are captured by our own redirect rules.
+            // Note the side effect in dedicated mode: MarkSocketFactory also marks every outbound
+            // TCP socket, so enabling udp_proxy changes whether that TCP traffic is redirected.
+            // There is only one mark knob, so the two cannot be separated without a second one.
+            if proxy_mode == ProxyMode::Shared || udp_proxy {
                 Some(DEFAULT_INPOD_MARK)
             } else {
                 None
@@ -1047,6 +1117,19 @@ fn validate_config(cfg: Config) -> Result<Config, Error> {
     if !cfg.proxy && !cfg.dns_proxy {
         return Err(Error::ProxyConfig(anyhow!(
             "ztunnel run without any servers enabled"
+        )));
+    }
+
+    // Zero would not mean "unlimited" for either of these; it would silently drop every datagram,
+    // since no session could ever be admitted or could ever outlive its first idle check.
+    if cfg.udp_max_sessions == 0 {
+        return Err(Error::ProxyConfig(anyhow!(
+            "{UDP_MAX_SESSIONS} must be greater than zero"
+        )));
+    }
+    if cfg.udp_session_idle_timeout.is_zero() {
+        return Err(Error::ProxyConfig(anyhow!(
+            "{UDP_SESSION_IDLE_TIMEOUT} must be greater than zero"
         )));
     }
 
@@ -1342,6 +1425,27 @@ pub mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+
+    #[test]
+    fn rejects_zero_udp_session_limits() {
+        let base = parse_config().unwrap();
+        assert!(validate_config(base.clone()).is_ok());
+
+        assert!(
+            validate_config(Config {
+                udp_max_sessions: 0,
+                ..base.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_config(Config {
+                udp_session_idle_timeout: Duration::ZERO,
+                ..base
+            })
+            .is_err()
+        );
     }
 
     #[test]
