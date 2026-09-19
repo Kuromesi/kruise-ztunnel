@@ -64,6 +64,35 @@ impl AdsServer {
         DemandProxyState,
         tokio::sync::watch::Receiver<()>,
     ) {
+        let (rx, cfg) = Self::spawn_config(xds_on_demand).await;
+        let mut registry = Registry::default();
+        let istio_registry = sub_registry(&mut registry);
+        let metrics = xds::metrics::Metrics::new(istio_registry);
+        let (block_tx, block_rx) = tokio::sync::watch::channel(());
+        let proxy_metrics = Arc::new(crate::proxy::Metrics::new(&mut registry));
+        let state: Arc<RwLock<ProxyState>> = Arc::new(RwLock::new(ProxyState::new(None)));
+        let dstate = DemandProxyState::new(
+            state.clone(),
+            None,
+            ResolverConfig::default(),
+            ResolverOpts::default(),
+            proxy_metrics,
+        );
+        let store_updater = ProxyStateUpdater::new_no_fetch(state);
+        let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(
+            cfg.xds_root_cert.clone(),
+        ));
+        let xds_client = xds::Config::new(Arc::new(cfg), tls_client_fetcher)
+            .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, store_updater.clone())
+            .with_watched_handler::<XdsTrafficPolicy>(xds::TRAFFIC_POLICY_TYPE, store_updater)
+            .build(metrics, block_tx);
+
+        (rx, xds_client, dstate, block_rx)
+    }
+
+    pub async fn spawn_config(
+        xds_on_demand: bool,
+    ) -> (mpsc::Receiver<AdsConnection>, crate::config::Config) {
         let (tx, rx) = mpsc::channel(100);
 
         let server = AdsServer { tx };
@@ -96,12 +125,6 @@ impl AdsServer {
             }
         });
 
-        let mut registry = Registry::default();
-        let istio_registry = sub_registry(&mut registry);
-        let metrics = xds::metrics::Metrics::new(istio_registry);
-
-        let (block_tx, block_rx) = tokio::sync::watch::channel(());
-
         let mut cfg = test_config_with_port_xds_addr_and_root_cert(
             80,
             Some(listener_addr_string),
@@ -110,25 +133,7 @@ impl AdsServer {
         );
         cfg.xds_on_demand = xds_on_demand;
 
-        let proxy_metrics = Arc::new(crate::proxy::Metrics::new(&mut registry));
-        let state: Arc<RwLock<ProxyState>> = Arc::new(RwLock::new(ProxyState::new(None)));
-        let dstate = DemandProxyState::new(
-            state.clone(),
-            None,
-            ResolverConfig::default(),
-            ResolverOpts::default(),
-            proxy_metrics,
-        );
-        let store_updater = ProxyStateUpdater::new_no_fetch(state);
-        let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(
-            cfg.xds_root_cert.clone(),
-        ));
-        let xds_client = xds::Config::new(Arc::new(cfg), tls_client_fetcher)
-            .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, store_updater.clone())
-            .with_watched_handler::<XdsTrafficPolicy>(xds::TRAFFIC_POLICY_TYPE, store_updater)
-            .build(metrics, block_tx);
-
-        (rx, xds_client, dstate, block_rx)
+        (rx, cfg)
     }
 }
 

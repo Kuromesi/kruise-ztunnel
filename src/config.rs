@@ -84,6 +84,7 @@ const IPV6_ENABLED: &str = "IPV6_ENABLED";
 const FIREWALL_BACKEND: &str = "FIREWALL_BACKEND";
 const FIREWALL_DEBOUNCE_INTERVAL: &str = "FIREWALL_DEBOUNCE_INTERVAL";
 const FIREWALL_MAX_DEBOUNCE_TIME: &str = "FIREWALL_MAX_DEBOUNCE_TIME";
+const AGENTIO_SANDBOX_MODE: &str = "AGENTIO_SANDBOX_MODE";
 const ENABLE_SANDBOX_MANAGER: &str = "ENABLE_SANDBOX_MANAGER";
 const SANDBOX_TOKEN_PATH: &str = "SANDBOX_TOKEN_PATH";
 const SANDBOX_WATCHER_DEBOUNCE_MS: &str = "SANDBOX_WATCHER_DEBOUNCE_MS";
@@ -443,6 +444,9 @@ pub struct Config {
     pub firewall_debounce_interval: Duration,
 
     pub firewall_max_debounce_time: Duration,
+
+    /// Subscribe to Sandbox xDS resources and wait for their initial synchronization.
+    pub sandbox_mode: bool,
 
     pub enable_sandbox_manager: bool,
 
@@ -1077,6 +1081,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             FIREWALL_MAX_DEBOUNCE_TIME,
             crate::firewall::DEFAULT_FIREWALL_MAX_DEBOUNCE_TIME,
         )?,
+        sandbox_mode: parse_default(AGENTIO_SANDBOX_MODE, false)?,
         enable_sandbox_manager: env::var(ENABLE_SANDBOX_MANAGER)
             .map(|value| value == "true")
             .unwrap_or(false),
@@ -1323,6 +1328,45 @@ pub mod tests {
     use super::*;
 
     static SANDBOX_WATCHER_DEBOUNCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn sandbox_mode_environment() {
+        // Use subprocesses so environment changes cannot race other Config tests.
+        const CASE: &str = "ZTUNNEL_TEST_SANDBOX_MODE";
+        if let Ok(case) = env::var(CASE) {
+            let result = construct_config(ProxyConfig::default());
+            if case == "invalid" {
+                assert!(result.is_err());
+            } else {
+                let config = result.unwrap();
+                assert_eq!(config.sandbox_mode, case == "true");
+                assert!(config.enable_sandbox_manager);
+            }
+            return;
+        }
+        for case in ["default", "false", "true", "invalid"] {
+            let mut command = std::process::Command::new(env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "config::tests::sandbox_mode_environment",
+                    "--nocapture",
+                ])
+                .env(CASE, case)
+                .env(ENABLE_SANDBOX_MANAGER, "true")
+                .env_remove(AGENTIO_SANDBOX_MODE);
+            if case != "default" {
+                command.env(AGENTIO_SANDBOX_MODE, case);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "case {case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn tls_sniff_fail_open_environment() {

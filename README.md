@@ -24,6 +24,13 @@ Their existing established/related-flow and infrastructure bypasses still apply.
 Sandbox and Workload SNI rules are evaluated independently: a deny in either
 stage wins, followed by TLS termination, then passthrough.
 
+`AGENTIO_SANDBOX_MODE` defaults to `false`: ztunnel subscribes to Address and
+TrafficPolicy xDS resources only, and does not wait for a Sandbox response.
+Set it to `true` on ztunnel and the control plane to enable Sandbox discovery;
+ztunnel then waits for the first accepted Sandbox response (which may be empty)
+before becoming ready. This is independent of `ENABLE_SANDBOX_MANAGER`, which
+controls Sandbox token management.
+
 The privileged `tests/firewall_stages.rs` test exercises fresh UDP and ICMP flows
 in isolated network namespaces for both backends and directions. Run it on Linux
 with `sudo -E cargo test --test firewall_stages -- --ignored --test-threads=1`.

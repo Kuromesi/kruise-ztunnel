@@ -79,6 +79,100 @@ fn resource() -> ProtoResource {
     }
 }
 
+#[test_case(false, false; "workload_push_without_sandbox")]
+#[test_case(true, false; "workload_on_demand_without_sandbox")]
+#[test_case(false, true; "workload_push_with_sandbox")]
+#[test_case(true, true; "workload_on_demand_with_sandbox")]
+#[tokio::test]
+async fn sandbox_mode_controls_subscription_and_readiness(on_demand: bool, sandbox_mode: bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (mut connections, mut config) = AdsServer::spawn_config(on_demand).await;
+        config.sandbox_mode = sandbox_mode;
+        // Token management must not implicitly enable Sandbox discovery.
+        config.enable_sandbox_manager = true;
+        let mut registry = prometheus_client::registry::Registry::default();
+        let (awaiting_ready, mut ready) = tokio::sync::watch::channel(());
+        let manager = crate::state::ProxyStateManager::new(
+            Arc::new(config),
+            crate::xds::Metrics::new(&mut registry),
+            Arc::new(crate::proxy::Metrics::new(&mut registry)),
+            awaiting_ready,
+            crate::identity::mock::new_secret_manager(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(manager.state().supports_on_demand(), on_demand);
+        let client_task = tokio::spawn(manager.run());
+
+        // Exercise the production subscription setup on both initial connection and reconnect.
+        for attempt in 0..2 {
+            let mut connection = connections.recv().await.unwrap();
+            let mut expected =
+                HashSet::from([ADDRESS_TYPE.to_string(), TRAFFIC_POLICY_TYPE.to_string()]);
+            if sandbox_mode {
+                expected.insert(SANDBOX_TYPE.to_string());
+            }
+            for _ in 0..expected.len() {
+                let initial = connection.rx.recv().await.unwrap();
+                assert!(
+                    expected.remove(&initial.type_url),
+                    "unexpected subscription: {initial:?}"
+                );
+                assert!(initial.response_nonce.is_empty());
+                if initial.type_url == ADDRESS_TYPE && on_demand {
+                    assert_eq!(initial.resource_names_subscribe, ["*"]);
+                    assert_eq!(initial.resource_names_unsubscribe, ["*"]);
+                } else {
+                    assert!(initial.resource_names_subscribe.is_empty());
+                    assert!(initial.resource_names_unsubscribe.is_empty());
+                }
+                if initial.type_url != SANDBOX_TYPE {
+                    connection
+                        .tx
+                        .send(Ok(DeltaDiscoveryResponse {
+                            type_url: initial.type_url,
+                            nonce: "workload-ready".into(),
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap();
+                }
+            }
+            assert!(expected.is_empty());
+            for _ in 0..2 {
+                let ack = connection.rx.recv().await.unwrap();
+                assert!(ack.type_url == ADDRESS_TYPE || ack.type_url == TRAFFIC_POLICY_TYPE);
+                assert_eq!(ack.response_nonce, "workload-ready");
+                assert!(ack.error_detail.is_none());
+            }
+            if sandbox_mode {
+                if attempt == 0 {
+                    // All Workload responses were ACKed, but Sandbox still blocks readiness.
+                    assert!(matches!(ready.has_changed(), Ok(false)));
+                }
+                connection
+                    .tx
+                    .send(Ok(response("sandbox-ready", vec![], vec![])))
+                    .await
+                    .unwrap();
+                let ack = connection.rx.recv().await.unwrap();
+                assert_eq!(ack.type_url, SANDBOX_TYPE);
+                assert_eq!(ack.response_nonce, "sandbox-ready");
+                assert!(ack.error_detail.is_none());
+            }
+            assert!(ready.changed().await.is_err());
+            connection
+                .tx
+                .send(Err(tonic::Status::unavailable("reconnect")))
+                .await
+                .unwrap();
+        }
+        client_task.abort();
+    })
+    .await
+    .expect("Sandbox mode ADS test deadline");
+}
+
 #[test_case(false; "workload_push")]
 #[test_case(true; "workload_on_demand")]
 #[tokio::test]
