@@ -218,23 +218,19 @@ mod tests {
             Some(SniAction::TlsTermination)
         );
 
-        // Unknown extension types are skipped rather than rejecting the Sandbox.
+        // The Sandbox contract rejects an update containing unsupported policies.
         let unknown = prost_types::Any {
             type_url: "type.googleapis.com/kruise.networking.extensions.v1.Future".into(),
             value: vec![0xff],
         };
-        let accepted = Sandbox::try_from(sandbox(vec![
-            unknown.clone(),
-            extension("*", proto::SniAction::Deny.into()),
-        ]))
-        .unwrap();
-        assert_eq!(accepted.sni_policy.unwrap().rules.len(), 1);
         assert!(
-            Sandbox::try_from(sandbox(vec![unknown]))
-                .unwrap()
-                .sni_policy
-                .is_none()
+            Sandbox::try_from(sandbox(vec![
+                unknown.clone(),
+                extension("*", proto::SniAction::Deny.into()),
+            ]))
+            .is_err()
         );
+        assert!(Sandbox::try_from(sandbox(vec![unknown])).is_err());
 
         for invalid in [
             extension("*", 0),
