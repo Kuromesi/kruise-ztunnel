@@ -4,16 +4,29 @@ ztunnel is the Layer 4 traffic enforcement data plane for [Agentio](https://gith
 
 ## How does it differ from Istio ztunnel?
 
-- **Sandbox traffic policies** — discovers native Sandbox and TrafficPolicy resources, enforcing inline rules followed by shared policy references ordered by the control plane.
+- **Workload traffic policies** — enforces native TrafficPolicy references ordered by the control plane for every Workload. A bound Sandbox adds an inline policy stage before the shared Workload stage.
 - **Non-TCP firewall enforcement** — translates traffic policies into inbound and outbound iptables or nftables rules for UDP, ICMP, and other supported non-TCP traffic, with automatic backend detection and live rule updates.
 - **Per-workload sidecar deployment** — runs a dedicated ztunnel alongside each sandbox workload instead of as a node-level proxy, enforcing traffic policy at the workload boundary.
 
-Outbound traffic follows the source Sandbox or Workload's egress policy: connect
+Outbound traffic follows the source Workload's egress policy: connect
 through an Agentio egress gateway over HBONE, or connect directly to the original
 destination over TCP. Destination Service and Workload metadata does not select
 waypoints, service endpoints, or peer HBONE routes. Service VIP routing is handled
 by the underlying network. Cross-network routing through Istio east-west gateways
 (double HBONE) is unsupported.
+
+Workloads must carry an explicit `traffic-policy-reference` extension, including
+an empty list when no shared policies apply. Missing bindings or referenced
+policy bodies fail closed. Legacy Authorization resources are not evaluated.
+Sandbox inline DENY rejects traffic; inline ALLOW continues to the Workload stage.
+iptables and nftables implement that continuation with a returning inline chain.
+Their existing established/related-flow and infrastructure bypasses still apply.
+Sandbox and Workload SNI rules are evaluated independently: a deny in either
+stage wins, followed by TLS termination, then passthrough.
+
+The privileged `tests/firewall_stages.rs` test exercises fresh UDP and ICMP flows
+in isolated network namespaces for both backends and directions. Run it on Linux
+with `sudo -E cargo test --test firewall_stages -- --ignored --test-threads=1`.
 
 ## Sidecar admin socket
 

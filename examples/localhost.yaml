@@ -24,6 +24,7 @@ workloads:
   protocol: HBONE
   node: local
   network: ""
+  trafficPolicyRefs: []
   services:
     "default/example.com":
       80: 8080
@@ -38,6 +39,7 @@ workloads:
   protocol: TCP
   node: local
   network: ""
+  trafficPolicyRefs: []
   services:
     "default/example.com":
       80: 8080

@@ -29,7 +29,6 @@ fn main() -> Result<(), anyhow::Error> {
         "proto/zds.proto",
         "proto/extensions.proto",
         "proto/api/sandbox/v1/sandbox.proto",
-        "proto/api/sandbox/v1/egressrouting.proto",
         "proto/api/security/v1/trafficpolicy.proto",
     ]
     .iter()

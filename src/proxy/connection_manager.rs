@@ -585,17 +585,17 @@ mod tests {
                         attester: Some(crate::xds::agentio::sandbox::sandbox::Attester {
                             workload_uid: workload.uid.to_string(),
                         }),
-                        policy_refs: std::collections::HashMap::from([(
-                            crate::xds::TRAFFIC_POLICY_TYPE.to_string(),
-                            crate::xds::agentio::sandbox::PolicyReference {
-                                resource_names: vec![policy_name.into()],
-                            },
-                        )]),
                         ..Default::default()
                     },
                 },
             ))))
             .unwrap();
+        {
+            let mut current = state.write().unwrap();
+            let mut bound = (*workload).clone();
+            bound.traffic_policy_refs = Some(vec![policy_name.into()]);
+            current.workloads.insert(Arc::new(bound));
+        }
         let publish = |rules| {
             updater
                 .handle(Box::new(&mut std::iter::once(XdsUpdate::Update(

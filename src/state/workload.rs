@@ -13,7 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::extensions::sni::{SNI_POLICY_TYPE_URL, SniPolicyError, SniTrafficPolicy};
 use crate::identity::Identity;
+use crate::rbac::{TrafficPolicy, TrafficPolicyStore};
+use prost::Message;
 
 use crate::baggage::Baggage;
 use crate::extensions::extensions::{EgressPolicies, EgressPolicyError, WorkloadExtension};
@@ -285,6 +288,11 @@ pub struct Workload {
     pub encoded_labels: Option<Strng>,
     #[serde(skip)]
     pub egress_policies: Option<EgressPolicies>,
+    /// None means the native binding has not been delivered; Some([]) permits an empty stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_policy_refs: Option<Vec<Strng>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni_policy: Option<SniTrafficPolicy>,
 }
 
 fn default_capacity() -> u32 {
@@ -296,6 +304,40 @@ pub fn is_default<T: Default + PartialEq>(t: &T) -> bool {
 }
 
 impl Workload {
+    pub fn traffic_policies<'a>(
+        &'a self,
+        store: &'a TrafficPolicyStore,
+    ) -> impl Iterator<Item = (&'a str, Option<&'a TrafficPolicy>)> + Clone {
+        // Preserve an absent binding as a missing policy, so both TCP and netfilter fail closed.
+        self.traffic_policy_refs
+            .is_none()
+            .then_some(("workload-binding", None))
+            .into_iter()
+            .chain(
+                self.traffic_policy_refs
+                    .iter()
+                    .flatten()
+                    .map(move |name| (name.as_str(), store.get(name))),
+            )
+    }
+
+    pub(crate) fn validate_policies(&self) -> Result<(), WorkloadError> {
+        if let Some(names) = &self.traffic_policy_refs {
+            let mut seen = HashSet::new();
+            for name in names {
+                if name.is_empty() || name == "*" || !seen.insert(name) {
+                    return Err(WorkloadError::PolicyReference(format!(
+                        "invalid or duplicate policy name: {name}"
+                    )));
+                }
+            }
+        }
+        if let Some(policy) = &self.sni_policy {
+            policy.validate()?;
+        }
+        Ok(())
+    }
+
     pub fn identity(&self) -> Identity {
         Identity::Spiffe {
             trust_domain: self.trust_domain.clone(),
@@ -458,8 +500,49 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
 
         let mut metadata: Option<WorkloadMetadata> = None;
         let mut egress_policies: Option<EgressPolicies> = None;
+        let mut traffic_policy_refs = None;
+        let mut sni_policy = None;
 
         for extension in resource.extensions.into_iter() {
+            if extension.name == "traffic-policy-reference" {
+                let config = extension
+                    .config
+                    .as_ref()
+                    .ok_or_else(|| WorkloadError::PolicyReference("missing config".into()))?;
+                if traffic_policy_refs.is_some()
+                    || config.type_url
+                        != "type.googleapis.com/kruise.networking.extensions.v1.PolicyReference"
+                {
+                    return Err(WorkloadError::PolicyReference(
+                        "duplicate reference extension or invalid config type".into(),
+                    ));
+                }
+                let refs = xds::kruise::networking::extensions::v1::PolicyReference::decode(
+                    config.value.as_slice(),
+                )?;
+                if refs.type_url != xds::TRAFFIC_POLICY_TYPE {
+                    return Err(WorkloadError::PolicyReference(format!(
+                        "unsupported policy type: {}",
+                        refs.type_url
+                    )));
+                }
+                traffic_policy_refs =
+                    Some(refs.resource_names.into_iter().map(Strng::from).collect());
+                continue;
+            }
+            if extension.name == "sni-traffic-policy" {
+                let config = extension
+                    .config
+                    .as_ref()
+                    .ok_or_else(|| WorkloadError::PolicyReference("missing SNI config".into()))?;
+                if sni_policy.is_some() || config.type_url != SNI_POLICY_TYPE_URL {
+                    return Err(WorkloadError::PolicyReference(
+                        "duplicate SNI extension or invalid config type".into(),
+                    ));
+                }
+                sni_policy = Some(SniTrafficPolicy::decode(&config.value)?);
+                continue;
+            }
             let extension = WorkloadExtension::try_from(extension)?;
             match extension {
                 WorkloadExtension::WorkloadMetadata(m) => metadata = Some(m),
@@ -531,7 +614,10 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
                 .map(|m| Some(strng::new(m.encode_labels())))
                 .unwrap_or_default(),
             egress_policies,
+            traffic_policy_refs,
+            sni_policy,
         };
+        wl.validate_policies()?;
         // Return back part we did not use (service) so it can be consumed without cloning
         Ok((wl, resource.services))
     }
@@ -904,6 +990,10 @@ impl WorkloadStore {
 #[allow(clippy::enum_variant_names)]
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum WorkloadError {
+    #[error("invalid Workload policy reference: {0}")]
+    PolicyReference(String),
+    #[error("invalid Workload SNI policy: {0}")]
+    SniPolicy(#[from] SniPolicyError),
     #[error("failed to parse namespaced hostname: {0}")]
     NamespacedHostnameParse(String),
     #[error("failed to parse address: {0}")]
@@ -949,6 +1039,51 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::RwLock;
     use xds::istio::workload::NetworkAddress as XdsNetworkAddress;
+
+    #[test]
+    fn native_policy_reference_decoding() {
+        let decode = |extensions| {
+            Workload::try_from(XdsWorkload {
+                extensions,
+                ..Default::default()
+            })
+        };
+        let reference = |names: Vec<&str>| xds::istio::workload::Extension {
+            name: "traffic-policy-reference".into(),
+            config: Some(Any {
+                type_url: "type.googleapis.com/kruise.networking.extensions.v1.PolicyReference"
+                    .into(),
+                value: ext_proto::PolicyReference {
+                    type_url: xds::TRAFFIC_POLICY_TYPE.to_string(),
+                    resource_names: names.into_iter().map(String::from).collect(),
+                }
+                .encode_to_vec(),
+            }),
+        };
+        let missing = decode(vec![]).unwrap();
+        assert!(missing.traffic_policy_refs.is_none());
+        assert!(
+            missing
+                .traffic_policies(&TrafficPolicyStore::default())
+                .any(|(_, policy)| policy.is_none())
+        );
+        assert_eq!(
+            decode(vec![reference(vec![])]).unwrap().traffic_policy_refs,
+            Some(vec![])
+        );
+        assert_eq!(
+            decode(vec![reference(vec!["z", "a"])])
+                .unwrap()
+                .traffic_policy_refs,
+            Some(vec!["z".into(), "a".into()])
+        );
+        assert!(decode(vec![reference(vec!["a", "a"])]).is_err());
+        assert!(decode(vec![reference(vec!["*"])]).is_err());
+        assert!(decode(vec![reference(vec![]), reference(vec![])]).is_err());
+        let mut invalid = reference(vec![]);
+        invalid.config.as_mut().unwrap().type_url = "wrong-type".into();
+        assert!(decode(vec![invalid]).is_err());
+    }
 
     #[test]
     fn workload_rejects_invalid_embedded_egress_policy() {
@@ -1099,6 +1234,7 @@ mod tests {
                 uid: uid1.as_str().into(),
                 workload_ips: vec![nw_addr1.address],
                 name: "some name".into(),
+                traffic_policy_refs: None,
                 ..test_helpers::test_default_workload()
             }))
         );
@@ -1113,6 +1249,7 @@ mod tests {
                 uid: uid1.as_str().into(),
                 workload_ips: vec![nw_addr1.address],
                 name: "some name".into(),
+                traffic_policy_refs: None,
                 ..test_helpers::test_default_workload()
             }))
         );
@@ -1124,6 +1261,7 @@ mod tests {
                 uid: uid1.as_str().into(),
                 workload_ips: vec![nw_addr1.address],
                 name: "some name".into(),
+                traffic_policy_refs: None,
                 ..test_helpers::test_default_workload()
             }))
         );
@@ -1476,6 +1614,7 @@ mod tests {
                 uid: uid1.as_str().into(),
                 workload_ips: vec![nw_addr1.address],
                 name: "some pod".into(),
+                traffic_policy_refs: None,
                 ..test_helpers::test_default_workload()
             }))
         );
@@ -1490,6 +1629,7 @@ mod tests {
                 uid: uid2.as_str().into(),
                 workload_ips: vec![nw_addr1.address],
                 name: "some we".into(),
+                traffic_policy_refs: None,
                 ..test_helpers::test_default_workload()
             }))
         );

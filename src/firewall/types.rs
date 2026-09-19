@@ -110,6 +110,9 @@ pub struct FirewallRule {
 /// Complete rule set (passed to Backend)
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RuleSet {
+    /// Sandbox gate evaluated before the Workload rules. ALLOW returns to the
+    /// Workload stage; DENY terminates evaluation. Defaults are explicit rules.
+    pub inline_rules: Vec<FirewallRule>,
     /// Rules in policy evaluation order, preserving declaration order within
     /// each policy. Backends must preserve this order when priorities are equal.
     pub rules: Vec<FirewallRule>,

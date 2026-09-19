@@ -23,6 +23,8 @@ workloads:
   node: local
   network: ""
   services: {}
+  trafficPolicyRefs:
+  - namespaces/default/trafficPolicies/local-egress
 
 sandboxes:
 - uid: workload:local
@@ -31,13 +33,8 @@ sandboxes:
     egress:
       rules:
       - action: Allow
-        ports:
-        - protocol: TCP
-          range: {start: 8080, end: 8080}
-  trafficPolicyRefs:
-  - namespaces/default/trafficPolicies/local-egress
 
-# Map keys are xDS resource names; Sandbox references determine evaluation order.
+# Map keys are xDS resource names; Workload references determine evaluation order.
 policies:
   namespaces/default/trafficPolicies/local-egress:
     egress:

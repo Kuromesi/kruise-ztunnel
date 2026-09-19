@@ -513,63 +513,40 @@ impl DemandProxyState {
         &self,
         ctx: &ProxyRbacContext,
     ) -> Result<(), proxy::AuthorizationRejectionError> {
-        let conn = &ctx.conn;
         let state = self.read();
-        // Rechecks resolve the current Sandbox binding and policies.
-        let workload_uid = &ctx.workload.uid;
+        let denied = |name: &str| {
+            proxy::AuthorizationRejectionError::ExplicitlyDenied(
+                name.into(),
+                "binding-unavailable".into(),
+            )
+        };
+        // Existing connections must use the current Workload binding, not their cached Arc.
+        let workload = state
+            .workloads
+            .find_uid(&ctx.workload.uid)
+            .ok_or_else(|| denied(&ctx.workload.uid))?;
         let sandbox = match &ctx.sandbox {
-            Some(sandbox) => state
-                .sandboxes
-                .get(&sandbox.uid)
-                .filter(|s| s.workload_uid.as_ref() == Some(workload_uid)),
-            // Connections opened before discovery also use the current binding.
+            Some(selected) => Some(
+                state
+                    .sandboxes
+                    .get(&selected.uid)
+                    .filter(|sandbox| sandbox.workload_uid.as_ref() == Some(&workload.uid))
+                    .ok_or_else(|| denied(&selected.uid))?,
+            ),
             None => state
                 .sandboxes
-                .get_by_workload(workload_uid)
+                .get_by_workload(&workload.uid)
                 .first()
                 .cloned(),
         };
-        let Some(sandbox) = sandbox else {
-            return Ok(());
-        };
-        let mut configured = false;
-        for (name, policy) in sandbox.traffic_policies(&state.policies) {
-            let policy = policy.ok_or_else(|| {
-                proxy::AuthorizationRejectionError::ExplicitlyDenied(
-                    name.into(),
-                    "policy-unavailable".into(),
-                )
-            })?;
-            let Some(rules) = policy.rules_for(conn.direction) else {
-                continue;
-            };
-            configured = true;
-            match rules.match_tcp(conn) {
-                Some((index, rbac::Action::Allow)) => {
-                    debug!(
-                        policy = name,
-                        rule = index,
-                        "TrafficPolicy allowed connection"
-                    );
-                    return Ok(());
-                }
-                Some((index, rbac::Action::Deny)) => {
-                    return Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
-                        name.into(),
-                        format!("rule-{index}").into(),
-                    ));
-                }
-                None => continue,
-            }
+        if let Some(inline) = sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.traffic_policy.as_ref())
+        {
+            rbac::assert_policies(std::iter::once(("inline", Some(inline))), &ctx.conn)?;
         }
-        if configured {
-            Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
-                strng::EMPTY,
-                "DEFAULT-DENY".into(),
-            ))
-        } else {
-            Ok(())
-        }
+        // An inline ALLOW passes only the Sandbox stage; Workload policies still apply.
+        rbac::assert_policies(workload.traffic_policies(&state.policies), &ctx.conn)
     }
 
     // Select a workload IP, with DNS resolution if needed

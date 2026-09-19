@@ -175,7 +175,7 @@ impl TrafficPolicyStore {
         self.notifier.subscribe()
     }
 
-    /// Notify after accepted changes to policy bodies or Sandbox policy bindings.
+    /// Notify after accepted changes to policy bodies or Workload/Sandbox policy bindings.
     pub fn send(&self) {
         self.notifier.send_replace(());
     }
@@ -261,6 +261,36 @@ fn firewall_ruleset(policy: &TrafficPolicy) -> crate::firewall::RuleSet {
     firewall_rulesets(std::iter::once(("inline", Some(policy))))
 }
 
+/// Evaluate one ordered stage. An unresolved reference blocks the entire stage.
+pub(crate) fn assert_policies<'a>(
+    policies: impl Iterator<Item = (&'a str, Option<&'a TrafficPolicy>)> + Clone,
+    conn: &Connection,
+) -> Result<(), crate::proxy::AuthorizationRejectionError> {
+    let deny = |name: &str, reason: String| {
+        crate::proxy::AuthorizationRejectionError::ExplicitlyDenied(name.into(), reason.into())
+    };
+    if let Some((name, _)) = policies.clone().find(|(_, policy)| policy.is_none()) {
+        return Err(deny(name, "policy-unavailable".into()));
+    }
+    let mut configured = false;
+    for (name, policy) in policies {
+        let Some(rules) = policy.and_then(|policy| policy.rules_for(conn.direction)) else {
+            continue;
+        };
+        configured = true;
+        match rules.match_tcp(conn) {
+            Some((_, Action::Allow)) => return Ok(()),
+            Some((index, Action::Deny)) => return Err(deny(name, format!("rule-{index}"))),
+            None => {}
+        }
+    }
+    if configured {
+        Err(deny("", "DEFAULT-DENY".into()))
+    } else {
+        Ok(())
+    }
+}
+
 /// Feed native policies into the same netfilter backends used by Workload policies.
 pub fn firewall_rulesets<'a>(
     policies: impl Iterator<Item = (&'a str, Option<&'a TrafficPolicy>)> + Clone,
@@ -270,17 +300,22 @@ pub fn firewall_rulesets<'a>(
         RuleAction,
     };
 
+    let missing = policies
+        .clone()
+        .find(|(_, policy)| policy.is_none())
+        .map(|(name, _)| name);
     let mut rules = Vec::new();
     for direction in [FirewallDirection::Inbound, FirewallDirection::Outbound] {
         let mut configured = false;
         let mut default_deny_name = "DEFAULT-DENY".into();
         let mut offset = 0;
-        for (name, policy) in policies.clone() {
+        if let Some(name) = missing {
+            configured = true;
+            default_deny_name = format!("{name}/policy-unavailable").into();
+        }
+        for (name, policy) in policies.clone().filter(|_| missing.is_none()) {
             let Some(policy) = policy else {
-                // Unknown directions cannot safely fall through to later policies.
-                configured = true;
-                default_deny_name = format!("{name}/policy-unavailable").into();
-                break;
+                continue; // Unresolved references were handled before evaluating any rules.
             };
             let body = match direction {
                 FirewallDirection::Inbound => &policy.ingress,
@@ -353,6 +388,7 @@ pub fn firewall_rulesets<'a>(
         rules,
         // Per-direction defaults are explicit rules; this flag is the legacy
         // Workload policy's bidirectional default.
+        inline_rules: Vec::new(),
         policy_attached: false,
     }
 }

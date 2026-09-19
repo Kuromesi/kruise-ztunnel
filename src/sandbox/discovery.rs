@@ -14,14 +14,13 @@
 
 //! Cached Sandbox resources and their attester Workload bindings.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use tracing::{debug, warn};
+use tracing::warn;
 
-use crate::extensions::extensions::EgressPolicies;
 use crate::extensions::sni::{SNI_POLICY_TYPE_URL, SniTrafficPolicy};
-use crate::rbac::{TrafficPolicy, TrafficPolicyStore};
+use crate::rbac::TrafficPolicy;
 use crate::strng::Strng;
 use crate::xds::XdsResource;
 use crate::xds::agentio::sandbox::Sandbox as XdsSandbox;
@@ -43,10 +42,7 @@ fn validate_id(id: &str) -> anyhow::Result<()> {
 pub struct Sandbox {
     pub uid: Strng,
     pub workload_uid: Option<Strng>,
-    pub egress_routing: Option<EgressPolicies>,
     pub traffic_policy: Option<TrafficPolicy>,
-    #[serde(default)]
-    pub traffic_policy_refs: Vec<Strng>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni_policy: Option<SniTrafficPolicy>,
 }
@@ -68,33 +64,13 @@ impl TryFrom<XdsSandbox> for Sandbox {
                         .rules
                         .extend(policy.rules);
                 }
-                type_url => debug!(
-                    sandbox_id = %resource.uid,
-                    type_url,
-                    "ignoring unknown Sandbox extension"
-                ),
+                type_url => anyhow::bail!("unsupported Sandbox extension: {type_url}"),
             }
-        }
-        let mut traffic_policy_refs = Vec::new();
-        for (type_url, reference) in resource.policy_refs {
-            if reference.resource_names.is_empty() {
-                continue;
-            }
-            anyhow::ensure!(
-                type_url == crate::xds::TRAFFIC_POLICY_TYPE,
-                "unsupported policy reference type: {type_url}"
-            );
-            traffic_policy_refs.extend(reference.resource_names.into_iter().map(Strng::from));
         }
         let sandbox = Self {
             sni_policy,
-            traffic_policy_refs,
             uid: resource.uid.into(),
             workload_uid,
-            egress_routing: resource
-                .egress_routing
-                .map(EgressPolicies::try_from)
-                .transpose()?,
             traffic_policy: resource
                 .traffic_policy
                 .map(TrafficPolicy::try_from)
@@ -112,39 +88,13 @@ impl Sandbox {
             self.workload_uid.as_ref().is_none_or(|uid| !uid.is_empty()),
             "empty attester workload UID"
         );
-        let mut seen = HashSet::new();
-        for name in &self.traffic_policy_refs {
-            anyhow::ensure!(
-                !name.is_empty() && name != "*" && seen.insert(name),
-                "invalid or duplicate TrafficPolicy reference: {name}"
-            );
-        }
         if let Some(policy) = &self.traffic_policy {
             policy.validate()?;
         }
         if let Some(policy) = &self.sni_policy {
             policy.validate()?;
         }
-        if let Some(routing) = &self.egress_routing {
-            for route in &routing.policies {
-                route.validate_route()?;
-            }
-        }
         Ok(())
-    }
-
-    pub fn traffic_policies<'a>(
-        &'a self,
-        store: &'a TrafficPolicyStore,
-    ) -> impl Iterator<Item = (&'a str, Option<&'a TrafficPolicy>)> + Clone {
-        self.traffic_policy
-            .iter()
-            .map(|policy| ("inline", Some(policy)))
-            .chain(
-                self.traffic_policy_refs
-                    .iter()
-                    .map(move |name| (name.as_str(), store.get(name))),
-            )
     }
 }
 
@@ -189,9 +139,7 @@ impl SandboxStore {
         let previous_workload = previous.as_ref().and_then(|s| s.workload_uid.as_deref());
         let workload = sandbox.workload_uid.as_deref();
         let policy_changed = previous.as_ref().is_none_or(|old| {
-            old.workload_uid != sandbox.workload_uid
-                || old.traffic_policy != sandbox.traffic_policy
-                || old.traffic_policy_refs != sandbox.traffic_policy_refs
+            old.workload_uid != sandbox.workload_uid || old.traffic_policy != sandbox.traffic_policy
         });
         // Keep the selection order stable when only the resource contents change.
         if previous_workload != workload {

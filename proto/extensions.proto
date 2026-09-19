@@ -90,3 +90,9 @@ enum SniAction {
   SNI_ACTION_PASSTHROUGH = 2;
   SNI_ACTION_DENY = 3;
 }
+
+// Workload owns the complete ordered binding, including global and namespace policies.
+message PolicyReference {
+  string type_url = 1;
+  repeated string resource_names = 2;
+}

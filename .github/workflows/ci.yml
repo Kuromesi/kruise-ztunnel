@@ -100,7 +100,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends iptables protobuf-compiler
+          sudo apt-get install --yes --no-install-recommends iptables nftables iproute2 iputils-ping python3 protobuf-compiler
 
       - name: Run privileged tests
         run: |
@@ -127,3 +127,8 @@ jobs:
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             cargo test --locked --test firewall_ipt_integration -- --ignored --test-threads=1
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            cargo test --locked --test firewall_stages -- --ignored --test-threads=1

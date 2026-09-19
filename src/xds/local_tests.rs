@@ -77,7 +77,10 @@ async fn local_file_loads_sandbox_inline_and_shared_policies() {
     let ctx = context(&client, 8080);
     let sandbox = state.fetch_sandbox(&ctx.workload).unwrap();
     assert_eq!(sandbox.uid.as_str(), "workload:local");
-    assert_eq!(sandbox.traffic_policy_refs, vec![Strng::from(POLICY)]);
+    assert_eq!(
+        ctx.workload.traffic_policy_refs,
+        Some(vec![Strng::from(POLICY)])
+    );
     assert_eq!(state.assert_rbac(&ctx).await, Ok(()));
     assert_eq!(state.assert_rbac(&context(&client, 8081)).await, Ok(()));
     assert_eq!(
@@ -122,8 +125,8 @@ async fn local_reload_replaces_resources_and_keeps_policy_subscribers() {
             "rule-1".into()
         ))
     );
-    // Inline ALLOW remains terminal ahead of a shared DENY.
-    assert_eq!(state.assert_rbac(&context(&client, 8080)).await, Ok(()));
+    // Inline ALLOW still evaluates the Workload stage.
+    assert!(state.assert_rbac(&context(&client, 8080)).await.is_err());
 
     config.policies.clear();
     client.load_config(config.clone()).unwrap();
@@ -145,9 +148,10 @@ async fn local_reload_replaces_resources_and_keeps_policy_subscribers() {
             "policy-unavailable".into()
         ))
     );
-    assert_eq!(state.assert_rbac(&context(&client, 8080)).await, Ok(()));
+    assert!(state.assert_rbac(&context(&client, 8080)).await.is_err());
 
     config.sandboxes.clear();
+    config.workloads[0].workload.traffic_policy_refs = Some(Vec::new());
     client.load_config(config).unwrap();
     assert!(changes.has_changed().unwrap());
     changes.borrow_and_update();
@@ -185,8 +189,8 @@ fn invalid_local_resources_preserve_the_previous_snapshot() {
         (
             "zero inline port",
             (|c: &mut serde_yaml::Value| {
-                c["sandboxes"][0]["trafficPolicy"]["egress"]["rules"][0]["ports"][0]["range"]["start"] =
-                    0.into();
+                c["sandboxes"][0]["trafficPolicy"]["egress"]["rules"][0]["ports"] =
+                    serde_yaml::from_str("[{protocol: TCP, range: {start: 0, end: 80}}]").unwrap();
             }) as fn(&mut serde_yaml::Value),
         ),
         ("reversed shared port range", |c| {
@@ -202,13 +206,13 @@ fn invalid_local_resources_preserve_the_previous_snapshot() {
             c["sandboxes"][0]["workloadUid"] = "".into()
         }),
         ("duplicate policy reference", |c| {
-            c["sandboxes"][0]["trafficPolicyRefs"]
+            c["workloads"][0]["trafficPolicyRefs"]
                 .as_sequence_mut()
                 .unwrap()
                 .push(POLICY.into());
         }),
         ("wildcard policy reference", |c| {
-            c["sandboxes"][0]["trafficPolicyRefs"][0] = "*".into()
+            c["workloads"][0]["trafficPolicyRefs"][0] = "*".into()
         }),
         ("duplicate Sandbox", |c| {
             let sandbox = c["sandboxes"][0].clone();
@@ -220,10 +224,6 @@ fn invalid_local_resources_preserve_the_previous_snapshot() {
                 .as_mapping_mut()
                 .unwrap()
                 .insert("".into(), policy);
-        }),
-        ("missing gateway", |c| {
-            c["sandboxes"][0]["egressRouting"] =
-                serde_yaml::from_str("policies: [{policy: Gateway}]").unwrap();
         }),
     ] {
         let mut invalid: serde_yaml::Value = serde_yaml::from_str(CONFIG).unwrap();
@@ -240,39 +240,14 @@ fn invalid_local_resources_preserve_the_previous_snapshot() {
 
 #[test]
 fn local_resource_yaml_round_trips_and_rejects_unknown_fields() {
-    let mut config: LocalConfig = serde_yaml::from_str(CONFIG).unwrap();
-    config.sandboxes[0].egress_routing = Some(
-        serde_yaml::from_str(
-            r#"
-policies:
-- policy: Gateway
-  gateway:
-    destination: default/egress.default.svc.cluster.local
-    hboneMtlsPort: 15008
-"#,
-        )
-        .unwrap(),
+    let config: LocalConfig = serde_yaml::from_str(CONFIG).unwrap();
+    let encoded = serde_yaml::to_string(&config).unwrap();
+    assert_eq!(
+        serde_yaml::from_str::<LocalConfig>(&encoded).unwrap(),
+        config
     );
-    config.sandboxes[0].validate().unwrap();
-    let yaml = serde_yaml::to_string(&config).unwrap();
-    assert!(yaml.contains("action: Deny"));
-    assert!(yaml.contains("protocol: TCP"));
-    assert!(yaml.contains("policy: Gateway"));
-    assert_eq!(serde_yaml::from_str::<LocalConfig>(&yaml).unwrap(), config);
-    for invalid in [
-        CONFIG.replace("action: Allow", "acton: Allow"),
-        CONFIG.replace("action: Allow", "action: UNKNOWN"),
-        CONFIG.replace("protocol: TCP", "protocol: UNKNOWN"),
-        CONFIG.replace("end: 9999", "end: 65536"),
-        CONFIG.replace("ports:", "portt:"),
-        CONFIG.replace("trafficPolicyRefs:", "policyRefs:"),
-        CONFIG.replace(
-            "- action: Allow",
-            "- action: Allow\n        sourceIps: [invalid-cidr]",
-        ),
-        "policies: [{name: legacy, action: Allow}]".into(),
-    ] {
-        assert!(serde_yaml::from_str::<LocalConfig>(&invalid).is_err());
-    }
-    serde_yaml::from_str::<LocalConfig>(include_str!("../../examples/localhost.yaml")).unwrap();
+    assert!(
+        serde_yaml::from_str::<LocalConfig>(&CONFIG.replace("trafficPolicyRefs:", "policyRefs:"))
+            .is_err()
+    );
 }

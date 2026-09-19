@@ -125,11 +125,18 @@ impl IptBackend {
     ///
     /// All rules go into the `*filter` table using INPUT (inbound) and OUTPUT (outbound) hooks.
     pub fn render_ruleset(&self, ruleset: &RuleSet) -> String {
-        let mut lines = vec![
-            "*filter".to_string(),
-            "-F ISTIO_FW_FILTER_IN".to_string(),
-            "-F ISTIO_FW_FILTER_OUT".to_string(),
-        ];
+        let mut lines = vec!["*filter".to_string()];
+
+        if !ruleset.inline_rules.is_empty() {
+            for chain in ["ISTIO_FW_INLINE_IN", "ISTIO_FW_INLINE_OUT"] {
+                lines.push(format!(":{chain} - [0:0]"));
+            }
+            for chain in ["ISTIO_FW_INLINE_IN", "ISTIO_FW_INLINE_OUT"] {
+                lines.push(format!("-F {chain}"));
+            }
+        }
+        lines.push("-F ISTIO_FW_FILTER_IN".into());
+        lines.push("-F ISTIO_FW_FILTER_OUT".into());
 
         lines.push(
             "-A ISTIO_FW_FILTER_IN -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
@@ -159,6 +166,24 @@ impl IptBackend {
         } else {
             lines.push("-A ISTIO_FW_FILTER_OUT -m owner --uid-owner 1337 -j RETURN".to_string());
             lines.push("-A ISTIO_FW_FILTER_OUT -m owner --gid-owner 1337 -j RETURN".to_string());
+        }
+
+        if !ruleset.inline_rules.is_empty() {
+            lines.push("-A ISTIO_FW_FILTER_IN ! -p tcp -j ISTIO_FW_INLINE_IN".into());
+            lines.push("-A ISTIO_FW_FILTER_OUT ! -p tcp -j ISTIO_FW_INLINE_OUT".into());
+            let mut inline = ruleset.inline_rules.iter().collect::<Vec<_>>();
+            inline.sort_by_key(|rule| rule.priority);
+            for rule in inline {
+                let chain = match rule.direction {
+                    Direction::Inbound => "ISTIO_FW_INLINE_IN",
+                    Direction::Outbound => "ISTIO_FW_INLINE_OUT",
+                };
+                let action = match rule.action {
+                    RuleAction::Allow => "RETURN",
+                    RuleAction::Deny => "REJECT",
+                };
+                lines.extend(Self::render_rule_in_chain(rule, chain, action));
+            }
         }
 
         let mut sorted_rules = ruleset.rules.clone();
@@ -245,6 +270,10 @@ impl IptBackend {
             RuleAction::Deny => "REJECT",
         };
 
+        Self::render_rule_in_chain(rule, chain, action_str)
+    }
+
+    fn render_rule_in_chain(rule: &FirewallRule, chain: &str, action_str: &str) -> Vec<String> {
         // Flatten clauses into a list of flat match combinations via cartesian product.
         // Each FlatMatch is one concrete (src, dst, proto, port) tuple.
         let flat_matches = Self::flatten_clauses(&rule.clauses);
@@ -722,6 +751,7 @@ mod tests {
                 vec![53..=53],
                 RuleAction::Allow,
             )],
+            inline_rules: Vec::new(),
             policy_attached: true,
         };
         let rendered = IptBackend::new().render_ruleset(&ruleset);
@@ -910,6 +940,7 @@ mod tests {
                 vec![80..=80],
                 RuleAction::Deny,
             )],
+            inline_rules: Vec::new(),
             policy_attached: true,
         };
         let rendered = inpod_backend().render_ruleset(&ruleset);
@@ -939,6 +970,7 @@ mod tests {
                     RuleAction::Allow,
                 ),
             ],
+            inline_rules: Vec::new(),
             policy_attached: true,
         };
         let rendered = inpod_backend().render_ruleset(&ruleset);
@@ -1481,6 +1513,7 @@ mod tests {
                 .prop_map(|(rules, policy_attached)| RuleSet {
                     rules,
                     policy_attached,
+                    inline_rules: Vec::new(),
                 })
         }
 
@@ -1509,7 +1542,7 @@ mod tests {
                     );
                 }
                 // When policy_attached=false and no rules, there should be no default deny
-                let empty = RuleSet { rules: vec![], policy_attached: false };
+                let empty = RuleSet { rules: vec![], ..Default::default() };
                 let empty_output = IptBackend::new().render_ruleset(&empty);
                 prop_assert!(
                     !empty_output.contains("! -p tcp -j REJECT"),

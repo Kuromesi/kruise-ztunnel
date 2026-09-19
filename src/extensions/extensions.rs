@@ -15,7 +15,6 @@
 use crate::state::workload::GatewayAddress;
 use crate::state::workload::{NamespacedHostname, gatewayaddress};
 use crate::strng::Strng;
-use crate::xds::agentio::sandbox::{EgressRouting, egress_routing};
 use crate::xds::istio::workload::Extension as XdsWorkloadExtension;
 use crate::xds::kruise::networking::extensions::v1 as proto;
 use crate::xds::kruise::networking::extensions::v1::{
@@ -227,70 +226,6 @@ impl TryFrom<proto::EgressPolicies> for EgressPolicies {
         Ok(EgressPolicies {
             policies: value
                 .egress_policies
-                .into_iter()
-                .map(EgressPolicy::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
-}
-
-impl TryFrom<egress_routing::Route> for EgressPolicy {
-    type Error = EgressPolicyError;
-
-    fn try_from(value: egress_routing::Route) -> Result<Self, Self::Error> {
-        // Sandbox GATEWAY is 1; the legacy Workload action with that value is DENY.
-        let policy = match egress_routing::Action::try_from(value.action) {
-            Ok(egress_routing::Action::Passthrough) => EgressPolicyAction::Passthrough,
-            Ok(egress_routing::Action::Gateway) => EgressPolicyAction::Gateway,
-            Err(_) => return Err(EgressPolicyError::UnknownAction(value.action)),
-        };
-        let match_cidrs = parse_cidrs(value.match_cidrs)?;
-        let match_ports = parse_ports(value.match_ports)?;
-        let gateway = value
-            .gateway
-            .as_ref()
-            .map(|gateway| parse_gateway_address(&gateway.service, gateway.port))
-            .transpose()?;
-        let route = Self {
-            namespaces: HashSet::new(),
-            match_cidrs,
-            match_ports,
-            policy,
-            gateway,
-        };
-        route.validate_route()?;
-        Ok(route)
-    }
-}
-
-impl EgressPolicy {
-    pub(crate) fn validate_route(&self) -> Result<(), EgressPolicyError> {
-        if self.match_ports.contains(&0) {
-            return Err(EgressPolicyError::InvalidPort("0".into()));
-        }
-        if let Some(gateway) = &self.gateway
-            && gateway.hbone_mtls_port == 0
-        {
-            return Err(EgressPolicyError::InvalidGatewayPort(0));
-        }
-        match (self.policy, self.gateway.is_some()) {
-            (EgressPolicyAction::Gateway, false) => return Err(EgressPolicyError::MissingGateway),
-            (EgressPolicyAction::Passthrough, true) => {
-                return Err(EgressPolicyError::UnexpectedGateway);
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-}
-
-impl TryFrom<EgressRouting> for EgressPolicies {
-    type Error = EgressPolicyError;
-
-    fn try_from(value: EgressRouting) -> Result<Self, Self::Error> {
-        Ok(Self {
-            policies: value
-                .routes
                 .into_iter()
                 .map(EgressPolicy::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
@@ -549,95 +484,6 @@ mod tests {
             ],
         };
         assert!(EgressPolicies::try_from(pp).is_err());
-    }
-
-    #[test]
-    fn sandbox_egress_routing_reuses_workload_policy_types() {
-        let routing = EgressPolicies::try_from(EgressRouting {
-            routes: vec![
-                egress_routing::Route {
-                    action: egress_routing::Action::Gateway.into(),
-                    match_cidrs: vec!["10.0.0.0/8".into(), "2001:db8::/32".into()],
-                    match_ports: vec!["80".into(), "443".into()],
-                    gateway: Some(egress_routing::GatewayAddress {
-                        service: "egress.ns.svc.cluster.local".into(),
-                        port: 0,
-                    }),
-                },
-                egress_routing::Route::default(),
-            ],
-        })
-        .unwrap();
-        let legacy = EgressPolicy::try_from(ext_proto::EgressPolicy {
-            policy: 2,
-            match_cidrs: vec!["10.0.0.0/8".into(), "2001:db8::/32".into()],
-            match_ports: vec!["80".into(), "443".into()],
-            gateway: Some(ext_proto::GatewayAddress {
-                service: "egress.ns.svc.cluster.local".into(),
-                port: 0,
-            }),
-            ..Default::default()
-        })
-        .unwrap();
-        assert_eq!(routing.policies[0], legacy);
-        assert_eq!(routing.policies[1].policy, EgressPolicyAction::Passthrough);
-    }
-
-    #[test]
-    fn invalid_sandbox_egress_routes_are_rejected() {
-        use egress_routing::{Action, GatewayAddress, Route};
-        for route in [
-            Route {
-                action: 2,
-                ..Default::default()
-            },
-            Route {
-                action: Action::Gateway.into(),
-                ..Default::default()
-            },
-            Route {
-                match_cidrs: vec!["invalid".into()],
-                ..Default::default()
-            },
-            Route {
-                match_ports: vec!["0".into()],
-                ..Default::default()
-            },
-            Route {
-                match_ports: vec!["65536".into()],
-                ..Default::default()
-            },
-            Route {
-                gateway: Some(GatewayAddress {
-                    service: "egress.ns".into(),
-                    port: 15008,
-                }),
-                ..Default::default()
-            },
-            Route {
-                action: Action::Gateway.into(),
-                gateway: Some(GatewayAddress {
-                    service: "invalid".into(),
-                    port: 15008,
-                }),
-                ..Default::default()
-            },
-            Route {
-                action: Action::Gateway.into(),
-                gateway: Some(GatewayAddress {
-                    service: "egress.ns".into(),
-                    port: 65536,
-                }),
-                ..Default::default()
-            },
-        ] {
-            assert!(
-                EgressPolicies::try_from(EgressRouting {
-                    routes: vec![Route::default(), route],
-                })
-                .is_err()
-            );
-        }
     }
 
     // ---- WorkloadMetadata::encode_labels -------------------------------

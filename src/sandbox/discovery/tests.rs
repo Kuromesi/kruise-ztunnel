@@ -16,7 +16,6 @@ use super::*;
 use crate::state::workload::Workload;
 use crate::state::{DemandProxyState, ProxyState};
 use crate::test_helpers::test_default_workload;
-use crate::xds::agentio::sandbox::SandboxState;
 use crate::xds::agentio::sandbox::sandbox::Attester;
 use std::sync::RwLock;
 
@@ -53,6 +52,13 @@ impl Fixture {
         }
     }
 
+    pub fn bind_policies(&self, names: &[&str]) {
+        let mut state = self.state.write().unwrap();
+        let mut workload = (*state.workloads.find_uid(&self.workload.uid).unwrap()).clone();
+        workload.traffic_policy_refs = Some(names.iter().map(|name| Strng::from(*name)).collect());
+        state.workloads.insert(Arc::new(workload));
+    }
+
     pub fn publish(&self, id: &str) {
         self.state
             .write()
@@ -71,15 +77,33 @@ fn resource(id: &str, workload_uid: &str) -> XdsResource<XdsSandbox> {
             attester: Some(Attester {
                 workload_uid: workload_uid.into(),
             }),
-            state: SandboxState::Running.into(),
             ..Default::default()
         },
     }
 }
 
 #[test]
+fn unsupported_extension_retains_last_accepted_sandbox() {
+    let mut store = SandboxStore::default();
+    store.update(resource("sandbox", "original")).unwrap();
+    let mut update = resource("sandbox", "replacement");
+    update.resource.extensions.push(prost_types::Any {
+        type_url: "type.googleapis.com/unknown.Policy".into(),
+        value: Vec::new(),
+    });
+    assert!(store.update(update).is_err());
+    assert_eq!(
+        store
+            .get(&"sandbox".into())
+            .unwrap()
+            .workload_uid
+            .as_deref(),
+        Some("original")
+    );
+}
+
+#[test]
 fn config_dump_includes_sandbox_bindings_and_named_traffic_policies() {
-    use crate::xds::agentio::sandbox::PolicyReference;
     use crate::xds::agentio::security::{
         TrafficPolicy as XdsTrafficPolicy, traffic_policy as proto,
     };
@@ -119,12 +143,6 @@ fn config_dump_includes_sandbox_bindings_and_named_traffic_policies() {
     for id in ["sandbox-z", "sandbox-a"] {
         let mut sandbox = resource(id, "workload-uid");
         sandbox.resource.traffic_policy = Some(policy.clone());
-        sandbox.resource.policy_refs.insert(
-            crate::xds::TRAFFIC_POLICY_TYPE.to_string(),
-            PolicyReference {
-                resource_names: names.iter().map(|name| name.to_string()).collect(),
-            },
-        );
         state.sandboxes.update(sandbox).unwrap();
     }
 
@@ -134,7 +152,7 @@ fn config_dump_includes_sandbox_bindings_and_named_traffic_policies() {
     assert_eq!(dump["sandboxes"][1]["uid"], "sandbox-z");
     assert_eq!(sandbox["workloadUid"], "workload-uid");
     // Resource output is sorted; policy references retain evaluation order.
-    assert_eq!(sandbox["trafficPolicyRefs"], json!(names));
+    assert!(sandbox.get("trafficPolicyRefs").is_none());
     assert_eq!(dump["trafficPolicies"][0]["name"], names[1]);
     assert_eq!(dump["trafficPolicies"][1]["name"], names[0]);
     let rule = json!({
@@ -251,67 +269,6 @@ fn invalid_update_preserves_previous_resource_and_binding() {
             .map(|sandbox| sandbox.uid.clone())
             .as_deref(),
         Some("sandbox-a")
-    );
-}
-
-#[test]
-fn lifecycle_updates_do_not_remove_identity() {
-    let f = Fixture::new();
-    for state in [
-        SandboxState::Unspecified as i32,
-        SandboxState::Pending as i32,
-        SandboxState::Running as i32,
-        SandboxState::Paused as i32,
-        SandboxState::Stopped as i32,
-        99,
-    ] {
-        let mut changed = resource("sandbox-a", "workload-uid");
-        changed.resource.state = state;
-        f.state.write().unwrap().sandboxes.update(changed).unwrap();
-        assert_eq!(
-            f.demand
-                .fetch_sandbox(&f.workload)
-                .map(|sandbox| sandbox.uid.clone())
-                .as_deref(),
-            Some("sandbox-a")
-        );
-    }
-}
-
-#[test]
-fn routing_updates_preserve_snapshots_and_reject_invalid_rebinding() {
-    use crate::xds::agentio::sandbox::{EgressRouting, egress_routing};
-    let f = Fixture::new();
-    f.publish("sandbox-a");
-    let original = f.demand.fetch_sandbox(&f.workload).unwrap();
-    let mut update = resource("sandbox-a", "workload-uid");
-    update.resource.egress_routing = Some(EgressRouting {
-        routes: vec![egress_routing::Route::default()],
-    });
-    f.state
-        .write()
-        .unwrap()
-        .sandboxes
-        .update(update.clone())
-        .unwrap();
-    let accepted = f.demand.fetch_sandbox(&f.workload).unwrap();
-    assert!(original.egress_routing.is_none());
-    assert_eq!(accepted.egress_routing.as_ref().unwrap().policies.len(), 1);
-
-    update.resource.attester.as_mut().unwrap().workload_uid = "different-workload".into();
-    update.resource.egress_routing.as_mut().unwrap().routes[0].action = 99;
-    assert!(f.state.write().unwrap().sandboxes.update(update).is_err());
-    assert!(Arc::ptr_eq(
-        &accepted,
-        &f.demand.fetch_sandbox(&f.workload).unwrap()
-    ));
-    assert!(
-        f.state
-            .read()
-            .unwrap()
-            .sandboxes
-            .get_by_workload(&"different-workload".into())
-            .is_empty()
     );
 }
 

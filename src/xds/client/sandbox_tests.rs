@@ -15,7 +15,7 @@
 use super::*;
 use crate::sandbox::discovery::tests::Fixture;
 use crate::test_helpers::xds::{AdsConnection, AdsServer};
-use crate::xds::agentio::sandbox::{Sandbox, SandboxState, sandbox::Attester};
+use crate::xds::agentio::sandbox::{Sandbox, sandbox::Attester};
 use crate::xds::{ADDRESS_TYPE, ProxyStateUpdater, SANDBOX_TYPE, TRAFFIC_POLICY_TYPE};
 use prost::Message;
 use test_case::test_case;
@@ -71,7 +71,6 @@ fn resource() -> ProtoResource {
                 attester: Some(Attester {
                     workload_uid: "workload-uid".into(),
                 }),
-                state: SandboxState::Running.into(),
                 ..Default::default()
             }
             .encode_to_vec(),

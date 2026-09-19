@@ -18,21 +18,16 @@ package agentio.security;
 
 option go_package = "github.com/openkruise/agentio/api/security/v1;securityv1";
 
-// Traffic rules carried inline in a Sandbox or published as an independent
-// xDS resource. The resource name is carried by xDS, not this message.
-// Independent resource names follow the AIP-122 path convention:
-// - TrafficPolicy: namespaces/{namespace}/trafficPolicies/{name}.
-// - GlobalTrafficPolicy: trafficPolicies/{name}.
-// Namespace and name are the source object's identifiers. Selectors affect
-// attachment, not resource identity. Inline rules have no independent name.
-// Selection and ordering of predefined policies are resolved by the control
-// plane and published in Sandbox.policy_refs.
+// Traffic rules shared by native Workloads or carried inline in a Sandbox.
+// Shared policies are independent xDS resources. Each Workload carries their
+// complete ordered references, including global and namespace policies; scope
+// and selector matching stay in the control plane. Authorizations are a separate
+// compatibility projection for older data planes.
 message TrafficPolicy {
   // Absent = this policy does not configure the direction.
   // Present (including an empty rule set) = this direction is configured.
-  // First matching rule wins; no match continues to the next referenced policy.
-  // Default deny applies only after every inline/referenced policy misses,
-  // provided at least one policy configures this direction.
+  // First matching rule decides this policy. The enclosing policy stage defines
+  // how the result and an unmatched direction compose with Workload policies.
   RuleSet ingress = 1;
   RuleSet egress = 2;
 
@@ -58,7 +53,7 @@ message TrafficPolicy {
   }
 
   message RuleSet {
-    // Declaration order within this policy. A matching ALLOW or DENY is terminal.
+    // Declaration order within this policy. The first matching rule returns its action.
     // No per-policy default action.
     repeated Rule rules = 1;
   }

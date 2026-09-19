@@ -151,6 +151,10 @@ impl ProxyStateUpdateMutator {
         // Convert the workload.
         let (workload, services): (Workload, HashMap<String, PortList>) = w.try_into()?;
         let workload = Arc::new(workload);
+        let policy_changed = state
+            .workloads
+            .find_uid(&workload.uid)
+            .is_none_or(|old| old.traffic_policy_refs != workload.traffic_policy_refs);
 
         // First, remove the entry entirely to make sure things are cleaned up properly.
         self.remove_workload_for_insert(state, &workload.uid);
@@ -161,6 +165,9 @@ impl ProxyStateUpdateMutator {
         // Lock and upstate the stores.
         state.workloads.insert(workload.clone());
         insert_service_endpoints(&workload, &services, &mut state.services)?;
+        if policy_changed {
+            state.policies.send();
+        }
 
         Ok(())
     }
@@ -193,6 +200,9 @@ impl ProxyStateUpdateMutator {
                     .was_last_identity_on_node(&prev.node, &prev.identity())
             {
                 self.cert_fetcher.clear_cert(&prev.identity());
+            }
+            if !for_workload_insert {
+                state.policies.send();
             }
             // We removed a workload, no reason to attempt to remove a service with the same name
             return;
@@ -470,6 +480,7 @@ impl LocalClient {
             next.sandboxes.insert(sandbox);
         }
         for wl in r.workloads {
+            wl.workload.validate_policies()?;
             trace!("inserting local workload {}", &wl.workload.uid);
             self.cert_fetcher.prefetch_cert(&wl.workload);
             let w = Arc::new(wl.workload);
