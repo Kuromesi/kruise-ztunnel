@@ -146,7 +146,7 @@ impl CaClient {
             csr,
             validity_duration: self.secret_ttl,
             metadata: {
-                if self.enable_impersonated_identity {
+                if self.enable_impersonated_identity || id.legacy_service_account().is_none() {
                     Some(Struct {
                         fields: BTreeMap::from([(
                             "ImpersonatedIdentity".into(),
@@ -188,7 +188,7 @@ impl CaClient {
         };
         let certs = tls::WorkloadCertificate::new(&private_key, leaf, chain)?;
         // Make the certificate actually matches the identity we requested.
-        if self.enable_impersonated_identity && certs.identity().as_ref() != Some(id) {
+        if certs.identity().as_ref() != Some(id) {
             error!("expected identity {:?}, got {:?}", id, certs.identity());
             return Err(Error::SanError(id.to_owned()));
         }
@@ -275,12 +275,10 @@ pub mod mock {
             &self,
             id: &Identity,
         ) -> Result<tls::WorkloadCertificate, Error> {
-            let Identity::Spiffe {
-                trust_domain: td,
-                namespace: ns,
-                ..
-            } = id;
-            if td == "error" {
+            if id.trust_domain() == "error" {
+                let (ns, _) = id
+                    .legacy_service_account()
+                    .expect("injected Kubernetes error identity");
                 return Err(match ns.as_str() {
                     "forgotten" => Error::Forgotten,
                     _ => panic!("cannot parse injected error: {ns}"),
@@ -352,6 +350,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_dedicated_client_rejects_legacy_certificate() {
+        let (mock, mut client) = test_helpers::ca::CaServer::spawn().await;
+        client.enable_impersonated_identity = false;
+        let certs = tls::mock::generate_test_certs(
+            &Identity::default().into(),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+        mock.send(Ok(IstioCertificateResponse {
+            cert_chain: certs.full_chain_and_roots(),
+        }))
+        .unwrap();
+        let id = "spiffe://cluster.local/workload/k8s-pod-v1/cluster/native-id"
+            .parse()
+            .unwrap();
+        assert_matches!(client.fetch_certificate(&id).await, Err(Error::SanError(_)));
+    }
+
+    #[tokio::test]
     async fn empty_chain() {
         let res =
             test_ca_client_with_response(IstioCertificateResponse { cert_chain: vec![] }).await;
@@ -360,11 +377,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_identity() {
-        let id = Identity::Spiffe {
-            service_account: "wrong-sa".into(),
-            namespace: "foo".into(),
-            trust_domain: "cluster.local".into(),
-        };
+        let id = Identity::from_parts("cluster.local".into(), "foo".into(), "wrong-sa".into());
         let certs = tls::mock::generate_test_certs(
             &id.into(),
             Duration::from_secs(0),

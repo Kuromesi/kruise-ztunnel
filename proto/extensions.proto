@@ -22,6 +22,11 @@ message WorkloadMetadata {
   reserved "mesh_internal_traffic_policy";
 }
 
+// Wire-compatible with Agentio; old proxies ignore this extension.
+message WorkloadIdentity {
+  string spiffe_id = 1;
+}
+
 message EgressPolicies {
     repeated EgressPolicy egress_policies = 1;
 }

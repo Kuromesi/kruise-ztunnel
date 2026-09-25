@@ -41,14 +41,10 @@ const CERT_REFRESH_FAILURE_RETRY_DELAY_MAX_INTERVAL: Duration = Duration::from_s
 /// Default trust domain to use if not otherwise specified.
 pub const DEFAULT_TRUST_DOMAIN: &str = "cluster.local";
 
+/// A complete SPIFFE URI. Issuers own path semantics; the data plane compares
+/// the complete identity and does not whitelist workload runtime profiles.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
-pub enum Identity {
-    Spiffe {
-        trust_domain: Strng,
-        namespace: Strng,
-        service_account: Strng,
-    },
-}
+pub struct Identity(Strng);
 
 impl EncodeLabelValue for Identity {
     fn encode(&self, writer: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
@@ -68,65 +64,75 @@ impl serde::Serialize for Identity {
 impl FromStr for Identity {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        const URI_PREFIX: &str = "spiffe://";
-        const SERVICE_ACCOUNT: &str = "sa";
-        const NAMESPACE: &str = "ns";
-        if !s.starts_with(URI_PREFIX) {
+        let Some(rest) = s.strip_prefix("spiffe://") else {
+            return Err(Spiffe(s.to_string()));
+        };
+        let parts: Vec<_> = rest.split('/').collect();
+        if s.len() > 2048
+            || parts[0].len() > 255
+            || parts[0].bytes().any(|c| c.is_ascii_uppercase())
+            || parts.iter().any(|v| {
+                v.is_empty()
+                    || *v == "."
+                    || *v == ".."
+                    || !v
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_'))
+            })
+        {
             return Err(Spiffe(s.to_string()));
         }
-        let split: Vec<_> = s[URI_PREFIX.len()..].split('/').collect();
-        if split.len() != 5 {
-            return Err(Spiffe(s.to_string()));
-        }
-        if split[1] != NAMESPACE || split[3] != SERVICE_ACCOUNT {
-            return Err(Spiffe(s.to_string()));
-        }
-        Ok(Identity::Spiffe {
-            trust_domain: split[0].into(),
-            namespace: split[2].into(),
-            service_account: split[4].into(),
-        })
+        Ok(Identity(s.into()))
     }
 }
 
 impl fmt::Display for Identity {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Identity::Spiffe {
-                trust_domain,
-                namespace,
-                service_account,
-            } => write!(
-                f,
-                "spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}"
-            ),
-        }
+        f.write_str(self.0.as_str())
     }
 }
 
 impl Identity {
+    // Kubernetes bootstrap/debug inputs still arrive as separate fields. Their
+    // representation is normalized here; certificate/WDS URI parsing is strict.
     pub fn from_parts(td: Strng, ns: Strng, sa: Strng) -> Identity {
-        Identity::Spiffe {
-            trust_domain: td,
-            namespace: ns,
-            service_account: sa,
-        }
+        Identity(strng::format!("spiffe://{td}/ns/{ns}/sa/{sa}"))
     }
 
-    pub fn to_strng(self: &Identity) -> Strng {
-        match self {
-            Identity::Spiffe {
-                trust_domain,
-                namespace,
-                service_account,
-            } => strng::format!("spiffe://{trust_domain}/ns/{namespace}/sa/{service_account}"),
-        }
+    pub fn to_strng(&self) -> Strng {
+        self.0.clone()
     }
 
     pub fn trust_domain(&self) -> Strng {
-        match self {
-            Identity::Spiffe { trust_domain, .. } => trust_domain.clone(),
+        self.0
+            .as_str()
+            .strip_prefix("spiffe://")
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .into()
+    }
+
+    // Only compatibility adapters and Kubernetes test fixtures interpret this path.
+    pub(crate) fn legacy_service_account(&self) -> Option<(Strng, Strng)> {
+        let parts: Vec<_> = self
+            .0
+            .as_str()
+            .strip_prefix("spiffe://")?
+            .split('/')
+            .collect();
+        match parts.as_slice() {
+            [_, "ns", namespace, "sa", account] => Some(((*namespace).into(), (*account).into())),
+            _ => None,
         }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Identity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -135,11 +141,11 @@ impl Default for Identity {
     fn default() -> Self {
         const SERVICE_ACCOUNT: &str = "ztunnel";
         const NAMESPACE: &str = "istio-system";
-        Identity::Spiffe {
-            trust_domain: DEFAULT_TRUST_DOMAIN.into(),
-            namespace: NAMESPACE.into(),
-            service_account: SERVICE_ACCOUNT.into(),
-        }
+        Identity::from_parts(
+            DEFAULT_TRUST_DOMAIN.into(),
+            NAMESPACE.into(),
+            SERVICE_ACCOUNT.into(),
+        )
     }
 }
 
@@ -765,11 +771,11 @@ mod tests {
 
     async fn stress_many_ids(sm: Arc<SecretManager>, iterations: u32) {
         for i in 0..iterations {
-            let id = identity::Identity::Spiffe {
-                trust_domain: "cluster.local".into(),
-                namespace: "istio-system".into(),
-                service_account: strng::format!("ztunnel{i}"),
-            };
+            let id = identity::Identity::from_parts(
+                "cluster.local".into(),
+                "istio-system".into(),
+                strng::format!("ztunnel{i}"),
+            );
             sm.fetch_certificate(&id)
                 .await
                 .expect("Didn't get a cert as expected.");
@@ -918,19 +924,11 @@ mod tests {
     }
 
     fn identity(name: &str) -> Identity {
-        Identity::Spiffe {
-            trust_domain: "test".into(),
-            namespace: "test".into(),
-            service_account: name.into(),
-        }
+        Identity::from_parts("test".into(), "test".into(), name.into())
     }
 
     fn identity_n(name: &str, n: u8) -> Identity {
-        Identity::Spiffe {
-            trust_domain: "test".into(),
-            namespace: "test".into(),
-            service_account: strng::format!("{name}{n}"),
-        }
+        Identity::from_parts("test".into(), "test".into(), strng::format!("{name}{n}"))
     }
 
     #[tokio::test(start_paused = true)]
@@ -1199,41 +1197,59 @@ mod tests {
     }
 
     #[test]
+    fn typed_identity_round_trip_and_rejection() {
+        for raw in [
+            "spiffe://cluster.local/workload/k8s-pod-v1/cluster-a/native-id",
+            "spiffe://cluster.local/egress-gateway/named-v1/cluster-a/system/internet",
+            "spiffe://cluster.local/workload/vm-inventory-v2/account/region/native-id",
+            "spiffe://cluster.local/future-profile/subject",
+        ] {
+            let id: Identity = raw.parse().unwrap();
+            assert_eq!(id.to_string(), raw);
+            assert_eq!(id.to_strng().as_str(), raw);
+            assert_eq!(id.trust_domain().as_str(), "cluster.local");
+            assert_eq!(
+                serde_json::from_str::<Identity>(&serde_json::to_string(&id).unwrap()).unwrap(),
+                id
+            );
+        }
+        for raw in [
+            "spiffe://cluster.local/workload/k8s-pod-v1/cluster-a/id/",
+            "spiffe://cluster.local/workload/k8s-pod-v1/cluster-a/%69d",
+            "spiffe://cluster.local/workload/k8s-pod-v1/../id",
+            "spiffe://CLUSTER.local/workload/k8s-pod-v1/cluster-a/id",
+            "spiffe://cluster.local/workload/k8s-pod-v1/cluster-a/id?",
+            "spiffe://cluster.local/workload/k8s-pod-v1/cluster-a/id#fragment",
+        ] {
+            assert!(raw.parse::<Identity>().is_err(), "accepted {raw}");
+        }
+    }
+
+    #[test]
     fn identity_from_string() {
         assert_eq!(
             Identity::from_str("spiffe://cluster.local/ns/namespace/sa/service-account").ok(),
-            Some(Identity::Spiffe {
-                trust_domain: "cluster.local".into(),
-                namespace: "namespace".into(),
-                service_account: "service-account".into(),
-            })
+            Some(Identity::from_parts(
+                "cluster.local".into(),
+                "namespace".into(),
+                "service-account".into()
+            ))
         );
         assert_eq!(
             Identity::from_str("spiffe://td/ns/ns/sa/sa").ok(),
-            Some(Identity::Spiffe {
-                trust_domain: "td".into(),
-                namespace: "ns".into(),
-                service_account: "sa".into(),
-            })
+            Some(Identity::from_parts("td".into(), "ns".into(), "sa".into()))
         );
         assert_eq!(
             Identity::from_str("spiffe://td.with.dots/ns/ns.with.dots/sa/sa.with.dots").ok(),
-            Some(Identity::Spiffe {
-                trust_domain: "td.with.dots".into(),
-                namespace: "ns.with.dots".into(),
-                service_account: "sa.with.dots".into(),
-            })
+            Some(Identity::from_parts(
+                "td.with.dots".into(),
+                "ns.with.dots".into(),
+                "sa.with.dots".into()
+            ))
         );
-        assert_eq!(
-            Identity::from_str("spiffe://td/ns//sa/").ok(),
-            Some(Identity::Spiffe {
-                trust_domain: "td".into(),
-                namespace: "".into(),
-                service_account: "".into()
-            })
-        );
+        assert_matches!(Identity::from_str("spiffe://td/ns//sa/"), Err(_));
         assert_matches!(Identity::from_str("td/ns/ns/sa/sa"), Err(_));
-        assert_matches!(Identity::from_str("spiffe://td/ns/ns/sa"), Err(_));
+        assert!(Identity::from_str("spiffe://td/custom/profile/id").is_ok());
         assert_matches!(Identity::from_str("spiffe://td/ns/ns/sa/sa/"), Err(_));
         assert_matches!(Identity::from_str("spiffe://td/ns/ns/foobar/sa/"), Err(_));
     }

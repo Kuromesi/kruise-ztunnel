@@ -596,11 +596,11 @@ mod tests {
         });
         for i in 0..2 {
             manager
-                .fetch_certificate(&identity::Identity::Spiffe {
-                    trust_domain: "trust_domain".into(),
-                    namespace: "namespace".into(),
-                    service_account: strng::format!("sa-{i}"),
-                })
+                .fetch_certificate(&identity::Identity::from_parts(
+                    "trust_domain".into(),
+                    "namespace".into(),
+                    strng::format!("sa-{i}"),
+                ))
                 .await
                 .unwrap();
             // Make sure certificates are a significant amount of time apart, for better

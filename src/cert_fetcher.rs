@@ -37,10 +37,8 @@ impl CertFetcher for NoCertFetcher {
 
 /// Constructs an appropriate [CertFetcher] for the proxy config.
 pub fn new(cfg: &config::Config, cert_manager: Arc<SecretManager>) -> Arc<dyn CertFetcher> {
-    match cfg.proxy_mode {
-        ProxyMode::Dedicated => Arc::new(NoCertFetcher()),
-        ProxyMode::Shared => Arc::new(CertFetcherImpl::new(cfg, cert_manager)),
-    }
+    // Both modes need cleanup; should_prefetch_certificate limits warmup to shared mode.
+    Arc::new(CertFetcherImpl::new(cfg, cert_manager))
 }
 
 /// A real [CertFetcher] that asynchronously forwards cert pre-fetch requests to a [SecretManager].

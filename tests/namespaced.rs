@@ -833,11 +833,11 @@ mod namespaced {
     #[tokio::test]
     async fn egress_gateway_trust_domain_mismatch_rejected() -> anyhow::Result<()> {
         let mut manager = setup_netns_test!(Shared);
-        let id = identity::Identity::Spiffe {
-            trust_domain: "clusterset.local".into(), // change to mismatched trustdomain
-            service_account: "my-app".into(),
-            namespace: "default".into(),
-        };
+        let id = identity::Identity::from_parts(
+            "clusterset.local".into(),
+            "default".into(),
+            "my-app".into(),
+        );
 
         let _ = manager.deploy_ztunnel(DEFAULT_NODE).await?;
         run_tcp_server(
@@ -884,11 +884,8 @@ mod namespaced {
     async fn test_prefetch_forget_certs() -> anyhow::Result<()> {
         // TODO: this test doesn't really need namespacing, but the direct test doesn't allow dynamic config changes.
         let mut manager = setup_netns_test!(Shared);
-        let id1 = identity::Identity::Spiffe {
-            trust_domain: "cluster.local".into(),
-            service_account: "sa1".into(),
-            namespace: "default".into(),
-        };
+        let id1 =
+            identity::Identity::from_parts("cluster.local".into(), "default".into(), "sa1".into());
         let id1s = id1.to_string();
 
         let ta = manager.deploy_ztunnel(DEFAULT_NODE).await?;

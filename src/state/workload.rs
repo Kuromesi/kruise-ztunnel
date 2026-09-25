@@ -227,6 +227,8 @@ pub mod address {
 #[derive(Debug, Hash, Eq, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Workload {
+    /// The effective identity, resolved once at the input boundary.
+    pub principal: Identity,
     pub workload_ips: Vec<IpAddr>,
 
     #[serde(default, skip_serializing_if = "is_default")]
@@ -295,6 +297,37 @@ pub struct Workload {
     pub sni_policy: Option<SniTrafficPolicy>,
 }
 
+// Explicit identity syntax is validated once by the shared URI parser.
+fn parse_explicit_identity(value: &str) -> Result<Identity, WorkloadError> {
+    value
+        .parse()
+        .map_err(|e| WorkloadError::CertificateIdentity(format!("invalid SPIFFE ID: {e}")))
+}
+
+/// Compatibility for inputs without an explicit SPIFFE ID. It must never be
+/// called after parsing a present ID fails.
+pub(crate) fn parse_legacy_identity(
+    trust_domain: &str,
+    namespace: &str,
+    service_account: &str,
+) -> Identity {
+    Identity::from_parts(
+        if trust_domain.is_empty() {
+            "cluster.local"
+        } else {
+            trust_domain
+        }
+        .into(),
+        namespace.into(),
+        if service_account.is_empty() {
+            "default"
+        } else {
+            service_account
+        }
+        .into(),
+    )
+}
+
 fn default_capacity() -> u32 {
     1
 }
@@ -339,11 +372,7 @@ impl Workload {
     }
 
     pub fn identity(&self) -> Identity {
-        Identity::Spiffe {
-            trust_domain: self.trust_domain.clone(),
-            namespace: self.namespace.clone(),
-            service_account: self.service_account.clone(),
-        }
+        self.principal.clone()
     }
 
     pub fn baggage(&self) -> Baggage {
@@ -502,8 +531,38 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
         let mut egress_policies: Option<EgressPolicies> = None;
         let mut traffic_policy_refs = None;
         let mut sni_policy = None;
+        let mut certificate_identity = None;
 
         for extension in resource.extensions.into_iter() {
+            if extension.name == "workload-identity" {
+                let config = extension.config.as_ref().ok_or_else(|| {
+                    WorkloadError::CertificateIdentity("missing identity config".into())
+                })?;
+                if certificate_identity.is_some()
+                    || config.type_url
+                        != "type.googleapis.com/kruise.networking.extensions.v1.WorkloadIdentity"
+                {
+                    return Err(WorkloadError::CertificateIdentity(
+                        "duplicate or malformed identity extension".into(),
+                    ));
+                }
+                let identity = xds::kruise::networking::extensions::v1::WorkloadIdentity::decode(
+                    config.value.as_slice(),
+                )?;
+                let identity = parse_explicit_identity(&identity.spiffe_id)?;
+                let td = if resource.trust_domain.is_empty() {
+                    "cluster.local"
+                } else {
+                    &resource.trust_domain
+                };
+                if identity.trust_domain().as_str() != td {
+                    return Err(WorkloadError::CertificateIdentity(
+                        "certificate identity trust domain mismatch".into(),
+                    ));
+                }
+                certificate_identity = Some(identity);
+                continue;
+            }
             if extension.name == "traffic-policy-reference" {
                 let config = extension
                     .config
@@ -551,7 +610,16 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
             }
         }
 
+        let principal = match certificate_identity {
+            Some(identity) => identity,
+            None => parse_legacy_identity(
+                &resource.trust_domain,
+                &resource.namespace,
+                &resource.service_account,
+            ),
+        };
         let wl = Workload {
+            principal,
             workload_ips: addresses,
             waypoint: wp,
 
@@ -776,16 +844,11 @@ struct WorkloadIdentity {
     service_account: Strng,
 }
 
-impl From<&Identity> for WorkloadIdentity {
-    fn from(value: &Identity) -> Self {
-        let Identity::Spiffe {
-            namespace,
-            service_account,
-            ..
-        } = value;
+impl From<&Workload> for WorkloadIdentity {
+    fn from(value: &Workload) -> Self {
         WorkloadIdentity {
-            namespace: namespace.clone(),
-            service_account: service_account.clone(),
+            namespace: value.namespace.clone(),
+            service_account: value.service_account.clone(),
         }
     }
 }
@@ -805,6 +868,9 @@ pub struct WorkloadStore {
     pub(super) by_uid: HashMap<Strng, Arc<Workload>>,
     // Identity->Set of UIDs. Only stores local nodes
     node_local_by_identity: HashMap<WorkloadIdentity, HashSet<Strng>>,
+    // Certificate ownership is independent of the namespace/SA lookup used by
+    // in-pod discovery. Two Pods with the same SA can own different certificates.
+    node_local_by_certificate: HashMap<Identity, HashSet<Strng>>,
 }
 
 #[derive(Debug)]
@@ -883,6 +949,7 @@ impl WorkloadStore {
             insert_notifier: Sender::new(()),
             by_addr: Default::default(),
             node_local_by_identity: Default::default(),
+            node_local_by_certificate: Default::default(),
             by_uid: Default::default(),
         }
     }
@@ -910,8 +977,12 @@ impl WorkloadStore {
         self.by_uid.insert(w.uid.clone(), w.clone());
         // Only track local nodes to avoid overhead
         if self.local_node.is_none() || self.local_node.as_ref() == Some(&w.node) {
+            self.node_local_by_certificate
+                .entry(w.identity())
+                .or_default()
+                .insert(w.uid.clone());
             self.node_local_by_identity
-                .entry((&w.identity()).into())
+                .entry(w.as_ref().into())
                 .or_default()
                 .insert(w.uid.clone());
         }
@@ -938,7 +1009,14 @@ impl WorkloadStore {
                         }
                     }
                 }
-                let id = (&prev.identity()).into();
+                let id = prev.as_ref().into();
+                let certificate_id = prev.identity();
+                if let Some(set) = self.node_local_by_certificate.get_mut(&certificate_id) {
+                    set.remove(&prev.uid);
+                    if set.is_empty() {
+                        self.node_local_by_certificate.remove(&certificate_id);
+                    }
+                }
                 if let Some(set) = self.node_local_by_identity.get_mut(&id) {
                     set.remove(&prev.uid);
                     if set.is_empty() {
@@ -980,7 +1058,7 @@ impl WorkloadStore {
         if self.local_node.is_none() || self.local_node.as_ref() == Some(node_name) {
             // This was a workload on the node... now check if there are any remaining workloads with
             // this identity on the node.
-            !self.node_local_by_identity.contains_key(&identity.into())
+            !self.node_local_by_certificate.contains_key(identity)
         } else {
             false
         }
@@ -990,6 +1068,8 @@ impl WorkloadStore {
 #[allow(clippy::enum_variant_names)]
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum WorkloadError {
+    #[error("invalid Workload certificate identity: {0}")]
+    CertificateIdentity(String),
     #[error("invalid Workload policy reference: {0}")]
     PolicyReference(String),
     #[error("invalid Workload SNI policy: {0}")]
@@ -1039,6 +1119,89 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::RwLock;
     use xds::istio::workload::NetworkAddress as XdsNetworkAddress;
+
+    #[test]
+    fn typed_workload_identity_extension() {
+        let uri = "spiffe://cluster.local/workload/k8s-pod-v1/cluster-a/pod-id";
+        let extension = |id: &str| xds::istio::workload::Extension {
+            name: "workload-identity".into(),
+            config: Some(Any {
+                type_url: "type.googleapis.com/kruise.networking.extensions.v1.WorkloadIdentity"
+                    .into(),
+                value: ext_proto::WorkloadIdentity {
+                    spiffe_id: id.into(),
+                }
+                .encode_to_vec(),
+            }),
+        };
+        let decode = |extensions| {
+            Workload::try_from(XdsWorkload {
+                namespace: "demo".into(),
+                service_account: "shared".into(),
+                extensions,
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            decode(vec![]).unwrap().identity().to_string(),
+            "spiffe://cluster.local/ns/demo/sa/shared"
+        );
+        let typed = decode(vec![extension(uri)]).unwrap();
+        assert_eq!(typed.identity().to_string(), uri);
+        assert_eq!(typed.service_account.as_str(), "shared");
+        assert!(decode(vec![extension(uri), extension(uri)]).is_err());
+        assert!(
+            decode(vec![extension(
+                "spiffe://other/workload/k8s-pod-v1/cluster-a/pod-id"
+            )])
+            .is_err()
+        );
+        assert_eq!(
+            decode(vec![extension("spiffe://cluster.local/ns/demo/sa/shared")])
+                .unwrap()
+                .identity()
+                .to_string(),
+            "spiffe://cluster.local/ns/demo/sa/shared"
+        );
+        assert!(
+            decode(vec![extension(
+                "spiffe://cluster.local/workload/vm-inventory-v2/provider-native-id"
+            )])
+            .is_ok()
+        );
+        let mut bad = extension(uri);
+        bad.config.as_mut().unwrap().type_url = "wrong".into();
+        assert!(decode(vec![bad]).is_err());
+        let mut bad = extension(uri);
+        bad.config = None;
+        assert!(decode(vec![bad]).is_err());
+        let mut bad = extension(uri);
+        bad.config.as_mut().unwrap().value = vec![255];
+        assert!(decode(vec![bad]).is_err());
+    }
+
+    #[test]
+    fn typed_certificate_eviction_uses_identity_not_service_account() {
+        let mut store = WorkloadStore::new(Some("local".into()));
+        let mut a = test_helpers::test_default_workload();
+        a.uid = "a".into();
+        a.node = "local".into();
+        a.principal = "spiffe://cluster.local/workload/k8s-pod-v1/c/a"
+            .parse()
+            .unwrap();
+        let mut b = a.clone();
+        b.uid = "b".into();
+        b.principal = "spiffe://cluster.local/workload/k8s-pod-v1/c/b"
+            .parse()
+            .unwrap();
+        let aid = a.identity();
+        let bid = b.identity();
+        store.insert(Arc::new(a));
+        store.insert(Arc::new(b));
+        store.remove(&"a".into());
+        assert!(store.was_last_identity_on_node(&"local".into(), &aid));
+        assert!(!store.was_last_identity_on_node(&"local".into(), &bid));
+    }
 
     #[test]
     fn native_policy_reference_decoding() {

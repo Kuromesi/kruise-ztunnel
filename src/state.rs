@@ -1172,11 +1172,11 @@ mod tests {
         crate::state::ProxyRbacContext {
             sandbox: None,
             conn: rbac::Connection {
-                src_identity: Some(Identity::Spiffe {
-                    trust_domain: "cluster.local".into(),
-                    namespace: "default".into(),
-                    service_account: src_svc_acct.to_string().into(),
-                }),
+                src_identity: Some(Identity::from_parts(
+                    "cluster.local".into(),
+                    "default".into(),
+                    src_svc_acct.to_string().into(),
+                )),
                 src: std::net::SocketAddr::V4(SocketAddrV4::new(
                     Ipv4Addr::new(192, 168, 1, 1),
                     1234,

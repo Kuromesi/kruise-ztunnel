@@ -83,6 +83,11 @@ impl ConnSpawner {
         debug!("spawning new pool conn for {}", key);
 
         let cert = self.local_workload.fetch_certificate().await?;
+        // Identity may change while a request waits for a certificate. Never
+        // cache a connection under an identity other than the one it presents.
+        if cert.identity().as_ref() != Some(&key.src_id) {
+            return Err(crate::identity::Error::SanError(key.src_id).into());
+        }
         let connector = cert.outbound_connector(key.dst_id.clone())?;
         let tcp_stream = super::freebind_connect(None, key.dst, self.socket_factory.as_ref())
             .await
@@ -962,6 +967,25 @@ mod test {
         bound_addr
     }
 
+    #[tokio::test]
+    async fn rejects_pool_key_with_stale_source_identity() {
+        let (mut pool, srv) = setup_test(8).await;
+        let mut stale = key(&srv, 1);
+        stale.src_id = "spiffe://cluster.local/workload/k8s-pod-v1/cluster/old-id"
+            .parse()
+            .unwrap();
+        let request = hyper::Request::builder()
+            .uri(srv.addr.to_string())
+            .method(hyper::Method::CONNECT)
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            pool.send_request_pooled(&stale, request).await,
+            Err(Error::Identity(crate::identity::Error::SanError(_)))
+        ));
+        assert_eq!(srv.conn_counter.load(Ordering::SeqCst), 0);
+    }
+
     async fn setup_test(max_conns: u16) -> (WorkloadHBONEPool, TestServer) {
         setup_test_with_idle(max_conns, Duration::from_secs(100)).await
     }
@@ -985,6 +1009,11 @@ mod test {
 
         let mut state = ProxyState::new(None);
         let wl = Arc::new(workload::Workload {
+            principal: crate::identity::Identity::from_parts(
+                "cluster.local".into(),
+                "ns".into(),
+                "default".into(),
+            ),
             uid: "uid".into(),
             name: "source-workload".into(),
             namespace: "ns".into(),
@@ -1029,7 +1058,7 @@ mod test {
 
     fn key(srv: &TestServer, ip: u8) -> WorkloadKey {
         WorkloadKey {
-            src_id: Identity::default(),
+            src_id: Identity::from_parts("cluster.local".into(), "ns".into(), "default".into()),
             dst_id: vec![Identity::default()],
             sandbox_id: None,
             src: IpAddr::from([127, 0, 0, ip]),

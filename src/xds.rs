@@ -151,9 +151,9 @@ impl ProxyStateUpdateMutator {
         // Convert the workload.
         let (workload, services): (Workload, HashMap<String, PortList>) = w.try_into()?;
         let workload = Arc::new(workload);
-        let policy_changed = state
-            .workloads
-            .find_uid(&workload.uid)
+        let previous = state.workloads.find_uid(&workload.uid);
+        let policy_changed = previous
+            .as_ref()
             .is_none_or(|old| old.traffic_policy_refs != workload.traffic_policy_refs);
 
         // First, remove the entry entirely to make sure things are cleaned up properly.
@@ -164,6 +164,14 @@ impl ProxyStateUpdateMutator {
 
         // Lock and upstate the stores.
         state.workloads.insert(workload.clone());
+        if let Some(prev) = previous
+            && prev.principal != workload.principal
+            && state
+                .workloads
+                .was_last_identity_on_node(&prev.node, &prev.principal)
+        {
+            self.cert_fetcher.clear_cert(&prev.principal);
+        }
         insert_service_endpoints(&workload, &services, &mut state.services)?;
         if policy_changed {
             state.policies.send();
@@ -397,12 +405,39 @@ pub struct LocalClient {
     pub local_node: Option<Strng>,
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Eq, PartialEq, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LocalWorkload {
     #[serde(flatten)]
     pub workload: Workload,
     pub services: HashMap<String, HashMap<u16, u16>>,
+}
+
+impl<'de> serde::Deserialize<'de> for LocalWorkload {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let fields = value
+            .as_object_mut()
+            .ok_or_else(|| serde::de::Error::custom("workload must be an object"))?;
+        let services = fields
+            .remove("services")
+            .ok_or_else(|| serde::de::Error::missing_field("services"))?;
+        let services = serde_json::from_value(services).map_err(serde::de::Error::custom)?;
+        if !fields.contains_key("principal") {
+            let field = |key: &str| fields.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            let principal = crate::state::workload::parse_legacy_identity(
+                field("trustDomain"),
+                field("namespace"),
+                field("serviceAccount"),
+            );
+            fields.insert(
+                "principal".into(),
+                serde_json::Value::String(principal.to_string()),
+            );
+        }
+        let workload = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self { workload, services })
+    }
 }
 
 #[derive(Default, Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]

@@ -80,9 +80,7 @@ impl TrustDomainVerifier {
             want_trust_domain
         );
         ids.iter()
-            .find(|id| match id {
-                Identity::Spiffe { trust_domain, .. } => trust_domain == want_trust_domain,
-            })
+            .find(|id| &id.trust_domain() == want_trust_domain)
             .ok_or_else(|| {
                 rustls::Error::InvalidCertificate(rustls::CertificateError::Other(
                     rustls::OtherError(Arc::new(TlsError::SanTrustDomainError(

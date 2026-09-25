@@ -256,12 +256,9 @@ impl LocalWorkloadInformation {
             .get_workload()
             .await
             .map_err(|_| identity::Error::UnknownWorkload(self.workload_info()))?;
-        let id = &Identity::Spiffe {
-            trust_domain: wl.trust_domain.clone(),
-            namespace: (&self.wi.namespace).into(),
-            service_account: (&self.wi.service_account).into(),
-        };
-        self.full_cert_manager.fetch_certificate(id).await
+        self.full_cert_manager
+            .fetch_certificate(&wl.identity())
+            .await
     }
 
     pub fn workload_info(&self) -> Arc<WorkloadInfo> {
@@ -957,6 +954,45 @@ impl TryFrom<&http::Uri> for HboneAddress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_certificate_uses_typed_workload_identity() {
+        use crate::xds::istio::workload::{Extension, Workload as XdsWorkload};
+        use crate::xds::kruise::networking::extensions::v1::WorkloadIdentity;
+        use prost::Message;
+        let uri = "spiffe://cluster.local/workload/k8s-pod-v1/cluster/native-id";
+        let workload = XdsWorkload {
+            uid: "cluster//Pod/demo/client".into(),
+            name: "client".into(),
+            namespace: "demo".into(),
+            service_account: "shared".into(),
+            extensions: vec![Extension {
+                name: "workload-identity".into(),
+                config: Some(prost_types::Any {
+                    type_url:
+                        "type.googleapis.com/kruise.networking.extensions.v1.WorkloadIdentity"
+                            .into(),
+                    value: WorkloadIdentity {
+                        spiffe_id: uri.into(),
+                    }
+                    .encode_to_vec(),
+                }),
+            }],
+            ..Default::default()
+        };
+        let state = crate::test_helpers::new_proxy_state(&[workload], &[], &[]);
+        let local = LocalWorkloadInformation::new(
+            Arc::new(WorkloadInfo::new(
+                "client".into(),
+                "demo".into(),
+                "shared".into(),
+            )),
+            state,
+            identity::mock::new_secret_manager(std::time::Duration::from_secs(60)),
+        );
+        let certificate = local.fetch_certificate().await.unwrap();
+        assert_eq!(certificate.identity().unwrap().to_string(), uri);
+    }
 
     #[test]
     fn new_udp_v4_is_unbound_so_the_caller_can_set_pre_bind_options() {

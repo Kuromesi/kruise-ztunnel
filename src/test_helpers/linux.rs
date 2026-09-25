@@ -134,11 +134,11 @@ impl WorkloadManager {
         // These are used for registering ztunnel as a workload and for cfg.ztunnel_identity/workload.
         let ztunnel_shared_identity: Option<identity::Identity> = if proxy_mode == ProxyMode::Shared
         {
-            Some(identity::Identity::Spiffe {
-                trust_domain: "cluster.local".into(),
-                namespace: "default".into(),
-                service_account: ztunnel_name.clone().into(),
-            })
+            Some(identity::Identity::from_parts(
+                "cluster.local".into(),
+                "default".into(),
+                ztunnel_name.clone().into(),
+            ))
         } else {
             None
         };
@@ -346,11 +346,11 @@ impl WorkloadManager {
     pub fn workload_builder(&mut self, name: &str, node: &str) -> TestWorkloadBuilder<'_> {
         TestWorkloadBuilder::new(name, self)
             .on_node(node)
-            .identity(identity::Identity::Spiffe {
-                trust_domain: "cluster.local".into(),
-                namespace: "default".into(),
-                service_account: name.into(),
-            })
+            .identity(identity::Identity::from_parts(
+                "cluster.local".into(),
+                "default".into(),
+                name.into(),
+            ))
     }
 
     /// service_builder allows creating a new service
@@ -364,11 +364,11 @@ impl WorkloadManager {
         TestWorkloadBuilder::new(name, self)
             .on_node(node)
             .uncaptured() // Waypoints are not captured.
-            .identity(identity::Identity::Spiffe {
-                trust_domain: "cluster.local".into(),
-                namespace: "default".into(),
-                service_account: name.into(),
-            })
+            .identity(identity::Identity::from_parts(
+                "cluster.local".into(),
+                "default".into(),
+                name.into(),
+            ))
             .register()
             .await
     }
@@ -471,6 +471,11 @@ impl<'a> TestWorkloadBuilder<'a> {
             captured: false,
             w: LocalWorkload {
                 workload: Workload {
+                    principal: crate::identity::Identity::from_parts(
+                        "cluster.local".into(),
+                        "default".into(),
+                        "default".into(),
+                    ),
                     name: name.into(),
                     namespace: "default".into(),
                     service_account: "default".into(),
@@ -495,17 +500,12 @@ impl<'a> TestWorkloadBuilder<'a> {
     }
 
     pub fn identity(mut self, identity: identity::Identity) -> Self {
-        match identity {
-            identity::Identity::Spiffe {
-                trust_domain,
-                namespace,
-                service_account,
-            } => {
-                self.w.workload.service_account = service_account;
-                self.w.workload.namespace = namespace;
-                self.w.workload.trust_domain = trust_domain;
-            }
+        self.w.workload.principal = identity.clone();
+        if let Some((namespace, service_account)) = identity.legacy_service_account() {
+            self.w.workload.service_account = service_account;
+            self.w.workload.namespace = namespace;
         }
+        self.w.workload.trust_domain = identity.trust_domain();
         self
     }
 

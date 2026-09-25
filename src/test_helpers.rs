@@ -189,6 +189,11 @@ pub fn mock_default_service() -> Service {
 
 pub fn test_default_workload() -> Workload {
     Workload {
+        principal: crate::identity::Identity::from_parts(
+            "cluster.local".into(),
+            strng::EMPTY,
+            "default".into(),
+        ),
         workload_ips: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
         waypoint: None,
         protocol: Default::default(),
@@ -237,6 +242,11 @@ fn test_custom_workload(
         false => vec![ip_str.parse()?],
     };
     let workload = Workload {
+        principal: crate::identity::Identity::from_parts(
+            "cluster.local".into(),
+            "default".into(),
+            "default".into(),
+        ),
         workload_ips: wips,
         hostname: host.into(),
         protocol,

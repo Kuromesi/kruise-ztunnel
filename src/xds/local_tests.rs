@@ -20,6 +20,71 @@ use crate::state::{DemandProxyState, ProxyRbacContext};
 const CONFIG: &str = include_str!("../../examples/sandbox.yaml");
 const POLICY: &str = "namespaces/default/trafficPolicies/local-egress";
 
+#[test]
+fn identity_update_clears_only_unreferenced_old_certificate() {
+    use crate::identity::Identity;
+    use crate::xds::istio::workload::Extension;
+    use crate::xds::kruise::networking::extensions::v1::WorkloadIdentity;
+    use prost::Message;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct ClearedCertificates(Mutex<Vec<Identity>>);
+    impl CertFetcher for ClearedCertificates {
+        fn prefetch_cert(&self, _: &Workload) {}
+        fn clear_cert(&self, id: &Identity) {
+            self.0.lock().unwrap().push(id.clone());
+        }
+    }
+
+    let old = "spiffe://cluster.local/workload/k8s-pod-v1/cluster/old";
+    let new = "spiffe://cluster.local/workload/k8s-pod-v1/cluster/new";
+    let workload = |uid: &str, identity: &str| XdsWorkload {
+        uid: uid.into(),
+        node: "local".into(),
+        extensions: vec![Extension {
+            name: "workload-identity".into(),
+            config: Some(prost_types::Any {
+                type_url: "type.googleapis.com/kruise.networking.extensions.v1.WorkloadIdentity"
+                    .into(),
+                value: WorkloadIdentity {
+                    spiffe_id: identity.into(),
+                }
+                .encode_to_vec(),
+            }),
+        }],
+        ..Default::default()
+    };
+    for (next, shared, clears) in [(old, false, false), (new, false, true), (new, true, false)] {
+        let fetcher = Arc::new(ClearedCertificates::default());
+        let updater = ProxyStateUpdateMutator {
+            cert_fetcher: fetcher.clone(),
+        };
+        let mut state = ProxyState::new(Some("local".into()));
+        updater
+            .insert_workload(&mut state, workload("pod", old))
+            .unwrap();
+        if shared {
+            updater
+                .insert_workload(&mut state, workload("other", old))
+                .unwrap();
+        }
+        updater
+            .insert_workload(&mut state, workload("pod", next))
+            .unwrap();
+        let expected = if clears {
+            vec![old.parse::<Identity>().unwrap()]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            *fetcher.0.lock().unwrap(),
+            expected,
+            "next={next}, shared={shared}"
+        );
+    }
+}
+
 fn client(cfg: ConfigSource) -> LocalClient {
     LocalClient {
         cfg,
@@ -250,4 +315,21 @@ fn local_resource_yaml_round_trips_and_rejects_unknown_fields() {
         serde_yaml::from_str::<LocalConfig>(&CONFIG.replace("trafficPolicyRefs:", "policyRefs:"))
             .is_err()
     );
+}
+
+#[test]
+fn local_identity_is_resolved_once_and_invalid_ids_never_fall_back() {
+    let mut config: serde_yaml::Value = serde_yaml::from_str(CONFIG).unwrap();
+    let typed = "spiffe://cluster.local/workload/k8s-pod-v1/cluster/native-id";
+    config["workloads"][0]["principal"] = serde_yaml::Value::String(typed.into());
+    let mut parsed: LocalConfig = serde_yaml::from_value(config.clone()).unwrap();
+    let workload = &mut parsed.workloads[0].workload;
+    assert_eq!(workload.identity().to_string(), typed);
+    workload.service_account = "unrelated-metadata".into();
+    workload.namespace = "another-source-namespace".into();
+    assert_eq!(workload.identity().to_string(), typed);
+    config["workloads"][0]["principal"] = serde_yaml::Value::String("invalid".into());
+    assert!(serde_yaml::from_value::<LocalConfig>(config.clone()).is_err());
+    config["workloads"][0]["principal"] = serde_yaml::Value::Null;
+    assert!(serde_yaml::from_value::<LocalConfig>(config).is_err());
 }
