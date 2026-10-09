@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,9 +24,9 @@ use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
 use tracing::{debug, error, instrument, warn};
 
 use crate::config::RootCert;
-use crate::identity::Error;
 use crate::identity::auth::AuthSource;
 use crate::identity::manager::Identity;
+use crate::identity::{Error, WorkloadIdentity};
 use crate::tls::{self, RootCertManager, TlsGrpcChannel, control_plane_client_config};
 use crate::xds::istio::ca::IstioCertificateRequest;
 use crate::xds::istio::ca::istio_certificate_service_client::IstioCertificateServiceClient;
@@ -146,6 +147,7 @@ impl CaClient {
             csr,
             validity_duration: self.secret_ttl,
             metadata: {
+                // TODO: Support ambient instance certificates with TargetWorkload and per-instance caching.
                 if self.enable_impersonated_identity {
                     Some(Struct {
                         fields: BTreeMap::from([(
@@ -192,6 +194,7 @@ impl CaClient {
             error!("expected identity {:?}, got {:?}", id, certs.identity());
             return Err(Error::SanError(id.to_owned()));
         }
+        WorkloadIdentity::from_certificate(&certs.cert.der)?;
         Ok(certs)
     }
 }
@@ -346,7 +349,7 @@ mod tests {
     async fn test_ca_client_with_response(
         res: IstioCertificateResponse,
     ) -> Result<tls::WorkloadCertificate, Error> {
-        let (mock, ca_client) = test_helpers::ca::CaServer::spawn().await;
+        let (mock, ca_client, _) = test_helpers::ca::CaServer::spawn().await;
         mock.send(Ok(res)).unwrap();
         ca_client.fetch_certificate(&Identity::default()).await
     }
@@ -413,6 +416,69 @@ mod tests {
         assert!(
             !manager.take_dirty(),
             "take_dirty must return false after reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn sidecar_workload_identity() {
+        let principal = Identity::default();
+        let claims = crate::identity::WorkloadIdentity {
+            registry: "kubernetes/test".into(),
+            uid: "pod-a".into(),
+            role: Some("sandbox-attester".into()),
+        };
+        let (responses, mut client, requests) = test_helpers::ca::CaServer::spawn().await;
+        client.enable_impersonated_identity = false;
+        for expected in [Some(claims), None] {
+            let id = match &expected {
+                Some(claims) => {
+                    tls::mock::TestIdentity::Workload(principal.clone(), claims.clone())
+                }
+                None => principal.clone().into(),
+            };
+            let certs =
+                tls::mock::generate_test_certs(&id, Duration::ZERO, Duration::from_secs(60));
+            responses
+                .send(Ok(IstioCertificateResponse {
+                    cert_chain: certs.full_chain_and_roots(),
+                }))
+                .unwrap();
+            let issued = client.fetch_certificate(&principal).await.unwrap();
+            assert_eq!(issued.identity(), Some(principal.clone()));
+            assert_eq!(
+                crate::identity::WorkloadIdentity::from_certificate(&issued.cert.der).unwrap(),
+                expected,
+            );
+            assert!(requests.borrow().as_ref().unwrap().metadata.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn ambient_requests_logical_identity() {
+        let principal = Identity::default();
+        let certs = tls::mock::generate_test_certs(
+            &principal.clone().into(),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+        let (responses, client, requests) = test_helpers::ca::CaServer::spawn().await;
+        responses
+            .send(Ok(IstioCertificateResponse {
+                cert_chain: certs.full_chain_and_roots(),
+            }))
+            .unwrap();
+        let issued = client.fetch_certificate(&principal).await.unwrap();
+        assert!(
+            crate::identity::WorkloadIdentity::from_certificate(&issued.cert.der)
+                .unwrap()
+                .is_none()
+        );
+        let request = requests.borrow();
+        let fields = &request.as_ref().unwrap().metadata.as_ref().unwrap().fields;
+        assert_eq!(fields.len(), 1);
+        assert_eq!(
+            fields["ImpersonatedIdentity"].kind,
+            Some(prost_types::value::Kind::StringValue(principal.to_string()))
         );
     }
 }

@@ -92,6 +92,8 @@ pub struct CertDump {
 #[serde(rename_all = "camelCase")]
 pub struct CertsDump {
     identity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workload_identity: Option<crate::identity::WorkloadIdentity>,
     state: String,
     cert_chain: Vec<CertDump>,
     root_certs: Vec<CertDump>,
@@ -239,6 +241,10 @@ async fn dump_certs(cert_manager: &SecretManager) -> Vec<CertsDump> {
                 Initializing(_) => dump.state = "Initializing".to_string(),
                 Unavailable(err) => dump.state = format!("Unavailable: {err}"),
                 Available(certs) => {
+                    dump.workload_identity =
+                        crate::identity::WorkloadIdentity::from_certificate(&certs.cert.der)
+                            .ok()
+                            .flatten();
                     dump.state = "Available".to_string();
                     dump.cert_chain = certs
                         .cert_and_intermediates()

@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +16,9 @@
 use crate::tls;
 use std::str::Utf8Error;
 use std::sync::Arc;
+
+mod workload_identity;
+pub use workload_identity::*;
 
 mod caclient;
 pub use caclient::*;
@@ -36,6 +40,8 @@ pub mod mock {
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum Error {
+    #[error("workload identity: {0}")]
+    WorkloadIdentity(String),
     #[error("failed to create CSR: {0}")]
     Signing(Arc<tls::Error>),
     #[error("signing gRPC error ({}): {}", .0.code(), .0.message())]

@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,6 +39,7 @@ pub const TEST_ROOT2_KEY: &[u8] = include_bytes!("ca-key2.pem");
 /// TestIdentity is an identity used for testing. This extends the Identity with test-only types
 #[derive(Debug)]
 pub enum TestIdentity {
+    Workload(Identity, crate::identity::WorkloadIdentity),
     Identity(Identity),
     Ip(IpAddr),
 }
@@ -45,7 +47,9 @@ pub enum TestIdentity {
 impl Display for TestIdentity {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            TestIdentity::Identity(i) => std::fmt::Display::fmt(&i, f),
+            TestIdentity::Identity(i) | TestIdentity::Workload(i, _) => {
+                std::fmt::Display::fmt(&i, f)
+            }
             TestIdentity::Ip(i) => std::fmt::Display::fmt(&i, f),
         }
     }
@@ -146,8 +150,16 @@ pub fn generate_test_certs_with_root(
         ExtendedKeyUsagePurpose::ServerAuth,
         ExtendedKeyUsagePurpose::ClientAuth,
     ];
+    if let TestIdentity::Workload(_, claims) = id {
+        let value = serde_json::to_vec(claims).unwrap();
+        p.custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 4, 1, 57874, 5, 1],
+                value,
+            ));
+    }
     p.subject_alt_names = vec![match id {
-        TestIdentity::Identity(i) => {
+        TestIdentity::Identity(i) | TestIdentity::Workload(i, _) => {
             SanType::URI(string::Ia5String::try_from(i.to_string()).unwrap())
         }
         TestIdentity::Ip(i) => SanType::IpAddress(*i),

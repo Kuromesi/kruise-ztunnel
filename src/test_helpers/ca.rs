@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,17 +41,23 @@ use crate::{
 #[derive(Clone)]
 pub struct CaServer {
     response: watch::Receiver<Result<IstioCertificateResponse, tonic::Status>>,
+    request: watch::Sender<Option<IstioCertificateRequest>>,
 }
 
 impl CaServer {
     pub async fn spawn() -> (
         watch::Sender<Result<IstioCertificateResponse, tonic::Status>>,
         CaClient,
+        watch::Receiver<Option<IstioCertificateRequest>>,
     ) {
         let default = Err(tonic::Status::not_found("mock not set"));
         let (tx, rx) = watch::channel(default);
 
-        let server = CaServer { response: rx };
+        let (request_tx, request_rx) = watch::channel(None);
+        let server = CaServer {
+            response: rx,
+            request: request_tx,
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
         let certs = tls::mock::generate_test_certs(
@@ -91,15 +98,16 @@ impl CaServer {
         )
         .await
         .unwrap();
-        (tx, client)
+        (tx, client, request_rx)
     }
 }
 #[async_trait]
 impl IstioCertificateService for CaServer {
     async fn create_certificate(
         &self,
-        _request: tonic::Request<IstioCertificateRequest>,
+        request: tonic::Request<IstioCertificateRequest>,
     ) -> Result<tonic::Response<IstioCertificateResponse>, tonic::Status> {
+        self.request.send_replace(Some(request.into_inner()));
         let b = self.response.borrow();
         match &*b {
             Ok(res) => Ok(tonic::Response::new(res.clone())),
