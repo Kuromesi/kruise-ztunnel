@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -187,8 +188,8 @@ impl CaClient {
             vec![]
         };
         let certs = tls::WorkloadCertificate::new(&private_key, leaf, chain)?;
-        // Make the certificate actually matches the identity we requested.
-        if self.enable_impersonated_identity && certs.identity().as_ref() != Some(id) {
+        // Sidecar and delegated requests must receive the requested identity.
+        if certs.identity().as_ref() != Some(id) {
             error!("expected identity {:?}, got {:?}", id, certs.identity());
             return Err(Error::SanError(id.to_owned()));
         }
@@ -275,11 +276,16 @@ pub mod mock {
             &self,
             id: &Identity,
         ) -> Result<tls::WorkloadCertificate, Error> {
-            let Identity::Spiffe {
+            let (Identity::ServiceAccount {
                 trust_domain: td,
                 namespace: ns,
                 ..
-            } = id;
+            }
+            | Identity::Workload {
+                trust_domain: td,
+                namespace: ns,
+                ..
+            }) = id;
             if td == "error" {
                 return Err(match ns.as_str() {
                     "forgotten" => Error::Forgotten,
@@ -346,7 +352,7 @@ mod tests {
     async fn test_ca_client_with_response(
         res: IstioCertificateResponse,
     ) -> Result<tls::WorkloadCertificate, Error> {
-        let (mock, ca_client) = test_helpers::ca::CaServer::spawn().await;
+        let (mock, ca_client, _) = test_helpers::ca::CaServer::spawn().await;
         mock.send(Ok(res)).unwrap();
         ca_client.fetch_certificate(&Identity::default()).await
     }
@@ -360,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_identity() {
-        let id = Identity::Spiffe {
+        let id = Identity::ServiceAccount {
             service_account: "wrong-sa".into(),
             namespace: "foo".into(),
             trust_domain: "cluster.local".into(),
@@ -414,5 +420,67 @@ mod tests {
             !manager.take_dirty(),
             "take_dirty must return false after reset"
         );
+    }
+
+    #[tokio::test]
+    async fn workload_certificate_requests() {
+        use x509_parser::prelude::*;
+
+        let requested: Identity = "spiffe://cluster.local/cluster/prod-a/ns/demo/workload/worker-0"
+            .parse()
+            .unwrap();
+        let certs = tls::mock::generate_test_certs(
+            &requested.clone().into(),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+        let (responses, mut client, requests) = test_helpers::ca::CaServer::spawn().await;
+        responses
+            .send(Ok(IstioCertificateResponse {
+                cert_chain: certs.full_chain_and_roots(),
+            }))
+            .unwrap();
+
+        for impersonated in [false, true] {
+            client.enable_impersonated_identity = impersonated;
+            let certificate = client.fetch_certificate(&requested).await.unwrap();
+            assert_eq!(certificate.identity(), Some(requested.clone()));
+            let request = requests.borrow().clone().unwrap();
+            let (_, pem) = x509_parser::pem::parse_x509_pem(request.csr.as_bytes()).unwrap();
+            let (_, csr) = X509CertificationRequest::from_der(&pem.contents).unwrap();
+            csr.verify_signature().unwrap();
+            assert!(csr.requested_extensions().unwrap().any(|extension| {
+                matches!(extension, ParsedExtension::SubjectAlternativeName(san)
+                    if san.general_names == vec![GeneralName::URI(&requested.to_string())])
+            }));
+            if impersonated {
+                let metadata = request.metadata.unwrap();
+                assert_eq!(metadata.fields.len(), 1);
+                assert_eq!(
+                    metadata.fields["ImpersonatedIdentity"].kind,
+                    Some(prost_types::value::Kind::StringValue(requested.to_string()))
+                );
+            } else {
+                assert!(request.metadata.is_none());
+            }
+        }
+
+        let old = tls::mock::generate_test_certs(
+            &Identity::default().into(),
+            Duration::ZERO,
+            Duration::from_secs(60),
+        );
+        responses
+            .send(Ok(IstioCertificateResponse {
+                cert_chain: old.full_chain_and_roots(),
+            }))
+            .unwrap();
+        for impersonated in [false, true] {
+            client.enable_impersonated_identity = impersonated;
+            assert_matches!(
+                client.fetch_certificate(&requested).await,
+                Err(Error::SanError(_))
+            );
+        }
     }
 }

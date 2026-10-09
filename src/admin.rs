@@ -596,7 +596,7 @@ mod tests {
         });
         for i in 0..2 {
             manager
-                .fetch_certificate(&identity::Identity::Spiffe {
+                .fetch_certificate(&identity::Identity::ServiceAccount {
                     trust_domain: "trust_domain".into(),
                     namespace: "namespace".into(),
                     service_account: strng::format!("sa-{i}"),

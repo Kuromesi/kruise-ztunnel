@@ -542,7 +542,7 @@ impl OutboundConnection {
                     Err(e) => return Some(Err(e)),
                 };
                 let actual_destination = waypoint.workload_socket_addr();
-                let upstream_sans = waypoint.workload_and_services_san();
+                let upstream_sans = waypoint.gateway_sans();
                 Some(Ok(Request {
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload.clone(),

@@ -20,7 +20,6 @@ mod namespaced {
     use std::collections::HashMap;
     use ztunnel::state::workload::ApplicationTunnel;
     use ztunnel::state::workload::application_tunnel::Protocol;
-    use ztunnel::test_helpers::linux::TestMode;
 
     use std::net::{IpAddr, SocketAddr};
 
@@ -183,7 +182,7 @@ mod namespaced {
             ("message", "connection complete"),
             (
                 "src.identity",
-                "spiffe://cluster.local/ns/default/sa/client",
+                "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/client",
             ),
             (
                 "dst.identity",
@@ -251,7 +250,7 @@ mod namespaced {
             ("message", "connection complete"),
             (
                 "src.identity",
-                "spiffe://cluster.local/ns/default/sa/client",
+                "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/client",
             ),
             (
                 "dst.identity",
@@ -332,7 +331,7 @@ mod namespaced {
             ("message", "connection complete"),
             (
                 "src.identity",
-                "spiffe://cluster.local/ns/default/sa/client",
+                "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/client",
             ),
             (
                 "dst.identity",
@@ -400,7 +399,7 @@ mod namespaced {
             ("message", "connection complete"),
             (
                 "src.identity",
-                "spiffe://cluster.local/ns/default/sa/client",
+                "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/client",
             ),
             (
                 "dst.identity",
@@ -417,8 +416,19 @@ mod namespaced {
 
         let _zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
 
+        // This gateway runs through ztunnel and presents its Pod identity.
+        manager
+            .service_builder("waypoint")
+            .ports(HashMap::from([(15008, 15008)]))
+            .subject_alt_names(vec![
+                "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/waypoint".into(),
+            ])
+            .register()
+            .await?;
+
         let waypoint = manager
             .workload_builder("waypoint", DEFAULT_NODE)
+            .service("default/waypoint.default.svc.cluster.local", 15008, 15008)
             .mutate_workload(|w| {
                 w.application_tunnel = Some(ApplicationTunnel {
                     protocol: Protocol::NONE,
@@ -427,7 +437,6 @@ mod namespaced {
             })
             .register()
             .await?;
-        let waypoint_ip = waypoint.ip();
 
         let server = manager
             .workload_builder("server", DEFAULT_NODE)
@@ -438,7 +447,7 @@ mod namespaced {
 
         let client = manager
             .workload_builder("client", DEFAULT_NODE)
-            .egress_gateway(waypoint_ip)
+            .egress_gateway_hostname("waypoint.default.svc.cluster.local")
             .register()
             .await?;
 
@@ -462,6 +471,10 @@ mod namespaced {
                 network: strng::EMPTY,
                 address: waypoint_ip,
             }])
+            // This gateway runs through ztunnel and presents its Pod identity.
+            .subject_alt_names(vec![
+                "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/waypoint".into(),
+            ])
             .register()
             .await?;
 
@@ -653,9 +666,10 @@ mod namespaced {
                     .unwrap();
 
                 let id = &identity::Identity::default();
-                let dst_id =
-                    identity::Identity::from_str("spiffe://cluster.local/ns/default/sa/server")
-                        .unwrap();
+                let dst_id = identity::Identity::from_str(
+                    "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/server",
+                )
+                .unwrap();
                 let cert = zt.cert_manager.fetch_certificate(id).await?;
                 let connector = cert.outbound_connector(vec![dst_id]).unwrap();
                 let tcp_stream = TcpStream::connect(SocketAddr::from((srv.ip(), 15008)))
@@ -735,9 +749,10 @@ mod namespaced {
                     .unwrap();
 
                 let id = &identity::Identity::default();
-                let dst_id =
-                    identity::Identity::from_str("spiffe://cluster.local/ns/default/sa/server")
-                        .unwrap();
+                let dst_id = identity::Identity::from_str(
+                    "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/server",
+                )
+                .unwrap();
                 let cert = zt.cert_manager.fetch_certificate(id).await?;
                 let connector = cert.outbound_connector(vec![dst_id]).unwrap();
                 let tcp_stream = TcpStream::connect(SocketAddr::from((srv.ip(), 15008)))
@@ -833,7 +848,7 @@ mod namespaced {
     #[tokio::test]
     async fn egress_gateway_trust_domain_mismatch_rejected() -> anyhow::Result<()> {
         let mut manager = setup_netns_test!(Shared);
-        let id = identity::Identity::Spiffe {
+        let id = identity::Identity::ServiceAccount {
             trust_domain: "clusterset.local".into(), // change to mismatched trustdomain
             service_account: "my-app".into(),
             namespace: "default".into(),
@@ -884,15 +899,20 @@ mod namespaced {
     async fn test_prefetch_forget_certs() -> anyhow::Result<()> {
         // TODO: this test doesn't really need namespacing, but the direct test doesn't allow dynamic config changes.
         let mut manager = setup_netns_test!(Shared);
-        let id1 = identity::Identity::Spiffe {
+        let id1 = identity::Identity::ServiceAccount {
             trust_domain: "cluster.local".into(),
             service_account: "sa1".into(),
             namespace: "default".into(),
         };
-        let id1s = id1.to_string();
+        let id1s = "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/id1-a-same-node"
+            .to_string();
+        let id2s = "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/id1-b-same-node"
+            .to_string();
 
         let ta = manager.deploy_ztunnel(DEFAULT_NODE).await?;
-        let ztunnel_identity_obj = ta.ztunnel_identity.as_ref().unwrap().clone();
+        let ztunnel_identity_obj = identity::Identity::from_str(
+            "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/ztunnel-node",
+        )?;
         ta.cert_manager
             .fetch_certificate(&ztunnel_identity_obj)
             .await?;
@@ -951,37 +971,28 @@ mod namespaced {
             .register()
             .await?;
         check(
-            vec![ztunnel_identity_str.clone(), id1s.clone()],
-            "multiple of same identity shouldn't do anything",
+            vec![ztunnel_identity_str.clone(), id1s.clone(), id2s.clone()],
+            "Pods sharing a service account need separate certificates",
         )
         .await;
         manager.delete_workload("id1-a-remote-node").await?;
         // Deleting remote node should not affect local certs if local workloads still exist
         check(
-            vec![ztunnel_identity_str.clone(), id1s.clone()],
+            vec![ztunnel_identity_str.clone(), id1s.clone(), id2s.clone()],
             "removing remote node shouldn't impact anything",
         )
         .await;
         manager.delete_workload("id1-b-same-node").await?;
-        // Deleting one local node shouldn't impact certs if another local workload still exists
+        // Remove only the deleted Pod's certificate.
         check(
             vec![ztunnel_identity_str.clone(), id1s.clone()],
-            "removing local node shouldn't impact anything if I still have some running",
+            "removing one Pod preserves the other Pod's certificate",
         )
         .await;
         manager.delete_workload("id1-a-same-node").await?;
-        // After deleting all workloads using sa1, give cert manager time to clean up
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // In shared mode, certificates may be kept alive by the inbound listener
-        // for handling inbound connections, even after workload deletion
-        let expected_certs = match manager.mode() {
-            TestMode::Shared => vec![ztunnel_identity_str.clone(), id1s.clone()],
-            TestMode::Dedicated => vec![ztunnel_identity_str.clone()],
-        };
         check(
-            expected_certs,
-            "removing final workload should clear certs except those needed by inbound listener",
+            vec![ztunnel_identity_str.clone()],
+            "removing the final Pod clears its certificate",
         )
         .await;
         Ok(())
@@ -999,14 +1010,23 @@ mod namespaced {
         let target_metrics_addr = SocketAddr::new(ztunnel_node_ip, zt.metrics_address.port());
         let target_metrics_url = format!("http://{target_metrics_addr}/metrics");
 
-        // Deploy a client workload (simulating Prometheus)
-        let client = manager
-            .workload_builder("client", DEFAULT_NODE)
-            .egress_gateway(ztunnel_node_ip)
+        let zt_identity_str =
+            "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/ztunnel-node";
+        // This test uses ztunnel itself as the gateway, so publish its Pod identity explicitly.
+        manager
+            .service_builder("ztunnel-metrics")
+            .ports(HashMap::from([(15008, 15008)]))
+            .subject_alt_names(vec![zt_identity_str.into()])
+            .endpoint("cluster1//v1/Pod/default/ztunnel-node")
             .register()
             .await?;
 
-        let zt_identity_str = zt.ztunnel_identity.as_ref().unwrap().to_string();
+        // Deploy a client workload (simulating Prometheus)
+        let client = manager
+            .workload_builder("client", DEFAULT_NODE)
+            .egress_gateway_hostname("ztunnel-metrics.default.svc.cluster.local")
+            .register()
+            .await?;
 
         // Client makes a standard HTTP GET request to ztunnel's metrics endpoint
         // The explicit gateway policy sends HBONE to ztunnel's inbound listener,
@@ -1068,9 +1088,9 @@ mod namespaced {
             ("message", "connection complete"), // Assuming success
             (
                 "src.identity",
-                "spiffe://cluster.local/ns/default/sa/client",
+                "spiffe://cluster.local/cluster/Kubernetes/ns/default/workload/client",
             ), // Client identity
-            ("dst.identity", zt_identity_str.as_str()), // Ztunnel identity
+            ("dst.identity", zt_identity_str),  // Ztunnel identity
         ]);
         telemetry::testing::assert_contains(want);
 

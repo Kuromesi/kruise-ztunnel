@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -247,7 +248,7 @@ impl HboneTestServer {
 
     pub async fn run(self) {
         let certs = tls::mock::generate_test_certs(
-            &identity::Identity::Spiffe {
+            &identity::Identity::ServiceAccount {
                 trust_domain: "cluster.local".into(),
                 namespace: "default".into(),
                 service_account: self.name.clone().into(),

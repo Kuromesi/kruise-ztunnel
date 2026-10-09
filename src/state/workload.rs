@@ -339,7 +339,16 @@ impl Workload {
     }
 
     pub fn identity(&self) -> Identity {
-        Identity::Spiffe {
+        Identity::Workload {
+            trust_domain: self.trust_domain.clone(),
+            cluster: self.cluster_id.clone(),
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+        }
+    }
+
+    pub fn service_account_identity(&self) -> Identity {
+        Identity::ServiceAccount {
             trust_domain: self.trust_domain.clone(),
             namespace: self.namespace.clone(),
             service_account: self.service_account.clone(),
@@ -768,28 +777,6 @@ pub fn network_addr(network: Strng, vip: IpAddr) -> NetworkAddress {
     }
 }
 
-/// WorkloadIdentity provides information about a workloads identity. This is used in place of Identity
-/// in places where we do not have the full identity (no trust domain) and know we are working with workloads specifically.
-#[derive(Debug, Hash, Eq, PartialEq)]
-struct WorkloadIdentity {
-    namespace: Strng,
-    service_account: Strng,
-}
-
-impl From<&Identity> for WorkloadIdentity {
-    fn from(value: &Identity) -> Self {
-        let Identity::Spiffe {
-            namespace,
-            service_account,
-            ..
-        } = value;
-        WorkloadIdentity {
-            namespace: namespace.clone(),
-            service_account: service_account.clone(),
-        }
-    }
-}
-
 /// A WorkloadStore encapsulates all information about workloads in the mesh
 #[derive(Debug)]
 pub struct WorkloadStore {
@@ -803,8 +790,8 @@ pub struct WorkloadStore {
     by_addr: HashMap<NetworkAddress, WorkloadByAddr>,
     /// by_uid maps workload UIDs to workloads
     pub(super) by_uid: HashMap<Strng, Arc<Workload>>,
-    // Identity->Set of UIDs. Only stores local nodes
-    node_local_by_identity: HashMap<WorkloadIdentity, HashSet<Strng>>,
+    // (namespace, Pod name) -> set of UIDs. Only stores local nodes
+    node_local_by_name: HashMap<(Strng, Strng), HashSet<Strng>>,
 }
 
 #[derive(Debug)]
@@ -882,7 +869,7 @@ impl WorkloadStore {
             local_node,
             insert_notifier: Sender::new(()),
             by_addr: Default::default(),
-            node_local_by_identity: Default::default(),
+            node_local_by_name: Default::default(),
             by_uid: Default::default(),
         }
     }
@@ -910,8 +897,8 @@ impl WorkloadStore {
         self.by_uid.insert(w.uid.clone(), w.clone());
         // Only track local nodes to avoid overhead
         if self.local_node.is_none() || self.local_node.as_ref() == Some(&w.node) {
-            self.node_local_by_identity
-                .entry((&w.identity()).into())
+            self.node_local_by_name
+                .entry((w.namespace.clone(), w.name.clone()))
                 .or_default()
                 .insert(w.uid.clone());
         }
@@ -938,11 +925,11 @@ impl WorkloadStore {
                         }
                     }
                 }
-                let id = (&prev.identity()).into();
-                if let Some(set) = self.node_local_by_identity.get_mut(&id) {
+                let id = (prev.namespace.clone(), prev.name.clone());
+                if let Some(set) = self.node_local_by_name.get_mut(&id) {
                     set.remove(&prev.uid);
                     if set.is_empty() {
-                        self.node_local_by_identity.remove(&id);
+                        self.node_local_by_name.remove(&id);
                     }
                 }
 
@@ -958,13 +945,9 @@ impl WorkloadStore {
 
     /// Finds the workload by workload information, as an arc.
     pub fn find_by_info(&self, wl: &WorkloadInfo) -> Option<Arc<Workload>> {
-        // We do not have an index directly on the full workload info, but we can narrow it down
-        // to only workloads on the same node with the same identity -- a tiny set to iterate over
-        self.node_local_by_identity
-            .get(&WorkloadIdentity {
-                namespace: strng::new(&wl.namespace),
-                service_account: strng::new(&wl.service_account),
-            })?
+        // Match Pod name and namespace first, then verify the service account.
+        self.node_local_by_name
+            .get(&(strng::new(&wl.namespace), strng::new(&wl.name)))?
             .iter()
             .find_map(|uid| self.by_uid.get(uid).filter(|w| wl.matches(w)).cloned())
     }
@@ -974,13 +957,24 @@ impl WorkloadStore {
         self.by_uid.get(uid).cloned()
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Arc<Workload>> {
+        self.by_uid.values()
+    }
+
     // was_last_identity_on_node is a specialized function to help determine if we should clear a certificate.
-    // It is called when a workload is removed, with the node and identity of the workload
-    pub fn was_last_identity_on_node(&self, node_name: &Strng, identity: &Identity) -> bool {
-        if self.local_node.is_none() || self.local_node.as_ref() == Some(node_name) {
+    // It is called after removing a workload.
+    pub fn was_last_identity_on_node(&self, workload: &Workload) -> bool {
+        if self.local_node.is_none() || self.local_node.as_ref() == Some(&workload.node) {
             // This was a workload on the node... now check if there are any remaining workloads with
             // this identity on the node.
-            !self.node_local_by_identity.contains_key(&identity.into())
+            let identity = workload.identity();
+            !self
+                .node_local_by_name
+                .get(&(workload.namespace.clone(), workload.name.clone()))
+                .into_iter()
+                .flatten()
+                .filter_map(|uid| self.by_uid.get(uid))
+                .any(|w| w.identity() == identity)
         } else {
             false
         }
@@ -1039,6 +1033,64 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::RwLock;
     use xds::istio::workload::NetworkAddress as XdsNetworkAddress;
+
+    #[test]
+    fn named_identity_and_local_discovery() {
+        let first = Workload {
+            uid: "pod-1".into(),
+            name: "worker-0".into(),
+            namespace: "demo".into(),
+            node: "node-1".into(),
+            cluster_id: "prod-a".into(),
+            workload_name: "worker".into(),
+            ..test_helpers::test_default_workload()
+        };
+        let second = Workload {
+            uid: "pod-2".into(),
+            name: "worker-1".into(),
+            ..first.clone()
+        };
+        assert_eq!(
+            first.identity().to_string(),
+            "spiffe://cluster.local/cluster/prod-a/ns/demo/workload/worker-0"
+        );
+        assert_ne!(first.identity(), second.identity());
+        assert_eq!(
+            first.service_account_identity(),
+            second.service_account_identity()
+        );
+
+        let mut store = WorkloadStore::new(Some(first.node.clone()));
+        store.insert(Arc::new(first.clone()));
+        store.insert(Arc::new(second.clone()));
+        let mut info = WorkloadInfo::new("worker-0".into(), "demo".into(), "default".into());
+        assert_eq!(store.find_by_info(&info).unwrap().uid, first.uid);
+        info.service_account = "wrong".into();
+        assert!(store.find_by_info(&info).is_none());
+        store.remove(&first.uid);
+        assert!(store.was_last_identity_on_node(&first));
+        assert!(!store.was_last_identity_on_node(&second));
+
+        let replacement = Workload {
+            uid: "pod-3".into(),
+            ..first.clone()
+        };
+        assert_eq!(first.identity(), replacement.identity());
+        store.insert(Arc::new(replacement.clone()));
+        assert!(!store.was_last_identity_on_node(&first));
+        store.remove(&replacement.uid);
+        let other_cluster = Workload {
+            cluster_id: "prod-b".into(),
+            ..replacement
+        };
+        store.insert(Arc::new(other_cluster));
+        assert!(store.was_last_identity_on_node(&first));
+        let remote = Workload {
+            node: "node-2".into(),
+            ..first
+        };
+        assert!(!store.was_last_identity_on_node(&remote));
+    }
 
     #[test]
     fn native_policy_reference_decoding() {

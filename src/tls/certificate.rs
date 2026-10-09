@@ -303,9 +303,7 @@ impl WorkloadCertificate {
         &self,
         crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
     ) -> Result<ServerConfig, Error> {
-        let td = self.cert.identity().map(|i| match i {
-            Identity::Spiffe { trust_domain, .. } => trust_domain,
-        });
+        let td = self.cert.identity().map(|i| i.trust_domain());
 
         // build the base client cert verifier with optional CRL support
         let mut builder = WebPkiClientVerifier::builder_with_provider(

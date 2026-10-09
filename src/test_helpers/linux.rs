@@ -134,7 +134,7 @@ impl WorkloadManager {
         // These are used for registering ztunnel as a workload and for cfg.ztunnel_identity/workload.
         let ztunnel_shared_identity: Option<identity::Identity> = if proxy_mode == ProxyMode::Shared
         {
-            Some(identity::Identity::Spiffe {
+            Some(identity::Identity::ServiceAccount {
                 trust_domain: "cluster.local".into(),
                 namespace: "default".into(),
                 service_account: ztunnel_name.clone().into(),
@@ -344,13 +344,13 @@ impl WorkloadManager {
 
     /// workload_builder allows creating a new workload. It will run in its own network namespace.
     pub fn workload_builder(&mut self, name: &str, node: &str) -> TestWorkloadBuilder<'_> {
-        TestWorkloadBuilder::new(name, self)
-            .on_node(node)
-            .identity(identity::Identity::Spiffe {
+        TestWorkloadBuilder::new(name, self).on_node(node).identity(
+            identity::Identity::ServiceAccount {
                 trust_domain: "cluster.local".into(),
                 namespace: "default".into(),
                 service_account: name.into(),
-            })
+            },
+        )
     }
 
     /// service_builder allows creating a new service
@@ -364,7 +364,7 @@ impl WorkloadManager {
         TestWorkloadBuilder::new(name, self)
             .on_node(node)
             .uncaptured() // Waypoints are not captured.
-            .identity(identity::Identity::Spiffe {
+            .identity(identity::Identity::ServiceAccount {
                 trust_domain: "cluster.local".into(),
                 namespace: "default".into(),
                 service_account: name.into(),
@@ -422,6 +422,18 @@ impl<'a> TestServiceBuilder<'a> {
 
     pub fn subject_alt_names(mut self, mut sans: Vec<ArcStr>) -> Self {
         self.s.subject_alt_names.append(&mut sans);
+        self
+    }
+
+    pub fn endpoint(mut self, workload_uid: &str) -> Self {
+        self.s.endpoints.insert(
+            workload_uid.into(),
+            Endpoint {
+                workload_uid: workload_uid.into(),
+                port: Default::default(),
+                status: HealthStatus::Healthy,
+            },
+        );
         self
     }
 
@@ -496,7 +508,7 @@ impl<'a> TestWorkloadBuilder<'a> {
 
     pub fn identity(mut self, identity: identity::Identity) -> Self {
         match identity {
-            identity::Identity::Spiffe {
+            identity::Identity::ServiceAccount {
                 trust_domain,
                 namespace,
                 service_account,
@@ -504,6 +516,17 @@ impl<'a> TestWorkloadBuilder<'a> {
                 self.w.workload.service_account = service_account;
                 self.w.workload.namespace = namespace;
                 self.w.workload.trust_domain = trust_domain;
+            }
+            identity::Identity::Workload {
+                trust_domain,
+                cluster,
+                namespace,
+                name,
+            } => {
+                self.w.workload.trust_domain = trust_domain;
+                self.w.workload.cluster_id = cluster;
+                self.w.workload.namespace = namespace;
+                self.w.workload.name = name;
             }
         }
         self

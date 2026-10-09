@@ -64,7 +64,7 @@ pub struct Upstream {
     /// Port is the port we should connect to
     pub port: u16,
     /// Service SANs defines SANs defined at the service level *only*. A complete view of things requires
-    /// looking at workload.identity() as well.
+    /// looking at the gateway's service-account identity as well.
     pub service_sans: Vec<Strng>,
 }
 
@@ -78,7 +78,7 @@ impl Upstream {
     pub fn workload_socket_addr(&self) -> SocketAddr {
         SocketAddr::new(self.selected_workload_ip, self.port)
     }
-    pub fn workload_and_services_san(&self) -> Vec<Identity> {
+    pub fn gateway_sans(&self) -> Vec<Identity> {
         self.service_sans
             .iter()
             .flat_map(|san| match Identity::from_str(san) {
@@ -88,7 +88,7 @@ impl Upstream {
                     None
                 }
             })
-            .chain(std::iter::once(self.workload.identity()))
+            .chain(std::iter::once(self.workload.service_account_identity()))
             .collect()
     }
 }
@@ -894,6 +894,27 @@ mod tests {
     use crate::{strng, test_helpers};
     use test_case::test_case;
 
+    #[test]
+    fn gateway_sans_preserve_service_account_identity() {
+        let gateway = Workload {
+            name: "egress-0".into(),
+            namespace: "demo".into(),
+            service_account: "egress".into(),
+            ..test_helpers::test_default_workload()
+        };
+        let expected = gateway.service_account_identity();
+        let upstream = Upstream {
+            workload: Arc::new(gateway),
+            selected_workload_ip: "127.0.0.1".parse().unwrap(),
+            port: 15008,
+            service_sans: vec!["spiffe://cluster.local/ns/demo/sa/other-egress".into()],
+        };
+        let sans = upstream.gateway_sans();
+        assert_eq!(sans.len(), 2);
+        assert_eq!(sans[1], expected);
+        assert!(!sans.contains(&upstream.workload.identity()));
+    }
+
     #[tokio::test]
     async fn sandbox_discovery_allows_shared_startup_without_workload_or_xds_address() {
         let mut config = test_helpers::test_config();
@@ -1172,7 +1193,7 @@ mod tests {
         crate::state::ProxyRbacContext {
             sandbox: None,
             conn: rbac::Connection {
-                src_identity: Some(Identity::Spiffe {
+                src_identity: Some(Identity::ServiceAccount {
                     trust_domain: "cluster.local".into(),
                     namespace: "default".into(),
                     service_account: src_svc_acct.to_string().into(),

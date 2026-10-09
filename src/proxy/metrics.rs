@@ -373,13 +373,18 @@ impl CommonTrafficLabels {
         self
     }
 
-    fn with_destination(mut self, w: Option<&Workload>) -> Self {
+    fn with_destination(mut self, w: Option<&Workload>, reporter: Reporter) -> Self {
         let Some(w) = w else { return self };
         self.destination_workload = w.workload_name.clone().into();
         self.destination_canonical_service = w.canonical_name.clone().into();
         self.destination_canonical_revision = w.canonical_revision.clone().into();
         self.destination_workload_namespace = w.namespace.clone().into();
-        self.destination_principal = w.identity().into();
+        // Outbound HBONE destinations are gateways with shared SA identities.
+        self.destination_principal = match reporter {
+            Reporter::source => w.service_account_identity(),
+            Reporter::destination => w.identity(),
+        }
+        .into();
         self.destination_app = w.canonical_name.clone().into();
         self.destination_version = w.canonical_revision.clone().into();
         self.destination_cluster = w.cluster_id.to_string().into();
@@ -412,7 +417,7 @@ impl From<ConnectionOpen> for CommonTrafficLabels {
                 // Intentionally before with_source; source is more reliable
                 .with_derived_source(c.derived_source.as_ref())
                 .with_source(c.source.as_deref())
-                .with_destination(c.destination.as_deref())
+                .with_destination(c.destination.as_deref(), c.reporter)
                 .with_destination_service(c.destination_service.as_ref())
         }
     }

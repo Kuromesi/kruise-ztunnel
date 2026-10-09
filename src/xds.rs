@@ -194,11 +194,7 @@ impl ProxyStateUpdateMutator {
 
             // This is a real removal (not a removal before insertion), and nothing else references the cert
             // Clear it out
-            if !for_workload_insert
-                && state
-                    .workloads
-                    .was_last_identity_on_node(&prev.node, &prev.identity())
-            {
+            if !for_workload_insert && state.workloads.was_last_identity_on_node(&prev) {
                 self.cert_fetcher.clear_cert(&prev.identity());
             }
             if !for_workload_insert {
@@ -498,6 +494,11 @@ impl LocalClient {
             next.services.insert(svc);
         }
         let mut state = self.state.write().unwrap();
+        for workload in state.workloads.iter() {
+            if next.workloads.was_last_identity_on_node(workload) {
+                self.cert_fetcher.clear_cert(&workload.identity());
+            }
+        }
         state.workloads = next.workloads;
         state.services = next.services;
         state.sandboxes = next.sandboxes;

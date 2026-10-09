@@ -29,6 +29,41 @@ fn client(cfg: ConfigSource) -> LocalClient {
     }
 }
 
+#[test]
+fn local_reload_clears_only_removed_workload_certificates() {
+    #[derive(Default)]
+    struct Fetcher(std::sync::Mutex<Vec<crate::identity::Identity>>);
+    impl crate::cert_fetcher::CertFetcher for Fetcher {
+        fn prefetch_cert(&self, _: &Workload) {}
+        fn clear_cert(&self, id: &crate::identity::Identity) {
+            self.0.lock().unwrap().push(id.clone());
+        }
+    }
+
+    let fetcher = Arc::new(Fetcher::default());
+    let mut client = client(ConfigSource::Static(CONFIG.into()));
+    client.cert_fetcher = fetcher.clone();
+    let mut config: LocalConfig = serde_yaml::from_str(CONFIG).unwrap();
+    let mut second = config.workloads[0].clone();
+    second.workload.name = "second".into();
+    second.workload.uid = "second-uid".into();
+    let second_identity = second.workload.identity();
+    config.workloads.push(second);
+    client.load_config(config.clone()).unwrap();
+    let first_identity = config.workloads[0].workload.identity();
+    config.workloads[0].workload.uid = "replacement-uid".into();
+    client.load_config(config.clone()).unwrap();
+    assert!(fetcher.0.lock().unwrap().is_empty());
+    config.workloads.pop();
+    client.load_config(config).unwrap();
+    assert_eq!(*fetcher.0.lock().unwrap(), vec![second_identity.clone()]);
+    client.load_config(LocalConfig::default()).unwrap();
+    assert_eq!(
+        *fetcher.0.lock().unwrap(),
+        vec![second_identity, first_identity]
+    );
+}
+
 fn proxy_state(client: &LocalClient) -> DemandProxyState {
     DemandProxyState::new(
         client.state.clone(),

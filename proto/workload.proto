@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -216,10 +217,12 @@ message Workload {
   // Protocol that should be used to connect to this workload.
   TunnelProtocol tunnel_protocol = 5;
 
-  // The SPIFFE identity of the workload. The identity is joined to form spiffe://<trust_domain>/ns/<namespace>/sa/<service_account>.
+  // Workload identity: spiffe://<trust_domain>/cluster/<cluster_id>/ns/<namespace>/workload/<name>.
+  // Gateway and service-account identity: spiffe://<trust_domain>/ns/<namespace>/sa/<service_account>.
   // TrustDomain of the workload. May be elided if this is the mesh wide default (typically cluster.local)
   string trust_domain = 6;
-  // ServiceAccount of the workload. May be elided if this is "default"
+  // Kubernetes service account used for workload discovery.
+  // Also used for gateway and service-account certificate identities. May be elided if this is "default"
   string service_account = 7;
 
   // If present, the waypoint proxy for this workload.

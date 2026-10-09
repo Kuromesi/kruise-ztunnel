@@ -256,12 +256,9 @@ impl LocalWorkloadInformation {
             .get_workload()
             .await
             .map_err(|_| identity::Error::UnknownWorkload(self.workload_info()))?;
-        let id = &Identity::Spiffe {
-            trust_domain: wl.trust_domain.clone(),
-            namespace: (&self.wi.namespace).into(),
-            service_account: (&self.wi.service_account).into(),
-        };
-        self.full_cert_manager.fetch_certificate(id).await
+        self.full_cert_manager
+            .fetch_certificate(&wl.identity())
+            .await
     }
 
     pub fn workload_info(&self) -> Arc<WorkloadInfo> {
@@ -957,6 +954,41 @@ impl TryFrom<&http::Uri> for HboneAddress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_certificate_uses_wds_pod_identity() {
+        use crate::test_helpers;
+        use crate::xds::istio::workload::Workload as XdsWorkload;
+
+        let workload = XdsWorkload {
+            uid: "pod-uid".into(),
+            cluster_id: "prod-a".into(),
+            name: "worker-0".into(),
+            namespace: "demo".into(),
+            service_account: "shared".into(),
+            workload_name: "worker".into(),
+            ..Default::default()
+        };
+        let local = LocalWorkloadInformation::new(
+            Arc::new(WorkloadInfo::new(
+                "worker-0".into(),
+                "demo".into(),
+                "shared".into(),
+            )),
+            test_helpers::new_proxy_state(&[workload], &[], &[]),
+            identity::mock::new_secret_manager(Duration::from_secs(60)),
+        );
+        assert_eq!(
+            local
+                .fetch_certificate()
+                .await
+                .unwrap()
+                .identity()
+                .unwrap()
+                .to_string(),
+            "spiffe://cluster.local/cluster/prod-a/ns/demo/workload/worker-0"
+        );
+    }
 
     #[test]
     fn new_udp_v4_is_unbound_so_the_caller_can_set_pre_bind_options() {
