@@ -83,7 +83,7 @@ fn resource(id: &str, workload_uid: &str) -> XdsResource<XdsSandbox> {
 }
 
 #[test]
-fn unsupported_extension_retains_last_accepted_sandbox() {
+fn unknown_extension_allows_sandbox_update() {
     let mut store = SandboxStore::default();
     store.update(resource("sandbox", "original")).unwrap();
     let mut update = resource("sandbox", "replacement");
@@ -91,14 +91,14 @@ fn unsupported_extension_retains_last_accepted_sandbox() {
         type_url: "type.googleapis.com/unknown.Policy".into(),
         value: Vec::new(),
     });
-    assert!(store.update(update).is_err());
+    assert!(store.update(update).unwrap());
     assert_eq!(
         store
             .get(&"sandbox".into())
             .unwrap()
             .workload_uid
             .as_deref(),
-        Some("original")
+        Some("replacement")
     );
 }
 

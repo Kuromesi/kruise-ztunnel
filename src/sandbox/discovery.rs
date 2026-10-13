@@ -56,15 +56,12 @@ impl TryFrom<XdsSandbox> for Sandbox {
             .map(|attester| attester.workload_uid.into());
         let mut sni_policy: Option<SniTrafficPolicy> = None;
         for extension in resource.extensions {
-            match extension.type_url.as_str() {
-                SNI_POLICY_TYPE_URL => {
-                    let policy = SniTrafficPolicy::decode(&extension.value)?;
-                    sni_policy
-                        .get_or_insert_with(Default::default)
-                        .rules
-                        .extend(policy.rules);
-                }
-                type_url => anyhow::bail!("unsupported Sandbox extension: {type_url}"),
+            if extension.type_url == SNI_POLICY_TYPE_URL {
+                let policy = SniTrafficPolicy::decode(&extension.value)?;
+                sni_policy
+                    .get_or_insert_with(Default::default)
+                    .rules
+                    .extend(policy.rules);
             }
         }
         let sandbox = Self {
