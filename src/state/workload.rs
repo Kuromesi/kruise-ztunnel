@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::extensions::sni::{SNI_POLICY_TYPE_URL, SniPolicyError, SniTrafficPolicy};
 use crate::identity::Identity;
 use crate::rbac::{TrafficPolicy, TrafficPolicyStore};
 use prost::Message;
@@ -291,8 +290,6 @@ pub struct Workload {
     /// None means the native binding has not been delivered; Some([]) permits an empty stage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_policy_refs: Option<Vec<Strng>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sni_policy: Option<SniTrafficPolicy>,
 }
 
 fn default_capacity() -> u32 {
@@ -331,9 +328,6 @@ impl Workload {
                     )));
                 }
             }
-        }
-        if let Some(policy) = &self.sni_policy {
-            policy.validate()?;
         }
         Ok(())
     }
@@ -501,7 +495,6 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
         let mut metadata: Option<WorkloadMetadata> = None;
         let mut egress_policies: Option<EgressPolicies> = None;
         let mut traffic_policy_refs = None;
-        let mut sni_policy = None;
 
         for extension in resource.extensions.into_iter() {
             if extension.name == "traffic-policy-reference" {
@@ -528,19 +521,6 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
                 }
                 traffic_policy_refs =
                     Some(refs.resource_names.into_iter().map(Strng::from).collect());
-                continue;
-            }
-            if extension.name == "sni-traffic-policy" {
-                let config = extension
-                    .config
-                    .as_ref()
-                    .ok_or_else(|| WorkloadError::PolicyReference("missing SNI config".into()))?;
-                if sni_policy.is_some() || config.type_url != SNI_POLICY_TYPE_URL {
-                    return Err(WorkloadError::PolicyReference(
-                        "duplicate SNI extension or invalid config type".into(),
-                    ));
-                }
-                sni_policy = Some(SniTrafficPolicy::decode(&config.value)?);
                 continue;
             }
             let extension = WorkloadExtension::try_from(extension)?;
@@ -615,7 +595,6 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
                 .unwrap_or_default(),
             egress_policies,
             traffic_policy_refs,
-            sni_policy,
         };
         wl.validate_policies()?;
         // Return back part we did not use (service) so it can be consumed without cloning
@@ -992,8 +971,6 @@ impl WorkloadStore {
 pub enum WorkloadError {
     #[error("invalid Workload policy reference: {0}")]
     PolicyReference(String),
-    #[error("invalid Workload SNI policy: {0}")]
-    SniPolicy(#[from] SniPolicyError),
     #[error("failed to parse namespaced hostname: {0}")]
     NamespacedHostnameParse(String),
     #[error("failed to parse address: {0}")]
@@ -1083,6 +1060,25 @@ mod tests {
         let mut invalid = reference(vec![]);
         invalid.config.as_mut().unwrap().type_url = "wrong-type".into();
         assert!(decode(vec![invalid]).is_err());
+    }
+
+    #[test]
+    fn workload_ignores_sni_policy_extension() {
+        let workload = XdsWorkload {
+            uid: "workload".into(),
+            extensions: vec![xds::istio::workload::Extension {
+                name: "sni-traffic-policy".into(),
+                config: Some(Any {
+                    type_url:
+                        "type.googleapis.com/kruise.networking.extensions.v1.SniTrafficPolicy"
+                            .into(),
+                    // SNI policies belong to the gateway; ztunnel must not decode them.
+                    value: vec![0xff],
+                }),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(Workload::try_from(workload).unwrap().uid, "workload");
     }
 
     #[test]

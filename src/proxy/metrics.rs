@@ -863,8 +863,9 @@ impl ConnectionResult {
                 proxy::Error::MaybeHBONENetworkPolicyError(_) => ResponseFlags::NetworkPolicyError,
                 proxy::Error::Identity(_) => ResponseFlags::IdentityError,
                 proxy::Error::AuthorizationPolicyRejection(_)
-                | proxy::Error::AuthorizationPolicyLateRejection
-                | proxy::Error::SniPolicyDenied(_) => ResponseFlags::AuthorizationPolicyDenied,
+                | proxy::Error::AuthorizationPolicyLateRejection => {
+                    ResponseFlags::AuthorizationPolicyDenied
+                }
                 proxy::Error::ConnectionFailed(_) => ResponseFlags::ConnectionFailure,
                 _ => ResponseFlags::ConnectionFailure,
             };

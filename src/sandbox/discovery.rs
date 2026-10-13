@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::extensions::sni::{SNI_POLICY_TYPE_URL, SniTrafficPolicy};
 use crate::rbac::TrafficPolicy;
 use crate::strng::Strng;
 use crate::xds::XdsResource;
@@ -43,8 +42,6 @@ pub struct Sandbox {
     pub uid: Strng,
     pub workload_uid: Option<Strng>,
     pub traffic_policy: Option<TrafficPolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sni_policy: Option<SniTrafficPolicy>,
 }
 
 impl TryFrom<XdsSandbox> for Sandbox {
@@ -54,18 +51,7 @@ impl TryFrom<XdsSandbox> for Sandbox {
         let workload_uid = resource
             .attester
             .map(|attester| attester.workload_uid.into());
-        let mut sni_policy: Option<SniTrafficPolicy> = None;
-        for extension in resource.extensions {
-            if extension.type_url == SNI_POLICY_TYPE_URL {
-                let policy = SniTrafficPolicy::decode(&extension.value)?;
-                sni_policy
-                    .get_or_insert_with(Default::default)
-                    .rules
-                    .extend(policy.rules);
-            }
-        }
         let sandbox = Self {
-            sni_policy,
             uid: resource.uid.into(),
             workload_uid,
             traffic_policy: resource
@@ -86,9 +72,6 @@ impl Sandbox {
             "empty attester workload UID"
         );
         if let Some(policy) = &self.traffic_policy {
-            policy.validate()?;
-        }
-        if let Some(policy) = &self.sni_policy {
             policy.validate()?;
         }
         Ok(())
