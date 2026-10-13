@@ -27,7 +27,6 @@ use tokio::sync::watch;
 use tracing::{Instrument, debug, error, info, info_span, trace_span};
 
 use crate::extensions::extensions::{EgressPolicies, EgressPolicy, EgressPolicyAction};
-use crate::extensions::sni::SniAction;
 use crate::identity::Identity;
 use crate::proxy::connection_manager::{ConnectionAttributes, ConnectionContext};
 use crate::rbac::{Connection, Direction};
@@ -36,7 +35,7 @@ use crate::sandbox::sandbox;
 
 use crate::proxy::metrics::Reporter;
 use crate::proxy::{
-    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TLS_HEADER, TRACEPARENT_HEADER, TraceParent,
+    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, SNI_HEADER, TRACEPARENT_HEADER, TraceParent,
     WORKLOAD_NAME_HEADER, WORKLOAD_NAMESPACE_HEADER, util,
 };
 use crate::proxy::{ConnectionOpen, ConnectionResultBuilder, DerivedWorkload, metrics};
@@ -350,10 +349,9 @@ impl OutboundConnection {
                 if !sniffing.fail_open && sniffed.outcome.is_failure() {
                     return Err(Error::TlsSniffFailed(sniffed.outcome.as_str()));
                 }
-                req.tls.sni = sniffed.sni;
+                req.sni = sniffed.sni;
                 sniffed_data = sniffed.data;
             }
-            req.evaluate_sni_policy()?;
 
             let (mut upgraded, _) = Box::pin(self.send_hbone_request(remote_addr, req)).await?;
             upgraded
@@ -388,8 +386,8 @@ impl OutboundConnection {
             .header(WORKLOAD_NAME_HEADER, req.source.name.as_str())
             .header(WORKLOAD_NAMESPACE_HEADER, req.source.namespace.as_str());
 
-        if let Some(tls) = req.tls.header_value() {
-            builder = builder.header(TLS_HEADER, tls);
+        if let Some(sni) = &req.sni {
+            builder = builder.header(SNI_HEADER, sni);
         }
         if let Some(sandbox) = &req.sandbox {
             builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox.uid.as_str());
@@ -503,7 +501,7 @@ impl OutboundConnection {
             protocol: OutboundProtocol::TCP,
             source: source_workload,
             sandbox,
-            tls: TlsMetadata::default(),
+            sni: None,
             hbone_target_destination: None,
             actual_destination_workload: None,
             actual_destination: target,
@@ -547,7 +545,7 @@ impl OutboundConnection {
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload.clone(),
                     sandbox: sandbox.clone(),
-                    tls: TlsMetadata::default(),
+                    sni: None,
                     hbone_target_destination: Some(HboneAddress::SocketAddr(*target)),
                     actual_destination_workload: Some(waypoint.workload),
                     actual_destination,
@@ -586,8 +584,8 @@ struct Request {
     source: Arc<Workload>,
     // Selected before routing; shared by egress policy, CONNECT headers and the pool key.
     sandbox: Option<Arc<Sandbox>>,
-    // Optional ClientHello metadata for this CONNECT stream; never part of the pool key.
-    tls: TlsMetadata,
+    // Observed application ClientHello SNI for this CONNECT stream; never part of the pool key.
+    sni: Option<String>,
     // The selected egress gateway workload, if any.
     actual_destination_workload: Option<Arc<Workload>>,
     // The address of the next hop, such as a workload or egress gateway.
@@ -599,59 +597,6 @@ struct Request {
     // The identity we will assert for the next hop; this may not be the same as actual_destination_workload
     // in the case of proxies along the path.
     upstream_sans: Vec<Identity>,
-}
-
-#[derive(Debug, Default)]
-struct TlsMetadata {
-    sni: Option<String>,
-    action: Option<SniAction>,
-}
-
-impl TlsMetadata {
-    /// `action=<terminate|passthrough>;sni=<name>`, omitting unknown fields.
-    fn header_value(&self) -> Option<String> {
-        let fields = [
-            self.action
-                .and_then(SniAction::header_value)
-                .map(|action| format!("action={action}")),
-            self.sni.as_ref().map(|sni| format!("sni={sni}")),
-        ];
-        let value = fields.into_iter().flatten().collect::<Vec<_>>().join(";");
-        (!value.is_empty()).then_some(value)
-    }
-}
-
-impl Request {
-    fn evaluate_sni_policy(&mut self) -> Result<(), Error> {
-        let Some(sni) = &self.tls.sni else {
-            self.tls.action = None;
-            return Ok(());
-        };
-        let workload_action = self
-            .source
-            .sni_policy
-            .as_ref()
-            .and_then(|policy| policy.evaluate(sni));
-        let sandbox_action = self
-            .sandbox
-            .as_ref()
-            .and_then(|sandbox| sandbox.sni_policy.as_ref())
-            .and_then(|policy| policy.evaluate(sni));
-        // Each scope evaluates its own ordered rules. Either scope can require
-        // termination; neither can override the other's DENY with passthrough.
-        let action = if [workload_action, sandbox_action].contains(&Some(SniAction::Deny)) {
-            Some(SniAction::Deny)
-        } else if [workload_action, sandbox_action].contains(&Some(SniAction::TlsTermination)) {
-            Some(SniAction::TlsTermination)
-        } else {
-            Some(SniAction::Passthrough)
-        };
-        if action == Some(SniAction::Deny) {
-            return Err(Error::SniPolicyDenied(sni.clone()));
-        }
-        self.tls.action = action;
-        Ok(())
-    }
 }
 
 fn match_source_egress_policy<'a>(
@@ -963,7 +908,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hbone_request_carries_workload_headers() {
+    async fn hbone_request_carries_workload_and_sni_headers() {
         initialize_telemetry();
 
         // Create a test config with a specific network
@@ -1033,7 +978,7 @@ mod tests {
             protocol: OutboundProtocol::HBONE,
             source: source_workload,
             sandbox: None,
-            tls: TlsMetadata::default(),
+            sni: None,
             hbone_target_destination: Some(HboneAddress::SocketAddr(
                 "10.0.0.1:8080".parse().unwrap(),
             )),
@@ -1044,11 +989,10 @@ mod tests {
 
         let remote_addr = "127.0.0.1:12345".parse().unwrap();
 
-        req.evaluate_sni_policy().unwrap();
         let request = outbound.create_hbone_request(remote_addr, &req).await;
         assert_eq!(request.headers()[WORKLOAD_NAME_HEADER], "source-workload");
         assert_eq!(request.headers()[WORKLOAD_NAMESPACE_HEADER], "ns");
-        assert!(!request.headers().contains_key(TLS_HEADER));
+        assert!(!request.headers().contains_key(SNI_HEADER));
         let udp = outbound
             .create_connect_udp_request(remote_addr, &req)
             .await
@@ -1070,100 +1014,36 @@ mod tests {
                 .as_str(),
             "connect-udp"
         );
-        assert!(!udp.headers().contains_key(TLS_HEADER));
-        use crate::extensions::sni::{SniRule, SniTrafficPolicy};
-        let policy = SniTrafficPolicy {
-            rules: vec![
-                SniRule {
-                    sni: vec!["first.example".into()],
-                    action: SniAction::TlsTermination,
-                },
-                SniRule {
-                    sni: vec!["blocked.example".into()],
-                    action: SniAction::Deny,
-                },
-            ],
-        };
-        // Without a Sandbox there is no policy: explicitly pass observed TLS through.
-        req.tls.sni = Some("blocked.example".into());
-        req.evaluate_sni_policy().unwrap();
-        let request = outbound.create_hbone_request(remote_addr, &req).await;
-        assert_eq!(
-            request.headers()[TLS_HEADER],
-            "action=passthrough;sni=blocked.example"
-        );
-
-        let mut sandbox: Sandbox = crate::xds::agentio::sandbox::Sandbox {
+        assert!(!udp.headers().contains_key(SNI_HEADER));
+        assert!(!udp.headers().contains_key("x-agentio-tls"));
+        let sandbox: Sandbox = crate::xds::agentio::sandbox::Sandbox {
             uid: "sandbox-a".into(),
             ..Default::default()
         }
         .try_into()
         .unwrap();
-        // A selected Sandbox without an SNI policy has the same default decision.
-        req.sandbox = Some(Arc::new(sandbox.clone()));
-        req.evaluate_sni_policy().unwrap();
-        let request = outbound.create_hbone_request(remote_addr, &req).await;
-        assert_eq!(
-            request.headers()[TLS_HEADER],
-            "action=passthrough;sni=blocked.example"
-        );
-        req.tls.sni = None;
-        req.evaluate_sni_policy().unwrap();
-        let request = outbound.create_hbone_request(remote_addr, &req).await;
-        assert!(!request.headers().contains_key(TLS_HEADER));
-
-        sandbox.sni_policy = Some(policy);
-        req.sandbox = Some(Arc::new(sandbox));
-        for (sni, action) in [
-            ("first.example", "terminate"),
-            ("second.example", "passthrough"),
-        ] {
-            req.tls.sni = Some(sni.to_owned());
-            req.evaluate_sni_policy().unwrap();
-            let request = outbound.create_hbone_request(remote_addr, &req).await;
-            assert_eq!(
-                request.headers()[TLS_HEADER],
-                format!("action={action};sni={sni}")
-            );
+        for sandbox in [None, Some(Arc::new(sandbox))] {
+            req.sandbox = sandbox;
+            for sni in [Some("first.example"), Some("second.example"), None] {
+                req.sni = sni.map(str::to_owned);
+                let request = outbound.create_hbone_request(remote_addr, &req).await;
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("x-agentio-sni")
+                        .map(|v| v.to_str().unwrap()),
+                    sni
+                );
+                assert!(!request.headers().contains_key("x-agentio-tls"));
+                assert_eq!(
+                    request
+                        .headers()
+                        .get(sandbox::SANDBOX_ID_HEADER)
+                        .map(|v| v.to_str().unwrap()),
+                    req.sandbox.as_ref().map(|s| s.uid.as_str())
+                );
+            }
         }
-        req.tls.sni = None;
-        req.evaluate_sni_policy().unwrap();
-        let request = outbound.create_hbone_request(remote_addr, &req).await;
-        assert!(!request.headers().contains_key(TLS_HEADER));
-
-        req.tls.sni = Some("blocked.example".into());
-        assert!(matches!(
-            req.evaluate_sni_policy(),
-            Err(Error::SniPolicyDenied(_))
-        ));
-
-        // Workload SNI applies without a Sandbox and remains a separate gate with one.
-        let mut source = (*req.source).clone();
-        source.sni_policy = Some(SniTrafficPolicy {
-            rules: vec![SniRule {
-                sni: vec!["first.example".into()],
-                action: SniAction::Deny,
-            }],
-        });
-        req.source = Arc::new(source);
-        req.tls.sni = Some("first.example".into());
-        assert!(matches!(
-            req.evaluate_sni_policy(),
-            Err(Error::SniPolicyDenied(_))
-        ));
-        req.sandbox = None;
-        assert!(matches!(
-            req.evaluate_sni_policy(),
-            Err(Error::SniPolicyDenied(_))
-        ));
-        Arc::make_mut(&mut req.source)
-            .sni_policy
-            .as_mut()
-            .unwrap()
-            .rules[0]
-            .action = SniAction::TlsTermination;
-        req.evaluate_sni_policy().unwrap();
-        assert_eq!(req.tls.action, Some(SniAction::TlsTermination));
     }
 
     mod match_egress_policy_tests {

@@ -216,7 +216,6 @@ pub fn test_default_workload() -> Workload {
         encoded_labels: None,
         egress_policies: None,
         traffic_policy_refs: Some(Vec::new()),
-        sni_policy: None,
     }
 }
 

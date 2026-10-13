@@ -612,8 +612,6 @@ pub enum Error {
     DnsEmpty,
     #[error("denied by egress policy, dest: {0}")]
     EgressPolicyDenied(SocketAddr),
-    #[error("denied by SNI policy, server name: {0}")]
-    SniPolicyDenied(String),
     #[error("TLS sniffing failed: {0}")]
     TlsSniffFailed(&'static str),
     #[error("egress policy requires gateway but none configured")]
@@ -663,7 +661,8 @@ pub const BAGGAGE_HEADER: &str = "baggage";
 pub const TRACEPARENT_HEADER: &str = "traceparent";
 pub const WORKLOAD_NAME_HEADER: &str = "x-agentio-workload-name";
 pub const WORKLOAD_NAMESPACE_HEADER: &str = "x-agentio-workload-namespace";
-pub const TLS_HEADER: &str = "x-agentio-tls";
+/// Unverified SNI observed in the application ClientHello, omitted when unavailable.
+pub const SNI_HEADER: &str = "x-agentio-sni";
 
 impl TraceParent {
     pub fn header(&self) -> hyper::header::HeaderValue {
