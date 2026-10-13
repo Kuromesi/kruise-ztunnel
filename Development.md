@@ -265,24 +265,3 @@ Without a matching gateway egress policy, the request follows
 `curl -> ztunnel (15001) -> localhost:8080` over TCP. A gateway egress policy routes
 the connection through the configured gateway over HBONE. Discovering the target
 as a Service or Workload does not change the selected route.
-
-### SNI metadata on gateway connections
-
-For TCP connections routed through an egress gateway, ztunnel inspects the
-application ClientHello before sending HBONE CONNECT. Each CONNECT stream carries
-`x-agentio-sni: api.example.com` when SNI is available. The value is the observed
-server name alone, without a port, scheme or `sni=` prefix; it is not a verified
-destination identity or the outer HBONE TLS server name. Missing SNI omits the
-header. Direct TCP and CONNECT-UDP do not carry this metadata. Consumed bytes are
-forwarded unchanged after CONNECT succeeds.
-
-SNI policy decisions belong to the gateway’s CONNECT processing (for example,
-ext_proc). Ztunnel no longer emits `x-agentio-tls` or evaluates Workload/Sandbox
-SNI policy extensions. Gateways must consume the new header and enforce SNI policy
-before rolling out this change. Local configuration must remove `sniPolicy` fields.
-
-Sniffing limits and failure handling are unchanged: `TLS_SNIFF_TIMEOUT` defaults to
-1 second and `TLS_SNIFF_MAX_BYTES` to 64 KiB. Parse errors, timeouts and size-limit
-failures close the connection unless `TLS_SNIFF_FAIL_OPEN=true`; with that setting,
-CONNECT proceeds without SNI. Non-TLS traffic and ClientHello without SNI also omit
-the header. Sniff outcomes remain available in `istio_tls_sniff_results_total`.
