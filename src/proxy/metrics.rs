@@ -49,7 +49,6 @@ pub struct Metrics {
 
     // on-demand DNS is not a part of DNS proxy, but part of ztunnel proxy itself
     pub on_demand_dns: Family<OnDemandDnsLabels, Counter>,
-    tls_sniff_results: Family<TlsSniffLabels, Counter>,
 
     pub udp: UdpMetrics,
 }
@@ -244,11 +243,6 @@ impl Drop for UdpSessionGuard {
     fn drop(&mut self) {
         self.active.dec();
     }
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct TlsSniffLabels {
-    result: &'static str,
 }
 
 #[derive(Clone, Copy, Default, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
@@ -566,12 +560,6 @@ impl Metrics {
             open_sockets.clone(),
         );
 
-        let tls_sniff_results = Family::default();
-        registry.register(
-            "tls_sniff_results",
-            "Completed TLS sniff attempts by result (unstable)",
-            tls_sniff_results.clone(),
-        );
         let udp = UdpMetrics::new(registry);
 
         Self {
@@ -582,20 +570,8 @@ impl Metrics {
             on_demand_dns,
             connection_failures,
             open_sockets,
-            tls_sniff_results,
             udp,
         }
-    }
-
-    pub(crate) fn record_tls_sniff(&self, result: &std::io::Result<crate::tls::sniff::Sniffed>) {
-        let result = match result {
-            Ok(sniffed) => sniffed.outcome.as_str(),
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => "closed",
-            Err(_) => "read_error",
-        };
-        self.tls_sniff_results
-            .get_or_create(&TlsSniffLabels { result })
-            .inc();
     }
 
     pub fn record_socket_open(&self, labels: &SocketLabels) {
@@ -856,7 +832,7 @@ impl ConnectionResult {
         // Try to downcast the error itself to proxy::Error
         if let Some(proxy_err) = (err as &dyn Any).downcast_ref::<proxy::Error>() {
             return match proxy_err {
-                proxy::Error::Tls(_) | proxy::Error::TlsSniffFailed(_) => ResponseFlags::TlsFailure,
+                proxy::Error::Tls(_) => ResponseFlags::TlsFailure,
                 proxy::Error::Http2Handshake(_) | proxy::Error::H2(_) => {
                     ResponseFlags::Http2HandshakeFailure
                 }
