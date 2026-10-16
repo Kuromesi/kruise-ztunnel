@@ -16,7 +16,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use futures_util::TryFutureExt;
 use hyper::header::FORWARDED;
 use std::time::Instant;
@@ -35,7 +34,7 @@ use crate::sandbox::sandbox;
 
 use crate::proxy::metrics::Reporter;
 use crate::proxy::{
-    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, SNI_HEADER, TRACEPARENT_HEADER, TraceParent,
+    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER, TraceParent,
     WORKLOAD_NAME_HEADER, WORKLOAD_NAMESPACE_HEADER, util,
 };
 use crate::proxy::{ConnectionOpen, ConnectionResultBuilder, DerivedWorkload, metrics};
@@ -47,7 +46,6 @@ use crate::proxy::h2::{H2Stream, client::WorkloadKey};
 use crate::state::ProxyRbacContext;
 use crate::state::workload::OutboundProtocol;
 use crate::state::workload::Workload;
-use crate::tls::sniff;
 use crate::{assertions, copy, proxy, socket};
 
 pub struct Outbound {
@@ -238,7 +236,7 @@ impl OutboundConnection {
                 let sandbox = self.pi.state.fetch_sandbox(&source);
                 self.build_request(source, sandbox, dest_addr)
             });
-        let mut req = match Box::pin(build).await {
+        let req = match Box::pin(build).await {
             Ok(req) => Box::new(req),
             Err(err) => {
                 metrics::log_early_deny(source_addr, dest_addr, Reporter::source, err);
@@ -301,13 +299,8 @@ impl OutboundConnection {
         let proxy_future = async {
             match req.protocol {
                 OutboundProtocol::HBONE => {
-                    self.proxy_to_hbone(
-                        source_stream,
-                        source_addr,
-                        &mut req,
-                        connection_result_builder,
-                    )
-                    .await
+                    self.proxy_to_hbone(source_stream, source_addr, &req, connection_result_builder)
+                        .await
                 }
                 OutboundProtocol::TCP => {
                     self.proxy_to_tcp(source_stream, &req, connection_result_builder)
@@ -328,35 +321,14 @@ impl OutboundConnection {
 
     async fn proxy_to_hbone(
         &mut self,
-        mut stream: TcpStream,
+        stream: TcpStream,
         remote_addr: SocketAddr,
-        req: &mut Request,
+        req: &Request,
         connection_stats_builder: Box<ConnectionResultBuilder>,
     ) {
         let connection_stats = Box::new(connection_stats_builder.build());
         let res = (async {
-            let mut sniffed_data = Bytes::new();
-            if let Some(HboneAddress::SocketAddr(_)) = &req.hbone_target_destination {
-                let sniffing = &self.pi.cfg.tls_sniffing;
-                let sniffed = Box::pin(sniff::sniff(
-                    &mut stream,
-                    sniffing.timeout,
-                    sniffing.max_bytes,
-                ))
-                .await;
-                self.pi.metrics.record_tls_sniff(&sniffed);
-                let sniffed = sniffed?;
-                if !sniffing.fail_open && sniffed.outcome.is_failure() {
-                    return Err(Error::TlsSniffFailed(sniffed.outcome.as_str()));
-                }
-                req.sni = sniffed.sni;
-                sniffed_data = sniffed.data;
-            }
-
-            let (mut upgraded, _) = Box::pin(self.send_hbone_request(remote_addr, req)).await?;
-            upgraded
-                .write_sniffed(sniffed_data, &connection_stats)
-                .await?;
+            let (upgraded, _) = Box::pin(self.send_hbone_request(remote_addr, req)).await?;
             copy::copy_bidirectional(copy::TcpStreamSplitter(stream), upgraded, &connection_stats)
                 .await
         })
@@ -386,9 +358,6 @@ impl OutboundConnection {
             .header(WORKLOAD_NAME_HEADER, req.source.name.as_str())
             .header(WORKLOAD_NAMESPACE_HEADER, req.source.namespace.as_str());
 
-        if let Some(sni) = &req.sni {
-            builder = builder.header(SNI_HEADER, sni);
-        }
         if let Some(sandbox) = &req.sandbox {
             builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox.uid.as_str());
         }
@@ -501,7 +470,6 @@ impl OutboundConnection {
             protocol: OutboundProtocol::TCP,
             source: source_workload,
             sandbox,
-            sni: None,
             hbone_target_destination: None,
             actual_destination_workload: None,
             actual_destination: target,
@@ -545,7 +513,6 @@ impl OutboundConnection {
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload.clone(),
                     sandbox: sandbox.clone(),
-                    sni: None,
                     hbone_target_destination: Some(HboneAddress::SocketAddr(*target)),
                     actual_destination_workload: Some(waypoint.workload),
                     actual_destination,
@@ -584,8 +551,6 @@ struct Request {
     source: Arc<Workload>,
     // Selected before routing; shared by egress policy, CONNECT headers and the pool key.
     sandbox: Option<Arc<Sandbox>>,
-    // Observed application ClientHello SNI for this CONNECT stream; never part of the pool key.
-    sni: Option<String>,
     // The selected egress gateway workload, if any.
     actual_destination_workload: Option<Arc<Workload>>,
     // The address of the next hop, such as a workload or egress gateway.
@@ -908,7 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hbone_request_carries_workload_and_sni_headers() {
+    async fn hbone_request_carries_workload_headers_without_sni() {
         initialize_telemetry();
 
         // Create a test config with a specific network
@@ -978,7 +943,6 @@ mod tests {
             protocol: OutboundProtocol::HBONE,
             source: source_workload,
             sandbox: None,
-            sni: None,
             hbone_target_destination: Some(HboneAddress::SocketAddr(
                 "10.0.0.1:8080".parse().unwrap(),
             )),
@@ -992,7 +956,7 @@ mod tests {
         let request = outbound.create_hbone_request(remote_addr, &req).await;
         assert_eq!(request.headers()[WORKLOAD_NAME_HEADER], "source-workload");
         assert_eq!(request.headers()[WORKLOAD_NAMESPACE_HEADER], "ns");
-        assert!(!request.headers().contains_key(SNI_HEADER));
+        assert!(!request.headers().contains_key("x-agentio-sni"));
         let udp = outbound
             .create_connect_udp_request(remote_addr, &req)
             .await
@@ -1014,7 +978,7 @@ mod tests {
                 .as_str(),
             "connect-udp"
         );
-        assert!(!udp.headers().contains_key(SNI_HEADER));
+        assert!(!udp.headers().contains_key("x-agentio-sni"));
         assert!(!udp.headers().contains_key("x-agentio-tls"));
         let sandbox: Sandbox = crate::xds::agentio::sandbox::Sandbox {
             uid: "sandbox-a".into(),
@@ -1024,25 +988,16 @@ mod tests {
         .unwrap();
         for sandbox in [None, Some(Arc::new(sandbox))] {
             req.sandbox = sandbox;
-            for sni in [Some("first.example"), Some("second.example"), None] {
-                req.sni = sni.map(str::to_owned);
-                let request = outbound.create_hbone_request(remote_addr, &req).await;
-                assert_eq!(
-                    request
-                        .headers()
-                        .get("x-agentio-sni")
-                        .map(|v| v.to_str().unwrap()),
-                    sni
-                );
-                assert!(!request.headers().contains_key("x-agentio-tls"));
-                assert_eq!(
-                    request
-                        .headers()
-                        .get(sandbox::SANDBOX_ID_HEADER)
-                        .map(|v| v.to_str().unwrap()),
-                    req.sandbox.as_ref().map(|s| s.uid.as_str())
-                );
-            }
+            let request = outbound.create_hbone_request(remote_addr, &req).await;
+            assert!(!request.headers().contains_key("x-agentio-sni"));
+            assert!(!request.headers().contains_key("x-agentio-tls"));
+            assert_eq!(
+                request
+                    .headers()
+                    .get(sandbox::SANDBOX_ID_HEADER)
+                    .map(|v| v.to_str().unwrap()),
+                req.sandbox.as_ref().map(|s| s.uid.as_str())
+            );
         }
     }
 

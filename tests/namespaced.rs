@@ -157,7 +157,25 @@ mod namespaced {
             .await?;
 
         let server_ip = manager.resolver().resolve("server")?;
-        run_tcp_to_hbone_client(client, manager.resolver(), "server")?;
+        let srv = resolve_target(manager.resolver(), "server");
+        client
+            .run(move || async move {
+                timeout(Duration::from_secs(5), async {
+                    let mut stream = TcpStream::connect(srv).await?;
+                    // The gateway must be reachable before the client sends any bytes.
+                    let mut greeting = [0; WAYPOINT_MESSAGE.len()];
+                    stream.read_exact(&mut greeting).await?;
+                    assert_eq!(greeting, WAYPOINT_MESSAGE);
+                    stream.write_all(b"hello world").await?;
+                    let mut echoed = [0; REQ_SIZE as usize];
+                    stream.read_exact(&mut echoed).await?;
+                    assert_eq!(&echoed, b"hello world");
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await?
+            })?
+            .join()
+            .unwrap()?;
 
         let metrics = [
             (CONNECTIONS_OPENED, 1),
@@ -862,7 +880,6 @@ mod namespaced {
                 let mut tcp_stream = TcpStream::connect(&srv.to_string()).await?;
                 tcp_stream.write_all(b"hello world!").await?;
                 let mut buf = [0; 10];
-                // Rejection may close cleanly after sniffing consumes the client's data.
                 // Both EOF and reset are valid, but no application data may be returned.
                 let result = timeout(Duration::from_secs(5), tcp_stream.read(&mut buf)).await?;
                 match result {

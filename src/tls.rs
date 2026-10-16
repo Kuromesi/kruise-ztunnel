@@ -20,7 +20,6 @@ pub mod csr;
 mod lib;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
-pub(crate) mod sniff;
 mod workload;
 
 use std::sync::Arc;
