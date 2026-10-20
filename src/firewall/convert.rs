@@ -34,6 +34,7 @@ pub fn resolve_workload_firewall(
         .cloned();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     workload.uid.hash(&mut hasher);
+    state.enable_egress_traffic_policy.hash(&mut hasher);
     for policy in workload.traffic_policies(&state.policies) {
         policy.hash(&mut hasher);
     }
@@ -51,6 +52,14 @@ pub fn resolve_workload_firewall(
         .and_then(|sandbox| sandbox.traffic_policy.as_ref())
     {
         rules.inline_rules = firewall_rulesets(std::iter::once(("inline", Some(inline)))).rules;
+    }
+    if !state.enable_egress_traffic_policy {
+        rules
+            .rules
+            .retain(|rule| rule.direction == super::types::Direction::Inbound);
+        rules
+            .inline_rules
+            .retain(|rule| rule.direction == super::types::Direction::Inbound);
     }
     Some((rules, hash))
 }

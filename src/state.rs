@@ -163,6 +163,8 @@ impl fmt::Display for ProxyRbacContext {
 /// The current state information for this proxy.
 #[derive(Debug)]
 pub struct ProxyState {
+    /// Startup setting shared by proxy authorization and native firewall conversion.
+    pub enable_egress_traffic_policy: bool,
     pub workloads: WorkloadStore,
 
     pub services: ServiceStore,
@@ -236,6 +238,7 @@ impl serde::Serialize for ProxyState {
 impl ProxyState {
     pub fn new(local_node: Option<Strng>) -> ProxyState {
         ProxyState {
+            enable_egress_traffic_policy: true,
             workloads: WorkloadStore::new(local_node),
             services: Default::default(),
             policies: Default::default(),
@@ -514,6 +517,9 @@ impl DemandProxyState {
         ctx: &ProxyRbacContext,
     ) -> Result<(), proxy::AuthorizationRejectionError> {
         let state = self.read();
+        if ctx.conn.direction == rbac::Direction::Outbound && !state.enable_egress_traffic_policy {
+            return Ok(());
+        }
         let denied = |name: &str| {
             proxy::AuthorizationRejectionError::ExplicitlyDenied(
                 name.into(),
@@ -821,9 +827,9 @@ impl ProxyStateManager {
         cert_manager: Arc<SecretManager>,
     ) -> anyhow::Result<ProxyStateManager> {
         let cert_fetcher = cert_fetcher::new(&config, cert_manager);
-        let state: Arc<RwLock<ProxyState>> = Arc::new(RwLock::new(ProxyState::new(
-            config.local_node.as_ref().map(strng::new),
-        )));
+        let mut initial_state = ProxyState::new(config.local_node.as_ref().map(strng::new));
+        initial_state.enable_egress_traffic_policy = config.enable_egress_traffic_policy;
+        let state = Arc::new(RwLock::new(initial_state));
         let xds_client = if config.xds_address.is_some() {
             let updater = ProxyStateUpdater::new(state.clone(), cert_fetcher.clone());
             let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(

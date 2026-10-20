@@ -40,6 +40,7 @@ const ENABLE_ADMIN_UNIX_SOCKET: &str = "ENABLE_ADMIN_UNIX_SOCKET";
 const ADMIN_UNIX_SOCKET_PATH: &str = "ADMIN_UNIX_SOCKET_PATH";
 const DEFAULT_ADMIN_UNIX_SOCKET_PATH: &str = "/var/run/ztunnel/admin.sock";
 
+const ENABLE_EGRESS_TRAFFIC_POLICY: &str = "ENABLE_EGRESS_TRAFFIC_POLICY";
 const ENABLE_PROXY: &str = "ENABLE_PROXY";
 const KUBERNETES_SERVICE_HOST: &str = "KUBERNETES_SERVICE_HOST";
 const NETWORK: &str = "NETWORK";
@@ -287,6 +288,8 @@ pub struct Config {
     pub outbound_udp_addr: SocketAddr,
     /// Enables the experimental transparent UDP proxy, independently of its transport mode.
     pub udp_proxy: bool,
+    /// Enforce outbound Workload and Sandbox TrafficPolicy in proxy and firewall paths.
+    pub enable_egress_traffic_policy: bool,
     /// Maximum number of concurrent CONNECT-UDP sessions, counted per proxy (so per pod in-pod).
     /// Datagrams opening a new flow beyond this are dropped and counted as `session_limit`.
     pub udp_max_sessions: usize,
@@ -843,6 +846,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
 
     validate_config(Config {
         proxy: parse_default(ENABLE_PROXY, true)?,
+        enable_egress_traffic_policy: parse_default(ENABLE_EGRESS_TRAFFIC_POLICY, true)?,
         // Enable by default; running the server is not an issue, clients still need to opt-in to sending their
         // DNS requests to Ztunnel.
         dns_proxy: pc
@@ -1296,6 +1300,49 @@ pub mod tests {
     use super::*;
 
     static SANDBOX_WATCHER_DEBOUNCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn egress_traffic_policy_environment() {
+        const CASE: &str = "ZTUNNEL_TEST_EGRESS_TRAFFIC_POLICY";
+        if let Ok(case) = env::var(CASE) {
+            let result = construct_config(ProxyConfig::default());
+            if case == "invalid" {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains(ENABLE_EGRESS_TRAFFIC_POLICY)
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap().enable_egress_traffic_policy,
+                    case != "false"
+                );
+            }
+            return;
+        }
+        for case in ["default", "true", "false", "invalid"] {
+            let mut command = std::process::Command::new(env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "config::tests::egress_traffic_policy_environment",
+                    "--nocapture",
+                ])
+                .env(CASE, case)
+                .env_remove(ENABLE_EGRESS_TRAFFIC_POLICY);
+            if case != "default" {
+                command.env(ENABLE_EGRESS_TRAFFIC_POLICY, case);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "case {case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn sandbox_mode_environment() {

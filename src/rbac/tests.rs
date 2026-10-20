@@ -1165,3 +1165,93 @@ async fn workload_references_recheck_tcp_and_firewall() {
     assert!(state.assert_rbac(&ctx).await.is_ok());
     assert!(firewall().0.rules.is_empty());
 }
+
+#[tokio::test]
+async fn egress_traffic_policy_flag_preserves_ingress_and_firewall_rules() {
+    use crate::firewall::{Direction as FirewallDirection, resolve_workload_firewall};
+    use crate::sandbox::discovery::tests::Fixture;
+    use crate::state::{ProxyRbacContext, WorkloadInfo};
+    use crate::xds::agentio::sandbox::{Sandbox, sandbox::Attester};
+
+    // Exercise both policy stages separately, plus unresolved Workload references.
+    for source in ["workload", "sandbox", "missing"] {
+        let f = Fixture::new();
+        let deny = XdsTrafficPolicy {
+            ingress: Some(proto::RuleSet {
+                rules: vec![rule(proto::Action::Deny)],
+            }),
+            egress: Some(proto::RuleSet {
+                rules: vec![rule(proto::Action::Deny)],
+            }),
+        };
+        if source == "sandbox" {
+            f.state
+                .write()
+                .unwrap()
+                .sandboxes
+                .update(XdsResource {
+                    name: "sandbox-a".into(),
+                    resource: Sandbox {
+                        uid: "sandbox-a".into(),
+                        attester: Some(Attester {
+                            workload_uid: f.workload.uid.to_string(),
+                        }),
+                        traffic_policy: Some(deny),
+                        ..Default::default()
+                    },
+                })
+                .unwrap();
+        } else {
+            f.bind_policies(&["deny"]);
+            if source == "workload" {
+                f.state
+                    .write()
+                    .unwrap()
+                    .policies
+                    .update(XdsResource {
+                        name: "deny".into(),
+                        resource: deny,
+                    })
+                    .unwrap();
+            }
+        }
+        let mut ctx = ProxyRbacContext {
+            conn: connection("10.1.0.1:1234", "192.0.2.1:443"),
+            workload: f.workload.clone(),
+            sandbox: None,
+        };
+        let info = WorkloadInfo::new(
+            f.workload.name.to_string(),
+            f.workload.namespace.to_string(),
+            f.workload.service_account.to_string(),
+        );
+        assert!(f.demand.assert_rbac(&ctx).await.is_err(), "{source}");
+        let (before, hash) =
+            resolve_workload_firewall(&f.state.read().unwrap(), &info, None).unwrap();
+        assert!(
+            before
+                .rules
+                .iter()
+                .chain(&before.inline_rules)
+                .any(|r| r.direction == FirewallDirection::Outbound)
+        );
+        f.state.write().unwrap().enable_egress_traffic_policy = false;
+        assert!(f.demand.assert_rbac(&ctx).await.is_ok(), "{source}");
+        ctx.conn.direction = Direction::Inbound;
+        assert!(f.demand.assert_rbac(&ctx).await.is_err(), "{source}");
+        let (after, _) =
+            resolve_workload_firewall(&f.state.read().unwrap(), &info, Some(hash)).unwrap();
+        assert!(!after.policy_attached);
+        for (before, after) in [
+            (&before.rules, &after.rules),
+            (&before.inline_rules, &after.inline_rules),
+        ] {
+            let expected: Vec<_> = before
+                .iter()
+                .filter(|r| r.direction == FirewallDirection::Inbound)
+                .cloned()
+                .collect();
+            assert_eq!(*after, expected, "{source}");
+        }
+    }
+}
