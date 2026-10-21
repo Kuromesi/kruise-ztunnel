@@ -166,7 +166,7 @@ fn sandbox_firewall_allow_returns_to_workload_stage() {
 #[tokio::test]
 async fn native_policy_order_and_direction_defaults() {
     let mut conn = connection("10.1.0.1:1234", "192.0.2.1:443");
-    assert_eq!(evaluate(policy(None), &conn).await, Ok(()));
+    assert!(evaluate(policy(None), &conn).await.is_err());
     assert_eq!(
         evaluate(policy(Some(vec![])), &conn).await,
         Err(AuthorizationRejectionError::ExplicitlyDenied(
@@ -201,7 +201,7 @@ async fn native_policy_order_and_direction_defaults() {
         Ok(()),
     );
     conn.direction = Direction::Inbound;
-    assert_eq!(evaluate(policy(Some(vec![])), &conn).await, Ok(()));
+    assert!(evaluate(policy(Some(vec![])), &conn).await.is_err());
     assert!(
         evaluate(
             XdsTrafficPolicy {
@@ -569,7 +569,13 @@ fn native_firewall_rendering() {
     ];
     let native = TrafficPolicy::try_from(policy(Some(vec![mixed]))).unwrap();
     let rules = firewall_ruleset(&native);
-    let groups = &rules.rules[0].clauses[0][0].port_groups;
+    let groups = &rules
+        .rules
+        .iter()
+        .find(|r| r.name == "inline/rule-0")
+        .unwrap()
+        .clauses[0][0]
+        .port_groups;
     assert_eq!(groups.len(), 2);
     assert!(groups.iter().all(|g| g.ports.is_empty()));
     let ipt = IptBackend::new().render_ruleset(&rules);
@@ -627,9 +633,14 @@ fn native_firewall_resolution_tracks_policy_updates_and_removal() {
     changed.borrow_and_update();
     let deny = resolve();
     assert_ne!(initial.1, deny.1);
-    assert_eq!(deny.0.inline_rules.len(), 2);
+    assert_eq!(deny.0.inline_rules.len(), 3);
     assert_eq!(
-        deny.0.inline_rules[0].action,
+        deny.0
+            .inline_rules
+            .iter()
+            .find(|r| r.name == "inline/rule-0")
+            .unwrap()
+            .action,
         crate::firewall::RuleAction::Deny
     );
 
@@ -647,7 +658,13 @@ fn native_firewall_resolution_tracks_policy_updates_and_removal() {
     let allow = resolve();
     assert_ne!(deny.1, allow.1);
     assert_eq!(
-        allow.0.inline_rules[0].action,
+        allow
+            .0
+            .inline_rules
+            .iter()
+            .find(|r| r.name == "inline/rule-0")
+            .unwrap()
+            .action,
         crate::firewall::RuleAction::Allow
     );
     changed.borrow_and_update();
@@ -679,35 +696,27 @@ fn native_firewall_resolution_tracks_policy_updates_and_removal() {
 fn native_firewall_preserves_order_and_direction_presence() {
     use crate::firewall::{Direction as FirewallDirection, IptBackend, NftBackend};
 
-    assert!(firewall_ruleset(&TrafficPolicy::default()).rules.is_empty());
-    for inbound in [false, true] {
-        let mut wire = policy(Some(vec![]));
-        if inbound {
-            wire.ingress = wire.egress.take();
-        }
+    let unattached = firewall_rulesets(std::iter::empty());
+    assert!(unattached.rules.is_empty());
+    for wire in [
+        XdsTrafficPolicy::default(),
+        policy(Some(vec![])),
+        XdsTrafficPolicy {
+            ingress: Some(proto::RuleSet::default()),
+            ..Default::default()
+        },
+    ] {
         let rules = firewall_ruleset(&TrafficPolicy::try_from(wire).unwrap());
-        assert_eq!(rules.rules.len(), 1);
-        assert_eq!(
-            rules.rules[0].direction,
-            if inbound {
-                FirewallDirection::Inbound
-            } else {
-                FirewallDirection::Outbound
-            }
-        );
+        assert_eq!(rules.rules.len(), 2);
+        assert_eq!(rules.rules[0].direction, FirewallDirection::Inbound);
+        assert_eq!(rules.rules[1].direction, FirewallDirection::Outbound);
         let ipt = IptBackend::new().render_ruleset(&rules);
-        assert_eq!(
-            ipt.contains("-A ISTIO_FW_FILTER_IN ! -p tcp -j REJECT"),
-            inbound
-        );
-        assert_eq!(
-            ipt.contains("-A ISTIO_FW_FILTER_OUT ! -p tcp -j REJECT"),
-            !inbound
-        );
+        assert!(ipt.contains("-A ISTIO_FW_FILTER_IN ! -p tcp -j REJECT"));
+        assert!(ipt.contains("-A ISTIO_FW_FILTER_OUT ! -p tcp -j REJECT"));
         let nft = NftBackend::new().render_ruleset(&rules);
         let (input, output) = nft.split_once("chain zt_policy_output").unwrap();
-        assert_eq!(input.contains("meta l4proto != tcp reject"), inbound);
-        assert_eq!(output.contains("meta l4proto != tcp reject"), !inbound);
+        assert!(input.contains("meta l4proto != tcp reject"));
+        assert!(output.contains("meta l4proto != tcp reject"));
     }
 
     // Backend sorting must retain the published rule order.
@@ -759,7 +768,7 @@ async fn shared_policy_chain_precedence_missing_and_direction_defaults() {
         check_policies(None, &policies, &conn).await
     };
     assert_eq!(evaluate(vec![]).await, Ok(()));
-    assert_eq!(evaluate(vec![Some(&absent)]).await, Ok(()));
+    assert!(evaluate(vec![Some(&absent)]).await.is_err());
     assert_eq!(evaluate(vec![Some(&empty), Some(&allow)]).await, Ok(()));
     assert_eq!(evaluate(vec![Some(&allow), Some(&deny)]).await, Ok(()));
     assert!(evaluate(vec![Some(&deny), Some(&allow)]).await.is_err());
@@ -1164,4 +1173,26 @@ async fn workload_references_recheck_tcp_and_firewall() {
     publish(&[]).unwrap();
     assert!(state.assert_rbac(&ctx).await.is_ok());
     assert!(firewall().0.rules.is_empty());
+}
+
+#[tokio::test]
+async fn attached_policy_defaults_to_deny_in_both_directions() {
+    let default_deny = Err(AuthorizationRejectionError::ExplicitlyDenied(
+        crate::strng::EMPTY,
+        "DEFAULT-DENY".into(),
+    ));
+    for direction in [Direction::Inbound, Direction::Outbound] {
+        let mut conn = connection("10.1.0.1:1234", "192.0.2.1:443");
+        conn.direction = direction;
+        let mut opposite = policy(Some(vec![rule(proto::Action::Allow)]));
+        if direction == Direction::Outbound {
+            opposite.ingress = opposite.egress.take();
+        }
+        assert_eq!(check_policies(None, &[], &conn).await, Ok(()));
+        assert_eq!(evaluate(opposite.clone(), &conn).await, default_deny);
+        assert_eq!(
+            check_policies(None, &[("opposite", Some(&opposite))], &conn).await,
+            default_deny,
+        );
+    }
 }

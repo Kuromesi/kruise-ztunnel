@@ -24,10 +24,10 @@ option go_package = "github.com/openkruise/agentio/api/security/v1;securityv1";
 // and selector matching stay in the control plane. Authorizations are a separate
 // compatibility projection for older data planes.
 message TrafficPolicy {
-  // Absent = this policy does not configure the direction.
-  // Present (including an empty rule set) = this direction is configured.
-  // First matching rule decides this policy. The enclosing policy stage defines
-  // how the result and an unmatched direction compose with Workload policies.
+  // Absent or empty directions contribute no matching rules.
+  // The first matching rule across the ordered policy stage decides.
+  // Any attached policy makes unmatched traffic default to deny in both
+  // directions. A stage with no attached policies allows traffic.
   RuleSet ingress = 1;
   RuleSet egress = 2;
 

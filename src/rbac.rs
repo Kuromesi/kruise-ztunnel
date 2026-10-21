@@ -272,19 +272,19 @@ pub(crate) fn assert_policies<'a>(
     if let Some((name, _)) = policies.clone().find(|(_, policy)| policy.is_none()) {
         return Err(deny(name, "policy-unavailable".into()));
     }
-    let mut configured = false;
+    let mut policy_attached = false;
     for (name, policy) in policies {
+        policy_attached = true;
         let Some(rules) = policy.and_then(|policy| policy.rules_for(conn.direction)) else {
             continue;
         };
-        configured = true;
         match rules.match_tcp(conn) {
             Some((_, Action::Allow)) => return Ok(()),
             Some((index, Action::Deny)) => return Err(deny(name, format!("rule-{index}"))),
             None => {}
         }
     }
-    if configured {
+    if policy_attached {
         Err(deny("", "DEFAULT-DENY".into()))
     } else {
         Ok(())
@@ -306,17 +306,18 @@ pub fn firewall_rulesets<'a>(
         .map(|(name, _)| name);
     let mut rules = Vec::new();
     for direction in [FirewallDirection::Inbound, FirewallDirection::Outbound] {
-        let mut configured = false;
+        let mut policy_attached = false;
         let mut default_deny_name = "DEFAULT-DENY".into();
         let mut offset = 0;
         if let Some(name) = missing {
-            configured = true;
+            policy_attached = true;
             default_deny_name = format!("{name}/policy-unavailable").into();
         }
         for (name, policy) in policies.clone().filter(|_| missing.is_none()) {
             let Some(policy) = policy else {
                 continue; // Unresolved references were handled before evaluating any rules.
             };
+            policy_attached = true;
             let body = match direction {
                 FirewallDirection::Inbound => &policy.ingress,
                 FirewallDirection::Outbound => &policy.egress,
@@ -324,7 +325,6 @@ pub fn firewall_rulesets<'a>(
             let Some(body) = body else {
                 continue;
             };
-            configured = true;
             for (index, rule) in body.rules.iter().enumerate() {
                 let port_groups: Vec<_> = rule
                     .ports
@@ -364,11 +364,10 @@ pub fn firewall_rulesets<'a>(
             }
             offset += body.rules.len();
         }
-        if !configured {
+        if !policy_attached {
             continue;
         }
-        // A configured direction always defaults to deny, even with no rules
-        // or only TCP rules. Leave absent directions untouched.
+        // An attached policy defaults both directions to deny, even without rules.
         rules.push(FirewallRule {
             name: default_deny_name,
             action: RuleAction::Deny,
