@@ -29,6 +29,7 @@ use crate::identity::Identity;
 use crate::proxy::connection_manager::{ConnectionAttributes, ConnectionContext};
 use crate::rbac::{Connection, Direction};
 use crate::sandbox::discovery::Sandbox;
+use crate::sandbox::metadata::{SANDBOX_METADATA_HEADER, SandboxMetadata};
 use crate::sandbox::sandbox;
 
 use crate::proxy::metrics::Reporter;
@@ -352,10 +353,14 @@ impl OutboundConnection {
         if let Some(sandbox) = &req.sandbox {
             builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox.uid.as_str());
         }
-        if let Some(sandbox_manager) = &self.pi.sandbox_manager {
-            if let Some(token) = sandbox_manager.get_or_load_token().await {
-                builder = builder.header(sandbox::SANDBOX_TOKEN_HEADER, token.as_str());
-            }
+        let mut metadata = SandboxMetadata::default();
+        if let Some(manager) = &self.pi.sandbox_manager
+            && let Some(source) = &manager.token
+        {
+            source.fill_metadata(&mut metadata).await;
+        }
+        if let Some(header) = metadata.to_header_value() {
+            builder = builder.header(SANDBOX_METADATA_HEADER, header);
         }
 
         builder
@@ -897,7 +902,7 @@ mod tests {
             identity::mock::new_secret_manager(Duration::from_secs(10)),
         ));
 
-        let outbound = OutboundConnection {
+        let mut outbound = OutboundConnection {
             pi: Arc::new(ProxyInputs {
                 state: state.clone(),
                 cfg: cfg.clone(),
@@ -984,6 +989,40 @@ mod tests {
                     .map(|v| v.to_str().unwrap()),
                 req.sandbox.as_ref().map(|s| s.uid.as_str())
             );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for case in ["disabled", "empty", "ready"] {
+            std::fs::write(
+                directory.path().join("sandbox.token"),
+                if case == "empty" {
+                    ""
+                } else {
+                    r#"{"accessToken":"eyJ.test.signature","sandboxClientId":"client+/="}"#
+                },
+            )
+            .unwrap();
+            let mut manager = sandbox::SandboxManager::new(state.clone(), Arc::new(wi.clone()));
+            if case != "disabled" {
+                manager.token = Some(
+                    crate::sandbox::token::FileSandboxToken::start(directory.path().into(), 10)
+                        .await
+                        .unwrap(),
+                );
+            }
+            Arc::get_mut(&mut outbound.pi).unwrap().sandbox_manager = Some(Arc::new(manager));
+            let request = outbound.create_hbone_request(remote_addr, &req).await;
+            assert_eq!(
+                request
+                    .headers()
+                    .get(SANDBOX_METADATA_HEADER)
+                    .map(|v| v.to_str().unwrap()),
+                (case == "ready").then_some("agent-identity.access-token=eyJ.test.signature,agent-identity.sandbox-client-id=client+/="),
+            );
+            assert_eq!(request.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
+            assert!(!request.headers().contains_key("x-agentio-sandbox-token"));
+            if case == "ready" {
+                assert!(request.headers()[SANDBOX_METADATA_HEADER].is_sensitive());
+            }
         }
     }
 

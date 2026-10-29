@@ -166,3 +166,13 @@ async fn unregistered_manager_rejects_even_if_an_unrelated_sandbox_is_cached() {
     fixture.publish("kruise:unrelated");
     assert!(matches!(manager.ready_sandbox(), Err(Error::NotReady)));
 }
+
+#[test]
+fn header_constants_have_expected_values() {
+    assert_eq!(
+        crate::sandbox::metadata::SANDBOX_METADATA_HEADER,
+        "x-agentio-sandbox-metadata"
+    );
+    assert_eq!(SANDBOX_ID_HEADER, "x-agentio-sandbox-id");
+    assert_eq!(SANDBOX_LABELS_HEADER, "x-agentio-sandbox-labels");
+}

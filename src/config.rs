@@ -88,6 +88,7 @@ const SANDBOX_MANAGEMENT_TLS_DIR: &str = "SANDBOX_MANAGEMENT_TLS_DIR";
 const SANDBOX_MANAGEMENT_ALLOWED_IDENTITIES: &str = "SANDBOX_MANAGEMENT_ALLOWED_IDENTITIES";
 const SANDBOX_STATE_DIR: &str = "SANDBOX_STATE_DIR";
 const ENABLE_SANDBOX_MANAGER: &str = "ENABLE_SANDBOX_MANAGER";
+const SANDBOX_TOKEN_ENABLED: &str = "SANDBOX_TOKEN_ENABLED";
 const SANDBOX_TOKEN_PATH: &str = "SANDBOX_TOKEN_PATH";
 const SANDBOX_WATCHER_DEBOUNCE_MS: &str = "SANDBOX_WATCHER_DEBOUNCE_MS";
 
@@ -440,8 +441,11 @@ pub struct Config {
     /// Registration root; shared mode stores each ZDS workload in its own subdirectory.
     pub sandbox_state_dir: PathBuf,
 
-    /// Enable per-Pod Sandbox registration, preparation RPC, demand and token watching.
+    /// Enable per-Pod Sandbox registration, preparation RPC and demand.
     pub enable_sandbox_manager: bool,
+
+    /// Enable the optional file token protocol for preparation and outbound headers.
+    pub sandbox_token_enabled: bool,
 
     /// Token directory; shared mode appends the ZDS workload UID.
     pub sandbox_token_path: String,
@@ -1090,6 +1094,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             PathBuf::from(DEFAULT_SANDBOX_STATE_DIR),
         )?,
         enable_sandbox_manager: parse_default(ENABLE_SANDBOX_MANAGER, false)?,
+        sandbox_token_enabled: parse_default(SANDBOX_TOKEN_ENABLED, false)?,
         sandbox_token_path: env::var(SANDBOX_TOKEN_PATH)
             .unwrap_or_else(|_| DEFAULT_SANDBOX_TOKEN_PATH.to_string()),
         sandbox_watcher_debounce_ms: parse_default(
@@ -1103,6 +1108,11 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
 }
 
 fn validate_config(cfg: Config) -> Result<Config, Error> {
+    if cfg.sandbox_token_enabled && !cfg.enable_sandbox_manager {
+        return Err(Error::InvalidState(format!(
+            "{SANDBOX_TOKEN_ENABLED} requires {ENABLE_SANDBOX_MANAGER}"
+        )));
+    }
     if cfg.sandbox_management_tls_enabled
         && (!cfg.enable_sandbox_manager || cfg.sandbox_management_allowed_identities.is_empty())
     {
@@ -1125,7 +1135,7 @@ fn validate_config(cfg: Config) -> Result<Config, Error> {
         )));
     }
 
-    if cfg.sandbox_watcher_debounce_ms == 0 {
+    if cfg.sandbox_token_enabled && cfg.sandbox_watcher_debounce_ms == 0 {
         return Err(Error::InvalidState(format!(
             "{SANDBOX_WATCHER_DEBOUNCE_MS} must be greater than zero"
         )));
@@ -1414,12 +1424,17 @@ pub mod tests {
             let result = construct_config(ProxyConfig::default());
             if matches!(
                 case.as_str(),
-                "invalid" | "invalid-manager" | "invalid-address"
+                "invalid"
+                    | "invalid-manager"
+                    | "invalid-address"
+                    | "invalid-token"
+                    | "token-without-manager"
             ) {
                 assert!(result.is_err());
             } else {
                 let config = result.unwrap();
                 assert_eq!(config.sandbox_mode, case == "true");
+                assert_eq!(config.sandbox_token_enabled, case == "token-enabled");
                 assert_eq!(
                     config.enable_sandbox_manager,
                     !matches!(case.as_str(), "disabled" | "address-only")
@@ -1443,6 +1458,9 @@ pub mod tests {
             "custom-address",
             "invalid-manager",
             "invalid-address",
+            "token-enabled",
+            "invalid-token",
+            "token-without-manager",
         ] {
             let mut command = std::process::Command::new(env::current_exe().unwrap());
             command
@@ -1454,7 +1472,8 @@ pub mod tests {
                 .env(CASE, case)
                 .env(ENABLE_SANDBOX_MANAGER, "true")
                 .env_remove(AGENTIO_SANDBOX_MODE)
-                .env_remove(SANDBOX_PREPARE_ADDR);
+                .env_remove(SANDBOX_PREPARE_ADDR)
+                .env_remove(SANDBOX_TOKEN_ENABLED);
             match case {
                 "false" | "true" | "invalid" => {
                     command.env(AGENTIO_SANDBOX_MODE, case);
@@ -1475,6 +1494,17 @@ pub mod tests {
                 }
                 "invalid-address" => {
                     command.env(SANDBOX_PREPARE_ADDR, "invalid");
+                }
+                "token-enabled" => {
+                    command.env(SANDBOX_TOKEN_ENABLED, "true");
+                }
+                "invalid-token" => {
+                    command.env(SANDBOX_TOKEN_ENABLED, "invalid");
+                }
+                "token-without-manager" => {
+                    command
+                        .env(SANDBOX_TOKEN_ENABLED, "true")
+                        .env_remove(ENABLE_SANDBOX_MANAGER);
                 }
                 _ => {}
             }
@@ -1624,7 +1654,7 @@ pub mod tests {
     }
 
     #[test]
-    fn sandbox_watcher_debounce_ms_rejects_zero() {
+    fn sandbox_watcher_debounce_ms_rejects_zero_only_when_enabled() {
         let _guard = SANDBOX_WATCHER_DEBOUNCE_ENV_LOCK.lock().unwrap();
         unsafe {
             env::remove_var("SANDBOX_WATCHER_DEBOUNCE_MS");
@@ -1632,6 +1662,12 @@ pub mod tests {
         let mut config = construct_config(ProxyConfig::default())
             .expect("could not build Config without ProxyConfig");
         config.sandbox_watcher_debounce_ms = 0;
+        config.sandbox_token_enabled = false;
+        assert!(validate_config(config.clone()).is_ok());
+        config.enable_sandbox_manager = true;
+        config.proxy = true;
+        config.xds_address = Some("https://localhost:15012".into());
+        config.sandbox_token_enabled = true;
 
         assert!(matches!(
             validate_config(config),

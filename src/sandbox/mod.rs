@@ -13,4 +13,6 @@
 // limitations under the License.
 
 pub mod discovery;
+pub(crate) mod metadata;
 pub mod sandbox;
+pub(crate) mod token;

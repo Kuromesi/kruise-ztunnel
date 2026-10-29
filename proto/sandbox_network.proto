@@ -20,7 +20,11 @@ package agentio.network.v1;
 // Pod-scoped endpoint: one durable Sandbox registration per workload proxy.
 service SandboxNetwork {
   // Waits for a locally accepted Sandbox snapshot bound to this ztunnel's
-  // Workload, then persists the registration. Safe to retry with the same ID.
+  // Workload, then persists the registration. When the optional token module is
+  // enabled, also confirms a local token with nonempty accessToken and sandboxClientId
+  // fields is loaded. Missing or empty files return FAILED_PRECONDITION; malformed
+  // token JSON returns INTERNAL. Retry with the same ID after provisioning it.
+  // OK confirms local preparation, not EPE readiness.
   rpc PrepareSandbox(PrepareSandboxRequest) returns (PrepareSandboxResponse);
 }
 

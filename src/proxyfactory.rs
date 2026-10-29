@@ -16,6 +16,7 @@
 use crate::config;
 use crate::identity::SecretManager;
 use crate::sandbox::sandbox::SandboxManager;
+use crate::sandbox::token::FileSandboxToken;
 use crate::state::{DemandProxyState, WorkloadInfo};
 use crate::tls;
 use std::sync::Arc;
@@ -190,19 +191,28 @@ impl ProxyFactory {
                     .into());
                 }
                 let mut state_directory = self.config.sandbox_state_dir.clone();
-                let mut token_directory = std::path::PathBuf::from(&self.config.sandbox_token_path);
                 if let Some(uid) = workload_uid {
                     state_directory.push(uid);
-                    token_directory.push(uid);
                 }
                 let mut manager = SandboxManager::new(
                     self.state.clone(),
                     local_workload_information.workload_info(),
                 )
                 .with_registration(state_directory)?;
-                manager
-                    .run(token_directory, self.config.sandbox_watcher_debounce_ms)
-                    .await;
+                if self.config.sandbox_token_enabled {
+                    let mut token_directory =
+                        std::path::PathBuf::from(&self.config.sandbox_token_path);
+                    if let Some(uid) = workload_uid {
+                        token_directory.push(uid);
+                    }
+                    manager.token = Some(
+                        FileSandboxToken::start(
+                            token_directory,
+                            self.config.sandbox_watcher_debounce_ms,
+                        )
+                        .await?,
+                    );
+                }
                 Some(Arc::new(manager))
             } else {
                 None

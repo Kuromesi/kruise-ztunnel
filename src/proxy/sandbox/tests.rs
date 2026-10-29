@@ -17,11 +17,12 @@ use crate::proxy::{DefaultSocketFactory, LocalWorkloadInformation, SocketFactory
 use crate::sandbox::discovery::tests::Fixture;
 use crate::sandbox::sandbox::SandboxManager;
 use crate::sandbox::sandbox::rpc::sandbox_network_client::SandboxNetworkClient;
+use crate::sandbox::token::FileSandboxToken;
 use crate::state::workload::Workload;
 use crate::state::{DemandProxyState, WorkloadInfo};
 use std::path::Path;
 
-fn inputs(
+async fn inputs(
     state: DemandProxyState,
     workload: &Workload,
     directory: &Path,
@@ -30,6 +31,7 @@ fn inputs(
 ) -> Arc<ProxyInputs> {
     let mut config = crate::test_helpers::test_config();
     config.enable_sandbox_manager = true;
+    config.sandbox_token_enabled = true;
     config.sandbox_prepare_addr = address;
     let local = Arc::new(LocalWorkloadInformation::new(
         Arc::new(WorkloadInfo::new(
@@ -40,9 +42,16 @@ fn inputs(
         state.clone(),
         crate::identity::mock::new_secret_manager(Duration::from_secs(10)),
     ));
-    let manager = SandboxManager::new(state.clone(), local.workload_info())
+    let mut manager = SandboxManager::new(state.clone(), local.workload_info())
         .with_registration(directory.into())
         .unwrap();
+    let tokens = directory.join("tokens");
+    manager.token = Some(FileSandboxToken::start(tokens.clone(), 10).await.unwrap());
+    std::fs::write(
+        tokens.join("sandbox.token"),
+        r#"{"accessToken":"token","sandboxClientId":"client"}"#,
+    )
+    .unwrap();
     ProxyInputs::new(
         Arc::new(config),
         Default::default(),
@@ -70,7 +79,8 @@ async fn disabled_manager_preserves_cached_sandbox_lookup() {
         directory.path(),
         "127.0.0.1:0".parse().unwrap(),
         Arc::new(DefaultSocketFactory::default()),
-    );
+    )
+    .await;
     let inputs = Arc::get_mut(&mut pi).unwrap();
     Arc::make_mut(&mut inputs.cfg).enable_sandbox_manager = false;
     inputs.sandbox_manager = None;
@@ -78,6 +88,180 @@ async fn disabled_manager_preserves_cached_sandbox_lookup() {
         inputs.sandbox_for_connection().unwrap().unwrap().uid,
         "sandbox-a"
     );
+}
+
+#[tokio::test]
+async fn prepare_requires_a_nonempty_token_and_allows_retry() {
+    for case in [
+        "missing",
+        "empty",
+        "unreadable",
+        "missing-field",
+        "invalid-json",
+    ] {
+        let fixture = Fixture::new();
+        fixture.publish("sandbox-a");
+        let directory = tempfile::tempdir().unwrap();
+        let pi = inputs(
+            fixture.demand.clone(),
+            &fixture.workload,
+            directory.path(),
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(DefaultSocketFactory::default()),
+        )
+        .await;
+        let token = directory.path().join("tokens/sandbox.token");
+        match case {
+            "missing" => std::fs::remove_file(&token).unwrap(),
+            "empty" => std::fs::write(&token, "").unwrap(),
+            "missing-field" => std::fs::write(&token, r#"{"accessToken":"token"}"#).unwrap(),
+            "invalid-json" => std::fs::write(&token, "not-json").unwrap(),
+            _ => std::fs::write(&token, [0xff]).unwrap(),
+        }
+        let service = Service { pi: pi.clone() };
+        let request = || {
+            Request::new(PrepareSandboxRequest {
+                sandbox_id: "sandbox-a".into(),
+            })
+        };
+        let error = service.prepare_sandbox(request()).await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            if matches!(case, "unreadable" | "missing-field" | "invalid-json") {
+                Code::Internal
+            } else {
+                Code::FailedPrecondition
+            }
+        );
+        assert!(error.message().contains("token"));
+        assert!(!directory.path().join("sandbox.json").exists());
+        assert!(pi.sandbox_for_connection().unwrap().is_none());
+
+        std::fs::write(
+            token,
+            r#"{"accessToken":"ready-token","sandboxClientId":"client"}"#,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match service.prepare_sandbox(request()).await {
+                    Ok(_) => break,
+                    Err(error) => assert_eq!(error.code(), Code::FailedPrecondition),
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            pi.sandbox_for_connection().unwrap().unwrap().uid,
+            "sandbox-a"
+        );
+        assert!(directory.path().join("sandbox.json").exists());
+        // The same ID remains idempotent once both configuration and token are ready.
+        service.prepare_sandbox(request()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn dedicated_factory_reads_agents_token_layout() {
+    for case in ["disabled", "enabled", "startup-error"] {
+        let fixture = Fixture::new();
+        fixture.publish("sandbox-a");
+        let directory = tempfile::tempdir().unwrap();
+        let tokens = directory.path().join("agent-token");
+        let state = directory.path().join("state");
+        let mut cfg = crate::test_helpers::test_config();
+        cfg.enable_sandbox_manager = true;
+        cfg.dns_proxy = false;
+        cfg.proxy_mode = crate::config::ProxyMode::Dedicated;
+        cfg.sandbox_prepare_addr = "127.0.0.1:0".parse().unwrap();
+        cfg.sandbox_state_dir = state.clone();
+        cfg.sandbox_token_path = tokens.to_str().unwrap().into();
+        cfg.sandbox_token_enabled = case != "disabled";
+        cfg.sandbox_watcher_debounce_ms = if case == "disabled" { 0 } else { 10 };
+        if case == "startup-error" {
+            std::fs::write(&tokens, "not a directory").unwrap();
+        }
+        let (_drain, watch) = crate::drain::new();
+        let factory = crate::proxyfactory::ProxyFactory::new(
+            Arc::new(cfg),
+            fixture.demand.clone(),
+            crate::identity::mock::new_secret_manager(Duration::from_secs(10)),
+            crate::test_helpers::helpers::test_proxy_metrics(),
+            None,
+            watch,
+            None,
+        )
+        .unwrap();
+        let result = factory
+            .new_proxies_for_dedicated(WorkloadInfo::new(
+                "pod".into(),
+                "ns".into(),
+                "default".into(),
+            ))
+            .await;
+        let proxies = match result {
+            Ok(proxies) => {
+                assert_ne!(case, "startup-error");
+                proxies
+            }
+            Err(error) => {
+                assert_eq!(case, "startup-error");
+                assert!(error.to_string().contains("Sandbox token loading failed"));
+                continue;
+            }
+        };
+        let pi = proxies
+            .proxy
+            .as_ref()
+            .unwrap()
+            .sandbox
+            .as_ref()
+            .unwrap()
+            .pi
+            .clone();
+        let service = Service { pi: pi.clone() };
+        let request = || {
+            Request::new(PrepareSandboxRequest {
+                sandbox_id: "sandbox-a".into(),
+            })
+        };
+        if case == "disabled" {
+            assert!(pi.sandbox_manager.as_ref().unwrap().token.is_none());
+            service.prepare_sandbox(request()).await.unwrap();
+            assert!(state.join("sandbox.json").is_file());
+            assert!(!tokens.exists());
+            continue;
+        }
+        assert_eq!(
+            service.prepare_sandbox(request()).await.unwrap_err().code(),
+            Code::FailedPrecondition
+        );
+        assert!(!state.join("sandbox.json").exists());
+
+        // agents writes a namespace/name digest filename, independent of the xDS Sandbox ID.
+        let raw = r#"{"accessToken":"test-access-token","sandboxClientId":"client+/="}"#;
+        std::fs::write(tokens.join("5d10446ba1916368fd4fb05d40d31db3.token"), raw).unwrap();
+        service.prepare_sandbox(request()).await.unwrap();
+        assert!(state.join("sandbox.json").is_file());
+        assert_eq!(
+            pi.sandbox_manager
+                .as_ref()
+                .unwrap()
+                .token
+                .as_ref()
+                .unwrap()
+                .get_or_load()
+                .await
+                .unwrap()
+                .to_header_value()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "agent-identity.access-token=test-access-token,agent-identity.sandbox-client-id=client+/=",
+        );
+    }
 }
 
 #[tokio::test]
@@ -92,7 +276,8 @@ async fn sandbox_unavailable_uses_workload_policies_while_prepare_still_waits() 
         directory.path(),
         "127.0.0.1:0".parse().unwrap(),
         Arc::new(DefaultSocketFactory::default()),
-    );
+    )
+    .await;
     let manager = pi.sandbox_manager.as_ref().unwrap();
     assert!(pi.sandbox_for_connection().unwrap().is_none());
     let service = Service { pi: pi.clone() };
@@ -166,14 +351,16 @@ async fn sandbox_rpc_and_outbound_share_per_pod_registration_and_drain() {
             &directories.path().join("pod-a"),
             "127.0.0.1:0".parse().unwrap(),
             Arc::new(DefaultSocketFactory::default()),
-        );
+        )
+        .await;
         let pi_b = inputs(
             fixture.demand.clone(),
             &other,
             &directories.path().join("pod-b"),
             "127.0.0.1:0".parse().unwrap(),
             Arc::new(DefaultSocketFactory::default()),
-        );
+        )
+        .await;
         let (drain_a, watch_a) = crate::drain::new();
         let (drain_b, watch_b) = crate::drain::new();
         let server_a = Server::new(pi_a.clone(), watch_a).unwrap();
@@ -263,7 +450,8 @@ async fn failed_prepare_does_not_register_and_allows_corrected_id() {
             directory.path(),
             "127.0.0.1:0".parse().unwrap(),
             Arc::new(DefaultSocketFactory::default()),
-        );
+        )
+        .await;
         let service = Service { pi: pi.clone() };
         let error = service
             .prepare_sandbox(Request::new(PrepareSandboxRequest {
@@ -323,7 +511,8 @@ async fn cancelled_prepare_does_not_register_and_allows_corrected_id() {
         directory.path(),
         "127.0.0.1:0".parse().unwrap(),
         Arc::new(DefaultSocketFactory::default()),
-    );
+    )
+    .await;
     let service = Service { pi: pi.clone() };
     let mut preparation = Box::pin(service.prepare_sandbox(Request::new(PrepareSandboxRequest {
         sandbox_id: "missing".into(),
@@ -356,7 +545,8 @@ async fn concurrent_prepare_commits_only_one_identity() {
         directory.path(),
         "127.0.0.1:0".parse().unwrap(),
         Arc::new(DefaultSocketFactory::default()),
-    );
+    )
+    .await;
     let service = Service { pi: pi.clone() };
     let (a, b) = tokio::join!(
         service.prepare_sandbox(Request::new(PrepareSandboxRequest {
@@ -407,7 +597,8 @@ async fn sandbox_rpc_binds_same_address_in_distinct_pod_netns() {
         &directory.path().join("a"),
         "127.0.0.1:0".parse().unwrap(),
         Arc::from(inpod.socket_factory(ns_a)),
-    );
+    )
+    .await;
     let server_a = Server::new(pi_a, watch.clone()).unwrap();
     let address = server_a.listener.local_addr().unwrap();
     let pi_b = inputs(
@@ -416,7 +607,8 @@ async fn sandbox_rpc_binds_same_address_in_distinct_pod_netns() {
         &directory.path().join("b"),
         address,
         Arc::from(inpod.socket_factory(ns_b)),
-    );
+    )
+    .await;
     let server_b = Server::new(pi_b, watch).unwrap();
     assert_eq!(server_b.listener.local_addr().unwrap(), address);
 }
@@ -462,7 +654,8 @@ async fn sandbox_management_tls_authenticates_before_prepare() {
             directory.path(),
             "127.0.0.1:0".parse().unwrap(),
             Arc::new(DefaultSocketFactory::default()),
-        );
+        )
+        .await;
         let inputs = Arc::get_mut(&mut pi).unwrap();
         Arc::make_mut(&mut inputs.cfg).sandbox_management_tls_enabled = true;
         inputs.sandbox_management_tls = Some(tls);

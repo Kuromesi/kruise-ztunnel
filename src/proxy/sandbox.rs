@@ -165,6 +165,9 @@ impl SandboxNetwork for Service {
             .expect("preparation configured");
         manager.check_registration(&id)?;
         manager.wait_for_sandbox(&id).await?;
+        if let Some(token) = &manager.token {
+            token.require_ready().await?;
+        }
         tokio::task::spawn_blocking(move || manager.register(&id))
             .await
             .map_err(|e| Status::internal(format!("registration task failed: {e}")))??;
@@ -177,10 +180,12 @@ impl From<Error> for Status {
     fn from(error: Error) -> Self {
         let code = match &error {
             Error::InvalidIdentity(_) => Code::InvalidArgument,
-            Error::AlreadyRegistered | Error::WorkloadMismatch => Code::FailedPrecondition,
+            Error::AlreadyRegistered | Error::WorkloadMismatch | Error::TokenNotReady => {
+                Code::FailedPrecondition
+            }
             Error::NotReady => Code::DeadlineExceeded,
             Error::UnknownWorkload | Error::UpdateChannelClosed(_) => Code::Unavailable,
-            Error::Io(_) | Error::Json(_) => Code::Internal,
+            Error::Io(_) | Error::Json(_) | Error::TokenLoad(_) => Code::Internal,
         };
         Status::new(code, error.to_string())
     }
