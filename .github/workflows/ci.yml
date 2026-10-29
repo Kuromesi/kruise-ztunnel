@@ -67,6 +67,7 @@ jobs:
           env -u RUST_LOG cargo test --locked --lib --test direct --bins -- \
             --test-threads=1 \
             --skip inpod:: \
+            --skip proxy::sandbox::tests::sandbox_rpc_binds_same_address_in_distinct_pod_netns \
             --skip proxy::outbound_udp::tests::recvmmsg_reads_multiple_datagrams_with_original_destination \
             --skip proxy::outbound_udp::tests::response_socket_is_bound_in_the_workload_netns \
             --skip tls::certificate::test::multi_root
@@ -117,6 +118,11 @@ jobs:
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             cargo test --locked --lib proxy::outbound_udp::tests:: -- --test-threads=1
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            cargo test --locked --lib proxy::sandbox::tests::sandbox_rpc_binds_same_address_in_distinct_pod_netns -- --exact --test-threads=1
           sudo env \
             "PATH=$PATH" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \

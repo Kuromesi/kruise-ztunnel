@@ -23,6 +23,7 @@ use std::{fmt, io};
 
 use hickory_proto::ProtoError;
 
+use crate::sandbox::discovery::Sandbox;
 use crate::sandbox::sandbox::SandboxManager;
 use crate::socket::is_self_addr;
 use crate::strng::Strng;
@@ -64,6 +65,7 @@ pub mod metrics;
 mod outbound;
 mod outbound_udp;
 pub mod pool;
+mod sandbox;
 #[cfg(any(test, feature = "testing"))]
 mod socks5;
 pub mod util;
@@ -217,6 +219,7 @@ pub struct Proxy {
     inbound_passthrough: InboundPassthrough,
     outbound: Outbound,
     outbound_udp: Option<OutboundUdp>,
+    sandbox: Option<sandbox::Server>,
     #[cfg(any(test, feature = "testing"))]
     socks5: Option<Socks5>,
     policy_watcher: PolicyWatcher,
@@ -314,6 +317,7 @@ pub(super) struct ProxyInputs {
     pub disable_inbound_freebind: bool,
     pub(super) crl_manager: Option<Arc<tls::crl::CrlManager>>,
     sandbox_manager: Option<Arc<SandboxManager>>,
+    sandbox_management_tls: Option<Arc<tls::management::ManagementTls>>,
     firewall_metrics: Option<FirewallMetrics>,
 }
 
@@ -330,6 +334,7 @@ impl ProxyInputs {
         disable_inbound_freebind: bool,
         crl_manager: Option<Arc<tls::crl::CrlManager>>,
         sandbox_manager: Option<Arc<SandboxManager>>,
+        sandbox_management_tls: Option<Arc<tls::management::ManagementTls>>,
         firewall_metrics: Option<FirewallMetrics>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -344,8 +349,34 @@ impl ProxyInputs {
             disable_inbound_freebind,
             crl_manager,
             sandbox_manager,
+            sandbox_management_tls,
             firewall_metrics,
         })
+    }
+
+    /// System and Sandbox traffic share the Pod. Until Sandbox configuration is
+    /// ready, use only the existing Workload policies without waiting or demanding.
+    fn sandbox_for_connection(&self) -> Result<Option<Arc<Sandbox>>, Error> {
+        match &self.sandbox_manager {
+            Some(manager) => match manager.ready_sandbox() {
+                Ok(sandbox) => Ok(Some(sandbox)),
+                Err(crate::sandbox::sandbox::Error::NotReady) => Ok(None),
+                Err(error) => Err(Error::SandboxNotReady(error)),
+            },
+            _ => {
+                let state = self.state.read();
+                Ok(state
+                    .workloads
+                    .find_by_info(&self.local_workload_information.workload_info())
+                    .and_then(|workload| {
+                        state
+                            .sandboxes
+                            .get_by_workload(&workload.uid)
+                            .first()
+                            .cloned()
+                    }))
+            }
+        }
     }
 }
 
@@ -355,6 +386,11 @@ impl Proxy {
         drain: DrainWatcher,
     ) -> Result<Self, Error> {
         // We setup all the listeners first so we can capture any errors that should block startup
+        let sandbox = if pi.cfg.enable_sandbox_manager {
+            Some(sandbox::Server::new(pi.clone(), drain.clone())?)
+        } else {
+            None
+        };
         let inbound = Inbound::new(pi.clone(), drain.clone()).await?;
 
         let inbound_passthrough = InboundPassthrough::new(pi.clone(), drain.clone()).await?;
@@ -413,6 +449,7 @@ impl Proxy {
             inbound_passthrough,
             outbound,
             outbound_udp,
+            sandbox,
             #[cfg(any(test, feature = "testing"))]
             socks5,
             policy_watcher,
@@ -427,6 +464,10 @@ impl Proxy {
             tokio::spawn(self.inbound.run().in_current_span()),
             tokio::spawn(self.outbound.run().in_current_span()),
         ];
+
+        if let Some(sandbox) = self.sandbox {
+            tasks.push(tokio::spawn(sandbox.run().in_current_span()));
+        }
 
         if let Some(fw) = self.firewall_controller {
             tasks.push(tokio::spawn(fw.run().in_current_span()));
@@ -482,6 +523,9 @@ impl fmt::Display for AuthorizationRejectionError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("sandbox is not ready: {0}")]
+    SandboxNotReady(#[from] crate::sandbox::sandbox::Error),
+
     #[error("failed to bind to address {0}: {1}")]
     Bind(SocketAddr, io::Error),
 
@@ -657,8 +701,6 @@ pub struct TraceParent {
 
 pub const BAGGAGE_HEADER: &str = "baggage";
 pub const TRACEPARENT_HEADER: &str = "traceparent";
-pub const WORKLOAD_NAME_HEADER: &str = "x-agentio-workload-name";
-pub const WORKLOAD_NAMESPACE_HEADER: &str = "x-agentio-workload-namespace";
 
 impl TraceParent {
     pub fn header(&self) -> hyper::header::HeaderValue {

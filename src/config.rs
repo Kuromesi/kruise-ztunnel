@@ -82,6 +82,11 @@ const FIREWALL_BACKEND: &str = "FIREWALL_BACKEND";
 const FIREWALL_DEBOUNCE_INTERVAL: &str = "FIREWALL_DEBOUNCE_INTERVAL";
 const FIREWALL_MAX_DEBOUNCE_TIME: &str = "FIREWALL_MAX_DEBOUNCE_TIME";
 const AGENTIO_SANDBOX_MODE: &str = "AGENTIO_SANDBOX_MODE";
+const SANDBOX_PREPARE_ADDR: &str = "SANDBOX_PREPARE_ADDR";
+const SANDBOX_MANAGEMENT_TLS_ENABLED: &str = "SANDBOX_MANAGEMENT_TLS_ENABLED";
+const SANDBOX_MANAGEMENT_TLS_DIR: &str = "SANDBOX_MANAGEMENT_TLS_DIR";
+const SANDBOX_MANAGEMENT_ALLOWED_IDENTITIES: &str = "SANDBOX_MANAGEMENT_ALLOWED_IDENTITIES";
+const SANDBOX_STATE_DIR: &str = "SANDBOX_STATE_DIR";
 const ENABLE_SANDBOX_MANAGER: &str = "ENABLE_SANDBOX_MANAGER";
 const SANDBOX_TOKEN_PATH: &str = "SANDBOX_TOKEN_PATH";
 const SANDBOX_WATCHER_DEBOUNCE_MS: &str = "SANDBOX_WATCHER_DEBOUNCE_MS";
@@ -109,6 +114,7 @@ const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60 * 24); // 24 hours
 const DEFAULT_POOL_UNUSED_RELEASE_TIMEOUT: Duration = Duration::from_secs(60 * 5); // 5 minutes
 const DEFAULT_POOL_MAX_STREAMS_PER_CONNECTION: u16 = 100; //Go: 100, Hyper: 200, Envoy: 2147483647 (lol), Spec recommended minimum 100
+const DEFAULT_SANDBOX_STATE_DIR: &str = "/var/lib/ztunnel/sandbox";
 const DEFAULT_SANDBOX_TOKEN_PATH: &str = "/var/opt/sandbox/agent-token/";
 const DEFAULT_SANDBOX_WATCHER_DEBOUNCE_MS: u64 = 500;
 
@@ -420,11 +426,24 @@ pub struct Config {
 
     pub firewall_max_debounce_time: Duration,
 
-    /// Subscribe to Sandbox xDS resources and wait for their initial synchronization.
+    /// Watch all Sandbox resources when the per-Pod Sandbox manager is disabled.
     pub sandbox_mode: bool,
 
+    /// Bind the Sandbox preparation RPC in each proxied Pod's network namespace.
+    pub sandbox_prepare_addr: SocketAddr,
+    /// Require mTLS and an allowed client SAN on Sandbox management RPCs.
+    pub sandbox_management_tls_enabled: bool,
+    /// Contains tls.crt, tls.key and ca.crt (trusted management client CAs).
+    pub sandbox_management_tls_dir: PathBuf,
+    /// Exact URI or DNS SANs; no CN fallback or wildcard matching.
+    pub sandbox_management_allowed_identities: Vec<String>,
+    /// Registration root; shared mode stores each ZDS workload in its own subdirectory.
+    pub sandbox_state_dir: PathBuf,
+
+    /// Enable per-Pod Sandbox registration, preparation RPC, demand and token watching.
     pub enable_sandbox_manager: bool,
 
+    /// Token directory; shared mode appends the ZDS workload UID.
     pub sandbox_token_path: String,
 
     pub sandbox_watcher_debounce_ms: u64,
@@ -1050,9 +1069,27 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             crate::firewall::DEFAULT_FIREWALL_MAX_DEBOUNCE_TIME,
         )?,
         sandbox_mode: parse_default(AGENTIO_SANDBOX_MODE, false)?,
-        enable_sandbox_manager: env::var(ENABLE_SANDBOX_MANAGER)
-            .map(|value| value == "true")
-            .unwrap_or(false),
+        sandbox_prepare_addr: parse_default(
+            SANDBOX_PREPARE_ADDR,
+            SocketAddr::from(([127, 0, 0, 1], 15090)),
+        )?,
+        sandbox_management_tls_enabled: parse_default(SANDBOX_MANAGEMENT_TLS_ENABLED, false)?,
+        sandbox_management_tls_dir: parse_default(
+            SANDBOX_MANAGEMENT_TLS_DIR,
+            PathBuf::from("/var/run/ztunnel/management-tls"),
+        )?,
+        sandbox_management_allowed_identities: env::var(SANDBOX_MANAGEMENT_ALLOWED_IDENTITIES)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(String::from)
+            .collect(),
+        sandbox_state_dir: parse_default(
+            SANDBOX_STATE_DIR,
+            PathBuf::from(DEFAULT_SANDBOX_STATE_DIR),
+        )?,
+        enable_sandbox_manager: parse_default(ENABLE_SANDBOX_MANAGER, false)?,
         sandbox_token_path: env::var(SANDBOX_TOKEN_PATH)
             .unwrap_or_else(|_| DEFAULT_SANDBOX_TOKEN_PATH.to_string()),
         sandbox_watcher_debounce_ms: parse_default(
@@ -1066,6 +1103,19 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
 }
 
 fn validate_config(cfg: Config) -> Result<Config, Error> {
+    if cfg.sandbox_management_tls_enabled
+        && (!cfg.enable_sandbox_manager || cfg.sandbox_management_allowed_identities.is_empty())
+    {
+        return Err(Error::InvalidState(format!(
+            "{SANDBOX_MANAGEMENT_TLS_ENABLED} requires {ENABLE_SANDBOX_MANAGER} and a nonempty {SANDBOX_MANAGEMENT_ALLOWED_IDENTITIES}"
+        )));
+    }
+    if cfg.enable_sandbox_manager && (!cfg.proxy || cfg.xds_address.is_none()) {
+        return Err(Error::InvalidState(format!(
+            "{ENABLE_SANDBOX_MANAGER} requires an enabled proxy and an xDS server"
+        )));
+    }
+
     if cfg.enable_admin_unix_socket
         && (!cfg.admin_unix_socket_path.is_absolute()
             || cfg.admin_unix_socket_path.file_name().is_none())
@@ -1298,21 +1348,102 @@ pub mod tests {
     static SANDBOX_WATCHER_DEBOUNCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn sandbox_preparation_accepts_shared_and_dedicated_modes() {
+        for mode in [ProxyMode::Shared, ProxyMode::Dedicated] {
+            for on_demand in [false, true] {
+                let mut cfg = crate::test_helpers::test_config();
+                cfg.proxy_mode = mode;
+                cfg.sandbox_mode = false;
+                cfg.enable_sandbox_manager = true;
+                cfg.xds_address = Some("https://localhost:15012".into());
+                cfg.xds_on_demand = on_demand;
+                cfg.dns_proxy = false;
+                if mode == ProxyMode::Shared {
+                    cfg.proxy_workload_information = None;
+                }
+                assert!(
+                    validate_config(cfg).is_ok(),
+                    "{mode:?}, on_demand={on_demand}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sandbox_management_tls_requires_manager_and_allowed_identities() {
+        for enabled in [false, true] {
+            for manager in [false, true] {
+                for identities in [false, true] {
+                    let mut cfg = crate::test_helpers::test_config();
+                    cfg.xds_address = Some("https://localhost:15012".into());
+                    cfg.sandbox_management_tls_enabled = enabled;
+                    cfg.enable_sandbox_manager = manager;
+                    cfg.sandbox_management_allowed_identities = if identities {
+                        vec!["manager.example".into()]
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(
+                        validate_config(cfg).is_ok(),
+                        !enabled || (manager && identities)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sandbox_manager_requires_proxy_and_xds() {
+        for proxy in [false, true] {
+            for xds in [false, true] {
+                let mut cfg = crate::test_helpers::test_config();
+                cfg.enable_sandbox_manager = true;
+                cfg.proxy = proxy;
+                cfg.dns_proxy = true;
+                cfg.xds_address = xds.then(|| "https://localhost:15012".into());
+                assert_eq!(validate_config(cfg).is_ok(), proxy && xds);
+            }
+        }
+    }
+
+    #[test]
     fn sandbox_mode_environment() {
         // Use subprocesses so environment changes cannot race other Config tests.
         const CASE: &str = "ZTUNNEL_TEST_SANDBOX_MODE";
         if let Ok(case) = env::var(CASE) {
             let result = construct_config(ProxyConfig::default());
-            if case == "invalid" {
+            if matches!(
+                case.as_str(),
+                "invalid" | "invalid-manager" | "invalid-address"
+            ) {
                 assert!(result.is_err());
             } else {
                 let config = result.unwrap();
                 assert_eq!(config.sandbox_mode, case == "true");
-                assert!(config.enable_sandbox_manager);
+                assert_eq!(
+                    config.enable_sandbox_manager,
+                    !matches!(case.as_str(), "disabled" | "address-only")
+                );
+                let address = if matches!(case.as_str(), "custom-address" | "address-only") {
+                    "127.0.0.1:15091"
+                } else {
+                    "127.0.0.1:15090"
+                };
+                assert_eq!(config.sandbox_prepare_addr, address.parse().unwrap());
             }
             return;
         }
-        for case in ["default", "false", "true", "invalid"] {
+        for case in [
+            "default",
+            "false",
+            "true",
+            "invalid",
+            "disabled",
+            "address-only",
+            "custom-address",
+            "invalid-manager",
+            "invalid-address",
+        ] {
             let mut command = std::process::Command::new(env::current_exe().unwrap());
             command
                 .args([
@@ -1322,9 +1453,30 @@ pub mod tests {
                 ])
                 .env(CASE, case)
                 .env(ENABLE_SANDBOX_MANAGER, "true")
-                .env_remove(AGENTIO_SANDBOX_MODE);
-            if case != "default" {
-                command.env(AGENTIO_SANDBOX_MODE, case);
+                .env_remove(AGENTIO_SANDBOX_MODE)
+                .env_remove(SANDBOX_PREPARE_ADDR);
+            match case {
+                "false" | "true" | "invalid" => {
+                    command.env(AGENTIO_SANDBOX_MODE, case);
+                }
+                "disabled" => {
+                    command.env_remove(ENABLE_SANDBOX_MANAGER);
+                }
+                "address-only" => {
+                    command
+                        .env_remove(ENABLE_SANDBOX_MANAGER)
+                        .env(SANDBOX_PREPARE_ADDR, "127.0.0.1:15091");
+                }
+                "custom-address" => {
+                    command.env(SANDBOX_PREPARE_ADDR, "127.0.0.1:15091");
+                }
+                "invalid-manager" => {
+                    command.env(ENABLE_SANDBOX_MANAGER, "invalid");
+                }
+                "invalid-address" => {
+                    command.env(SANDBOX_PREPARE_ADDR, "invalid");
+                }
+                _ => {}
             }
             let output = command.output().unwrap();
             assert!(

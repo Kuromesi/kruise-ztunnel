@@ -575,6 +575,7 @@ async fn dispatcher_fixture(
         None,
         None,
         None,
+        None,
     );
     (
         OutboundUdp {

@@ -18,6 +18,7 @@ mod control;
 pub mod crl;
 pub mod csr;
 mod lib;
+pub(crate) mod management;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
 mod workload;

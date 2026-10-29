@@ -39,7 +39,7 @@ pub struct ProxyFactory {
     dns_metrics: Option<Arc<dns::Metrics>>,
     drain: DrainWatcher,
     crl_manager: Option<Arc<tls::crl::CrlManager>>,
-    sandbox_manager: Option<Arc<SandboxManager>>,
+    sandbox_management_tls: Option<Arc<tls::management::ManagementTls>>,
     firewall_metrics: Option<FirewallMetrics>,
 }
 
@@ -51,9 +51,19 @@ impl ProxyFactory {
         proxy_metrics: Arc<Metrics>,
         dns_metrics: Option<dns::Metrics>,
         drain: DrainWatcher,
-        sandbox_manager: Option<Arc<SandboxManager>>,
         firewall_metrics: Option<FirewallMetrics>,
     ) -> std::io::Result<Self> {
+        let sandbox_management_tls = if config.sandbox_management_tls_enabled {
+            Some(Arc::new(
+                tls::management::ManagementTls::load(
+                    &config.sandbox_management_tls_dir,
+                    &config.sandbox_management_allowed_identities,
+                )
+                .map_err(std::io::Error::other)?,
+            ))
+        } else {
+            None
+        };
         let dns_metrics = match dns_metrics {
             Some(metrics) => Some(Arc::new(metrics)),
             None => {
@@ -102,7 +112,7 @@ impl ProxyFactory {
             dns_metrics,
             drain,
             crl_manager,
-            sandbox_manager,
+            sandbox_management_tls,
             firewall_metrics,
         })
     }
@@ -118,13 +128,14 @@ impl ProxyFactory {
             } else {
                 Arc::new(base)
             };
-        self.new_proxies_from_factory(None, proxy_workload_info, factory)
+        self.new_proxies_from_factory(None, None, proxy_workload_info, factory)
             .await
     }
 
     pub async fn new_proxies_from_factory(
         &self,
         proxy_drain: Option<DrainWatcher>,
+        workload_uid: Option<&str>,
         proxy_workload_info: WorkloadInfo,
         socket_factory: Arc<dyn crate::proxy::SocketFactory + Send + Sync>,
     ) -> Result<ProxyResult, Error> {
@@ -168,6 +179,34 @@ impl ProxyFactory {
 
         // Optionally create the HBONE proxy.
         if self.config.proxy {
+            let sandbox_manager = if self.config.enable_sandbox_manager {
+                if let Some(uid) = workload_uid
+                    && std::path::Path::new(uid).file_name() != Some(std::ffi::OsStr::new(uid))
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "workload UID must be a single directory name",
+                    )
+                    .into());
+                }
+                let mut state_directory = self.config.sandbox_state_dir.clone();
+                let mut token_directory = std::path::PathBuf::from(&self.config.sandbox_token_path);
+                if let Some(uid) = workload_uid {
+                    state_directory.push(uid);
+                    token_directory.push(uid);
+                }
+                let mut manager = SandboxManager::new(
+                    self.state.clone(),
+                    local_workload_information.workload_info(),
+                )
+                .with_registration(state_directory)?;
+                manager
+                    .run(token_directory, self.config.sandbox_watcher_debounce_ms)
+                    .await;
+                Some(Arc::new(manager))
+            } else {
+                None
+            };
             let cm = ConnectionManager::default();
             let pi = crate::proxy::ProxyInputs::new(
                 self.config.clone(),
@@ -180,7 +219,8 @@ impl ProxyFactory {
                 local_workload_information,
                 false,
                 self.crl_manager.clone(),
-                self.sandbox_manager.clone(),
+                sandbox_manager,
+                self.sandbox_management_tls.clone(),
                 self.firewall_metrics.clone(),
             );
             result.connection_manager = Some(cm);
@@ -229,7 +269,8 @@ impl ProxyFactory {
                 local_workload_information,
                 true,
                 self.crl_manager.clone(),
-                self.sandbox_manager.clone(),
+                None,
+                None,
                 None,
             );
 

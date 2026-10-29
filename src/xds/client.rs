@@ -234,6 +234,9 @@ pub struct State {
     /// pending stores a list of all resources that are pending and XDS push
     pending: HashMap<ResourceKey, oneshot::Sender<()>>,
 
+    // Requested names remain subscribed even while absent. Replay them after reconnect.
+    subscriptions: HashMap<Strng, HashSet<Strng>>,
+
     demand: mpsc::Receiver<(oneshot::Sender<()>, ResourceKey)>,
     demand_tx: mpsc::Sender<(oneshot::Sender<()>, ResourceKey)>,
 }
@@ -284,6 +287,18 @@ impl Config {
         let no_on_demand = f.no_on_demand();
         self.with_handler(type_url.clone(), f)
             .watch(type_url, no_on_demand)
+    }
+
+    /// Demand only this resource type, independently of Workload discovery mode.
+    pub fn with_on_demand_handler<F>(mut self, type_url: Strng, f: impl Handler<F>) -> Config
+    where
+        F: 'static + fmt::Debug + prost::Message + Default,
+    {
+        let mut request = self.construct_initial_request(type_url.clone(), false);
+        request.resource_names_subscribe = vec!["*".into()];
+        request.resource_names_unsubscribe = vec!["*".into()];
+        self.initial_requests.push(request);
+        self.with_handler(type_url, f)
     }
 
     pub fn with_optional_watched_handler<F>(mut self, type_url: Strng, f: impl Handler<F>) -> Config
@@ -459,6 +474,7 @@ impl Demanded {
 #[derive(Debug, Clone)]
 pub struct Demander {
     demand: mpsc::Sender<(oneshot::Sender<()>, ResourceKey)>,
+    on_demand_types: Arc<HashSet<Strng>>,
 }
 
 #[derive(Debug)]
@@ -477,15 +493,22 @@ impl Display for XdsSignal {
 }
 
 impl Demander {
-    /// Demand requests a given workload by name
-    pub async fn demand(&self, type_url: Strng, name: Strng) -> Demanded {
+    pub fn supports(&self, type_url: &str) -> bool {
+        self.on_demand_types.contains(type_url)
+    }
+
+    /// Request a resource by type and name. Push-only or unwatched types return None.
+    pub async fn demand(&self, type_url: Strng, name: Strng) -> Option<Demanded> {
+        if !self.supports(&type_url) {
+            return None;
+        }
         let (tx, rx) = oneshot::channel::<()>();
         self.demand
             .send((tx, ResourceKey { name, type_url }))
             .await
             // TODO: is this guaranteed? How can we handle the failure
             .expect("demand channel should not close");
-        Demanded { b: rx }
+        Some(Demanded { b: rx })
     }
 }
 
@@ -502,6 +525,7 @@ impl AdsClient {
         let state = State {
             known_resources: Default::default(),
             pending: Default::default(),
+            subscriptions: Default::default(),
             demand: rx,
             demand_tx: tx,
         };
@@ -522,15 +546,22 @@ impl AdsClient {
         }
     }
 
-    /// demander returns a Demander instance which can be used to request resources on-demand
+    /// Return a shared demand handle for the resource types configured with named watches.
     pub fn demander(&self) -> Option<Demander> {
-        if self.config.on_demand {
-            Some(Demander {
-                demand: self.state.demand_tx.clone(),
-            })
-        } else {
-            None
+        let on_demand_types: HashSet<_> = self
+            .config
+            .initial_requests
+            .iter()
+            .filter(|request| Self::is_initial_request_on_demand(request))
+            .map(|request| strng::new(&request.type_url))
+            .collect();
+        if on_demand_types.is_empty() {
+            return None;
         }
+        Some(Demander {
+            demand: self.state.demand_tx.clone(),
+            on_demand_types: Arc::new(on_demand_types),
+        })
     }
 
     async fn run_loop(&mut self, backoff: Duration) -> Duration {
@@ -616,6 +647,13 @@ impl AdsClient {
             .iter()
             .map(|e| {
                 let mut req = e.clone();
+                if Self::is_initial_request_on_demand(e)
+                    && let Some(names) = self.state.subscriptions.get(&strng::new(&req.type_url))
+                    && !names.is_empty()
+                {
+                    req.resource_names_subscribe = names.iter().map(ToString::to_string).collect();
+                    req.resource_names_unsubscribe.clear();
+                }
                 req.initial_resource_versions = self
                     .state
                     .known_resources
@@ -782,7 +820,11 @@ impl AdsClient {
         info!("received on demand request {demand_event}");
         let ResourceKey { type_url, name } = demand_event.clone();
         self.state.pending.insert(demand_event, tx);
-        self.state.add_resource(type_url.clone(), name.clone());
+        self.state
+            .subscriptions
+            .entry(type_url.clone())
+            .or_default()
+            .insert(name.clone());
         send.send(DeltaDiscoveryRequest {
             type_url: type_url.to_string(),
             resource_names_subscribe: vec![name.to_string()],
@@ -1062,7 +1104,7 @@ mod tests {
                 info!("workload manager: {}", e);
             }
         });
-        let result = demander.demand(ADDRESS_TYPE, "foo0".into()).await;
+        let result = demander.demand(ADDRESS_TYPE, "foo0".into()).await.unwrap();
 
         let mut conn = conn_receiver.recv().await.unwrap();
 

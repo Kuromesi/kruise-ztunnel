@@ -27,6 +27,7 @@ fn main() -> Result<(), anyhow::Error> {
         "proto/workload.proto",
         "proto/citadel.proto",
         "proto/zds.proto",
+        "proto/sandbox_network.proto",
         "proto/extensions.proto",
         "proto/api/sandbox/v1/sandbox.proto",
         "proto/api/security/v1/trafficpolicy.proto",

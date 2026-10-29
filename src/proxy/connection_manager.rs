@@ -566,8 +566,10 @@ mod tests {
         assert_eq!(cm.connections().len(), 0);
     }
 
+    #[test_case::test_case(false; "policy_update")]
+    #[test_case::test_case(true; "binding_update")]
     #[tokio::test]
-    async fn test_policy_watcher_lifecycle() {
+    async fn test_sandbox_policy_watcher_lifecycle(rebind: bool) {
         let policy_name = "trafficPolicies/test";
         let state = Arc::new(RwLock::new(ProxyState::new(None)));
         let workload = Arc::new(crate::state::workload::Workload {
@@ -632,7 +634,7 @@ mod tests {
 
         let conn = ConnectionContext {
             rbac_ctx: crate::state::ProxyRbacContext {
-                sandbox: None,
+                sandbox: dstate.fetch_sandbox(&workload),
                 conn: Connection {
                     src_identity: None,
                     src: "192.168.0.1:80".parse().unwrap(),
@@ -647,8 +649,25 @@ mod tests {
         let mut connection = connection_manager.assert_rbac(&dstate, conn).await.unwrap();
         let close = connection.watch.take().unwrap();
 
-        // An explicitly empty ingress denies the previously allowed connection.
-        publish(vec![]);
+        if rebind {
+            updater
+                .handle(Box::new(&mut std::iter::once(XdsUpdate::Update(
+                    XdsResource {
+                        name: "sandbox".into(),
+                        resource: crate::xds::agentio::sandbox::Sandbox {
+                            uid: "sandbox".into(),
+                            attester: Some(crate::xds::agentio::sandbox::sandbox::Attester {
+                                workload_uid: "another-workload".into(),
+                            }),
+                            ..Default::default()
+                        },
+                    },
+                ))))
+                .unwrap();
+        } else {
+            // An explicitly empty ingress denies the previously allowed connection.
+            publish(vec![]);
+        }
         assert_close(close).await;
         drop(connection);
         tx.start_drain_and_wait(drain::DrainMode::Immediate).await;

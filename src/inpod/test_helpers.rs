@@ -93,7 +93,6 @@ impl Default for Fixture {
             dns_metrics,
             drain_rx.clone(),
             None,
-            None,
         )
         .unwrap();
         Fixture {

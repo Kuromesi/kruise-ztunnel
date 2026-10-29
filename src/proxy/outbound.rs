@@ -16,7 +16,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use futures_util::TryFutureExt;
 use hyper::header::FORWARDED;
 use std::time::Instant;
 
@@ -34,8 +33,7 @@ use crate::sandbox::sandbox;
 
 use crate::proxy::metrics::Reporter;
 use crate::proxy::{
-    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER, TraceParent,
-    WORKLOAD_NAME_HEADER, WORKLOAD_NAMESPACE_HEADER, util,
+    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER, TraceParent, util,
 };
 use crate::proxy::{ConnectionOpen, ConnectionResultBuilder, DerivedWorkload, metrics};
 
@@ -163,7 +161,7 @@ impl OutboundConnection {
         gateway: &mut Option<SocketAddr>,
     ) -> Result<H2Stream, Error> {
         let source = self.pi.local_workload_information.get_workload().await?;
-        let sandbox = self.pi.state.fetch_sandbox(&source);
+        let sandbox = self.pi.sandbox_for_connection()?;
         let req = self.build_request(source, sandbox, dest_addr).await?;
         if req.protocol != OutboundProtocol::HBONE {
             return Err(Error::UnsupportedFeature(
@@ -227,15 +225,12 @@ impl OutboundConnection {
 
         // First find the source workload of this traffic. If we don't know where the request is from
         // we will reject it.
-        let build = self
-            .pi
-            .local_workload_information
-            .get_workload()
-            .and_then(|source| {
-                // Select once before routing; policy, headers and pooling use this snapshot.
-                let sandbox = self.pi.state.fetch_sandbox(&source);
-                self.build_request(source, sandbox, dest_addr)
-            });
+        let build = async {
+            let source = self.pi.local_workload_information.get_workload().await?;
+            // Select once before routing; policy, headers and pooling use this snapshot.
+            let sandbox = self.pi.sandbox_for_connection()?;
+            self.build_request(source, sandbox, dest_addr).await
+        };
         let req = match Box::pin(build).await {
             Ok(req) => Box::new(req),
             Err(err) => {
@@ -352,11 +347,7 @@ impl OutboundConnection {
             .version(hyper::Version::HTTP_2)
             .header(BAGGAGE_HEADER, baggage(req))
             .header(FORWARDED, build_forwarded(remote_addr))
-            .header(TRACEPARENT_HEADER, self.id.header())
-            // Identify the source pod, rather than its owning deployment.
-            // This context also applies when sandbox mode is disabled.
-            .header(WORKLOAD_NAME_HEADER, req.source.name.as_str())
-            .header(WORKLOAD_NAMESPACE_HEADER, req.source.namespace.as_str());
+            .header(TRACEPARENT_HEADER, self.id.header());
 
         if let Some(sandbox) = &req.sandbox {
             builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox.uid.as_str());
@@ -364,9 +355,6 @@ impl OutboundConnection {
         if let Some(sandbox_manager) = &self.pi.sandbox_manager {
             if let Some(token) = sandbox_manager.get_or_load_token().await {
                 builder = builder.header(sandbox::SANDBOX_TOKEN_HEADER, token.as_str());
-            }
-            if let Some(encoded_labels) = &req.source.encoded_labels {
-                builder = builder.header(sandbox::SANDBOX_LABELS_HEADER, encoded_labels.as_str());
             }
         }
 
@@ -678,6 +666,7 @@ mod tests {
                 disable_inbound_freebind: false,
                 crl_manager: None,
                 sandbox_manager: None,
+                sandbox_management_tls: None,
                 firewall_metrics: None,
             }),
             id: TraceParent::new(),
@@ -873,7 +862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hbone_request_carries_workload_headers_without_sni() {
+    async fn hbone_request_carries_sandbox_id_without_sni() {
         initialize_telemetry();
 
         // Create a test config with a specific network
@@ -920,6 +909,7 @@ mod tests {
                 disable_inbound_freebind: false,
                 crl_manager: None,
                 sandbox_manager: None,
+                sandbox_management_tls: None,
                 firewall_metrics: None,
             }),
             id: TraceParent::new(),
@@ -954,8 +944,6 @@ mod tests {
         let remote_addr = "127.0.0.1:12345".parse().unwrap();
 
         let request = outbound.create_hbone_request(remote_addr, &req).await;
-        assert_eq!(request.headers()[WORKLOAD_NAME_HEADER], "source-workload");
-        assert_eq!(request.headers()[WORKLOAD_NAMESPACE_HEADER], "ns");
         assert!(!request.headers().contains_key("x-agentio-sni"));
         let udp = outbound
             .create_connect_udp_request(remote_addr, &req)
@@ -968,8 +956,6 @@ mod tests {
             "https://10.0.0.1:8080/.well-known/masque/udp/10.0.0.1/8080/"
         );
         assert_eq!(udp.headers()["capsule-protocol"], "?1");
-        assert_eq!(udp.headers()[WORKLOAD_NAME_HEADER], "source-workload");
-        assert_eq!(udp.headers()[WORKLOAD_NAMESPACE_HEADER], "ns");
         assert_eq!(udp.headers()[FORWARDED], r#"for="127.0.0.1:12345""#);
         assert_eq!(
             udp.extensions()
@@ -1272,6 +1258,7 @@ mod tests {
                 disable_inbound_freebind: false,
                 crl_manager: None,
                 sandbox_manager: None,
+                sandbox_management_tls: None,
                 firewall_metrics: None,
             }),
             id: TraceParent::new(),

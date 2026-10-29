@@ -31,7 +31,6 @@ use crate::xds::{AdsClient, Demander, LocalClient, ProxyStateUpdater};
 use crate::{cert_fetcher, config, rbac, xds};
 use crate::{proxy, strng};
 use educe::Educe;
-use futures_util::FutureExt;
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::*;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
@@ -452,7 +451,7 @@ pub struct DemandProxyState {
     #[serde(flatten)]
     state: Arc<RwLock<ProxyState>>,
 
-    /// If present, used to request on-demand updates for workloads.
+    /// If present, requests updates for resource types configured for on-demand discovery.
     #[serde(skip_serializing)]
     demand: Option<Demander>,
 
@@ -526,13 +525,13 @@ impl DemandProxyState {
             .find_uid(&ctx.workload.uid)
             .ok_or_else(|| denied(&ctx.workload.uid))?;
         let sandbox = match &ctx.sandbox {
-            Some(selected) => Some(
-                state
-                    .sandboxes
-                    .get(&selected.uid)
-                    .filter(|sandbox| sandbox.workload_uid.as_ref() == Some(&workload.uid))
-                    .ok_or_else(|| denied(&selected.uid))?,
-            ),
+            Some(selected) => state
+                .sandboxes
+                .get_for_workload(&selected.uid, &workload.uid)
+                .map_err(|_| denied(&selected.uid))?,
+            // Outbound selection belongs to the per-Pod proxy. A demand for a
+            // pending Prepare must not implicitly enroll existing connections.
+            None if ctx.conn.direction == rbac::Direction::Outbound => None,
             None => state
                 .sandboxes
                 .get_by_workload(&workload.uid)
@@ -693,10 +692,11 @@ impl DemandProxyState {
         if let Some(wl) = self.read().workloads.find_address(addr) {
             return Some(wl);
         }
-        if !self.supports_on_demand() {
+        if !self.supports_on_demand(&xds::ADDRESS_TYPE) {
             return None;
         }
-        self.fetch_on_demand(addr.to_string().into()).await;
+        self.fetch_on_demand(xds::ADDRESS_TYPE, addr.to_string().into())
+            .await;
         self.read().workloads.find_address(addr)
     }
 
@@ -784,21 +784,20 @@ impl DemandProxyState {
             .ok_or_else(|| Error::UnknownWaypoint(format!("waypoint {gw_address:?} not found")))
     }
 
-    pub fn supports_on_demand(&self) -> bool {
-        self.demand.is_some()
+    pub fn supports_on_demand(&self, type_url: &str) -> bool {
+        self.demand
+            .as_ref()
+            .is_some_and(|demand| demand.supports(type_url))
     }
 
-    /// fetch_on_demand looks up the provided key on-demand and waits for it to return
-    pub async fn fetch_on_demand(&self, key: Strng) {
-        if let Some(demand) = &self.demand {
-            debug!(%key, "sending demand request");
-            Box::pin(
-                demand
-                    .demand(xds::ADDRESS_TYPE, key.clone())
-                    .then(|o| o.recv()),
-            )
-            .await;
-            debug!(%key, "on demand ready");
+    /// Request a resource by type and name and wait for the response to be processed.
+    pub async fn fetch_on_demand(&self, type_url: Strng, key: Strng) {
+        if let Some(demand) = &self.demand
+            && let Some(request) = demand.demand(type_url.clone(), key.clone()).await
+        {
+            debug!(%type_url, %key, "sending demand request");
+            request.recv().await;
+            debug!(%type_url, %key, "on demand response processed");
         }
     }
 }
@@ -835,11 +834,18 @@ impl ProxyStateManager {
                     xds::TRAFFIC_POLICY_TYPE,
                     updater.clone(),
                 );
-            if config.sandbox_mode {
-                builder = builder.with_watched_handler::<xds::agentio::sandbox::Sandbox>(
-                    xds::SANDBOX_TYPE,
-                    updater,
-                );
+            if config.enable_sandbox_manager || config.sandbox_mode {
+                builder = if config.enable_sandbox_manager {
+                    builder.with_on_demand_handler::<xds::agentio::sandbox::Sandbox>(
+                        xds::SANDBOX_TYPE,
+                        updater,
+                    )
+                } else {
+                    builder.with_watched_handler::<xds::agentio::sandbox::Sandbox>(
+                        xds::SANDBOX_TYPE,
+                        updater,
+                    )
+                };
             }
             Some(builder.build(xds_metrics, awaiting_ready))
         } else {
@@ -898,7 +904,7 @@ mod tests {
     async fn sandbox_discovery_allows_shared_startup_without_workload_or_xds_address() {
         let mut config = test_helpers::test_config();
         config.sandbox_mode = true;
-        config.enable_sandbox_manager = true;
+        config.enable_sandbox_manager = false;
         config.proxy_mode = config::ProxyMode::Shared;
         config.proxy_workload_information = None;
         config.local_node = None;
@@ -914,7 +920,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!state_manager.state().supports_on_demand());
+        assert!(!state_manager.state().supports_on_demand(&xds::ADDRESS_TYPE));
     }
 
     #[tokio::test]

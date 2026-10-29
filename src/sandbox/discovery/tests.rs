@@ -282,8 +282,14 @@ fn workload_index_tracks_rebinding_unbinding_and_removal() {
     store.update(resource("sandbox-b", &first)).unwrap();
     store.update(resource("sandbox-c", &second)).unwrap();
 
-    let original = store.get_by_workload(&first)[0].clone();
+    let id: Strng = "sandbox-a".into();
+    let original = store.get_for_workload(&id, &first).unwrap().unwrap();
     store.update(resource("sandbox-a", &second)).unwrap();
+    assert!(store.get_for_workload(&id, &first).is_err());
+    assert_eq!(
+        store.get_for_workload(&id, &second).unwrap().unwrap().uid,
+        id
+    );
     assert_eq!(original.workload_uid.as_ref(), Some(&first));
     let rebound = store.get_by_workload(&second)[1].clone();
     assert_eq!(rebound.uid, "sandbox-a");
@@ -308,6 +314,12 @@ fn workload_index_tracks_rebinding_unbinding_and_removal() {
     let mut unbound = resource("sandbox-c", &second);
     unbound.resource.attester = None;
     store.update(unbound).unwrap();
+    assert!(
+        store
+            .get_for_workload(&"sandbox-c".into(), &second)
+            .unwrap()
+            .is_none()
+    );
     assert!(store.resources.contains_key(&Strng::from("sandbox-c")));
     assert_eq!(
         store
@@ -319,6 +331,7 @@ fn workload_index_tracks_rebinding_unbinding_and_removal() {
     );
 
     store.remove(&"sandbox-a".into());
+    assert!(store.get_for_workload(&id, &second).unwrap().is_none());
     store.remove(&"sandbox-a".into());
     assert!(store.get_by_workload(&second).is_empty());
     assert!(!store.by_workload.contains_key(&second));

@@ -18,7 +18,6 @@ use std::future::Future;
 use crate::proxyfactory::ProxyFactory;
 
 use crate::drain;
-use crate::sandbox::sandbox;
 use anyhow::Context;
 use prometheus_client::registry::Registry;
 use std::net::SocketAddr;
@@ -127,18 +126,6 @@ pub async fn build_with_cert(
     let mut tcp_dns_proxy_address: Option<SocketAddr> = None;
     let mut udp_dns_proxy_address: Option<SocketAddr> = None;
 
-    let mut sandbox_manager = None;
-    if config.enable_sandbox_manager {
-        let mut manager = sandbox::SandboxManager::default();
-        manager
-            .run(
-                config.sandbox_token_path.clone().into(),
-                config.sandbox_watcher_debounce_ms,
-            )
-            .await;
-        sandbox_manager = Some(Arc::new(manager));
-    }
-
     let firewall_metrics = if config.sidecar_mode && config.enable_firewall_rules {
         Some(crate::firewall::metrics::Metrics::new(
             crate::metrics::sub_registry(&mut registry),
@@ -154,7 +141,6 @@ pub async fn build_with_cert(
         proxy_metrics,
         dns_metrics,
         drain_rx.clone(),
-        sandbox_manager,
         firewall_metrics,
     )
     .map_err(|e| anyhow::anyhow!("failed to start proxy factory {:?}", e))?;

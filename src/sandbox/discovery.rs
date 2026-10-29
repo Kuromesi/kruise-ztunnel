@@ -27,7 +27,7 @@ use crate::xds::agentio::sandbox::Sandbox as XdsSandbox;
 #[cfg(test)]
 pub(crate) mod tests;
 
-fn validate_id(id: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_id(id: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !id.is_empty() && id.len() <= 512 && id != "*" && id.bytes().all(|b| b.is_ascii_graphic()),
         "Sandbox uid must be a nonempty printable ASCII identifier, at most 512 bytes, other than '*'"
@@ -77,6 +77,10 @@ impl Sandbox {
         Ok(())
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("Sandbox is bound to a different Workload")]
+pub struct WorkloadMismatch;
 
 #[derive(Debug, Default)]
 pub struct SandboxStore {
@@ -157,6 +161,23 @@ impl SandboxStore {
 
     pub fn get(&self, id: &Strng) -> Option<Arc<Sandbox>> {
         self.resources.get(id).cloned()
+    }
+
+    /// Read the latest configuration for an established Sandbox/Workload binding.
+    /// Missing or unbound resources are unavailable; a different binding is an error.
+    pub fn get_for_workload(
+        &self,
+        id: &Strng,
+        workload_uid: &Strng,
+    ) -> Result<Option<Arc<Sandbox>>, WorkloadMismatch> {
+        let Some(sandbox) = self.get(id) else {
+            return Ok(None);
+        };
+        match &sandbox.workload_uid {
+            Some(uid) if uid == workload_uid => Ok(Some(sandbox)),
+            Some(_) => Err(WorkloadMismatch),
+            None => Ok(None),
+        }
     }
 
     /// Return the Sandboxes bound to a Workload in binding arrival order.

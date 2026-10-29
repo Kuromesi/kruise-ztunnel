@@ -42,6 +42,7 @@ use crate::proxy::{
 use crate::rbac::Connection;
 use crate::socket::{SELF_ADDR_V4, SELF_ADDR_V6, to_canonical};
 use crate::state::service::Service;
+use crate::xds::ADDRESS_TYPE;
 use crate::{assertions, copy, handle_connection, proxy, socket, strng, tls};
 
 use crate::drain::run_with_drain;
@@ -562,11 +563,11 @@ impl Inbound {
         let res = match lookup_is_destination_this_waypoint() {
             Some(r) => Some(r),
             None => {
-                if !state.supports_on_demand() {
+                if !state.supports_on_demand(&ADDRESS_TYPE) {
                     None
                 } else {
                     state
-                        .fetch_on_demand(strng::new(hbone_dst.to_string()))
+                        .fetch_on_demand(ADDRESS_TYPE, strng::new(hbone_dst.to_string()))
                         .await;
                     lookup_is_destination_this_waypoint()
                 }
@@ -969,6 +970,7 @@ mod tests {
             None,
             local_workload,
             false,
+            None,
             None,
             None,
             None,

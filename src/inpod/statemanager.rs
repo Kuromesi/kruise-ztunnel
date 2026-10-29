@@ -311,6 +311,7 @@ impl WorkloadProxyManagerState {
             .proxy_gen
             .new_proxies_from_factory(
                 Some(drain_rx),
+                Some(&workload_uid.0),
                 workload_info.clone(),
                 Arc::from(self.inpod_config.socket_factory(netns.clone())),
             )

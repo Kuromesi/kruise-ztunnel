@@ -79,17 +79,23 @@ fn resource() -> ProtoResource {
     }
 }
 
-#[test_case(false, false; "workload_push_without_sandbox")]
-#[test_case(true, false; "workload_on_demand_without_sandbox")]
-#[test_case(false, true; "workload_push_with_sandbox")]
-#[test_case(true, true; "workload_on_demand_with_sandbox")]
+#[test_case(false, false, false; "workload_push_without_sandbox")]
+#[test_case(true, false, false; "workload_on_demand_without_sandbox")]
+#[test_case(false, true, false; "workload_push_with_sandbox")]
+#[test_case(true, true, false; "workload_on_demand_with_sandbox")]
+#[test_case(false, false, true; "manager_with_workload_push")]
+#[test_case(true, false, true; "manager_with_workload_demand")]
+#[test_case(false, true, true; "manager_overrides_sandbox_watch")]
 #[tokio::test]
-async fn sandbox_mode_controls_subscription_and_readiness(on_demand: bool, sandbox_mode: bool) {
+async fn sandbox_mode_controls_subscription_and_readiness(
+    on_demand: bool,
+    sandbox_mode: bool,
+    enable_manager: bool,
+) {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (mut connections, mut config) = AdsServer::spawn_config(on_demand).await;
         config.sandbox_mode = sandbox_mode;
-        // Token management must not implicitly enable Sandbox discovery.
-        config.enable_sandbox_manager = true;
+        config.enable_sandbox_manager = enable_manager;
         let mut registry = prometheus_client::registry::Registry::default();
         let (awaiting_ready, mut ready) = tokio::sync::watch::channel(());
         let manager = crate::state::ProxyStateManager::new(
@@ -101,7 +107,11 @@ async fn sandbox_mode_controls_subscription_and_readiness(on_demand: bool, sandb
         )
         .await
         .unwrap();
-        assert_eq!(manager.state().supports_on_demand(), on_demand);
+        assert_eq!(manager.state().supports_on_demand(&ADDRESS_TYPE), on_demand);
+        assert_eq!(
+            manager.state().supports_on_demand(&SANDBOX_TYPE),
+            enable_manager
+        );
         let client_task = tokio::spawn(manager.run());
 
         // Exercise the production subscription setup on both initial connection and reconnect.
@@ -109,7 +119,7 @@ async fn sandbox_mode_controls_subscription_and_readiness(on_demand: bool, sandb
             let mut connection = connections.recv().await.unwrap();
             let mut expected =
                 HashSet::from([ADDRESS_TYPE.to_string(), TRAFFIC_POLICY_TYPE.to_string()]);
-            if sandbox_mode {
+            if sandbox_mode || enable_manager {
                 expected.insert(SANDBOX_TYPE.to_string());
             }
             for _ in 0..expected.len() {
@@ -119,7 +129,9 @@ async fn sandbox_mode_controls_subscription_and_readiness(on_demand: bool, sandb
                     "unexpected subscription: {initial:?}"
                 );
                 assert!(initial.response_nonce.is_empty());
-                if initial.type_url == ADDRESS_TYPE && on_demand {
+                if (initial.type_url == ADDRESS_TYPE && on_demand)
+                    || (initial.type_url == SANDBOX_TYPE && enable_manager)
+                {
                     assert_eq!(initial.resource_names_subscribe, ["*"]);
                     assert_eq!(initial.resource_names_unsubscribe, ["*"]);
                 } else {
@@ -145,7 +157,7 @@ async fn sandbox_mode_controls_subscription_and_readiness(on_demand: bool, sandb
                 assert_eq!(ack.response_nonce, "workload-ready");
                 assert!(ack.error_detail.is_none());
             }
-            if sandbox_mode {
+            if sandbox_mode && !enable_manager {
                 if attempt == 0 {
                     // All Workload responses were ACKed, but Sandbox still blocks readiness.
                     assert!(matches!(ready.has_changed(), Ok(false)));
@@ -407,7 +419,8 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
         // Workloads still support ordinary named demands on the same ADS stream.
         let demand = demander
             .demand(ADDRESS_TYPE, "another-workload".into())
-            .await;
+            .await
+            .unwrap();
         next_matching(&mut connection, |r| {
             r.type_url == ADDRESS_TYPE && r.resource_names_subscribe == ["another-workload"]
         })
@@ -415,4 +428,61 @@ async fn sandbox_wildcard_push_rejection_and_reconnect(on_demand: bool) {
         drop(demand);
     }
     client_task.abort();
+}
+
+#[test_case(false, false; "all_push")]
+#[test_case(false, true; "sandbox_only")]
+#[test_case(true, false; "workload_only")]
+#[test_case(true, true; "both_types")]
+#[tokio::test]
+async fn on_demand_capabilities_are_per_resource_type(workload_demand: bool, sandbox_demand: bool) {
+    let fixture = Fixture::new();
+    let mut config = crate::test_helpers::test_config();
+    config.xds_address = Some("https://localhost:15012".into());
+    config.xds_on_demand = workload_demand;
+    let tls = Box::new(tls::ControlPlaneAuthentication::RootCert(
+        config.xds_root_cert.clone(),
+    ));
+    let updater = ProxyStateUpdater::new_no_fetch(fixture.state.clone());
+    let builder = Config::new(Arc::new(config), tls)
+        .with_watched_handler::<crate::xds::istio::workload::Address>(
+            ADDRESS_TYPE,
+            updater.clone(),
+        );
+    let builder = if sandbox_demand {
+        builder.with_on_demand_handler::<Sandbox>(SANDBOX_TYPE, updater)
+    } else {
+        builder.with_watched_handler::<Sandbox>(SANDBOX_TYPE, updater)
+    };
+    let mut registry = prometheus_client::registry::Registry::default();
+    let mut client = builder.build(
+        Metrics::new(&mut registry),
+        tokio::sync::watch::channel(()).0,
+    );
+    let demander = client.demander();
+    assert_eq!(demander.is_some(), workload_demand || sandbox_demand);
+    let Some(demander) = demander else {
+        return;
+    };
+    // Push-only and unregistered types must not enqueue a named subscription.
+    for (type_url, enabled) in [
+        (ADDRESS_TYPE, workload_demand),
+        (SANDBOX_TYPE, sandbox_demand),
+        (TRAFFIC_POLICY_TYPE, false),
+    ] {
+        assert_eq!(demander.supports(&type_url), enabled);
+        let requested = demander
+            .demand(type_url.clone(), "resource-key".into())
+            .await;
+        assert_eq!(requested.is_some(), enabled);
+        if let Some(requested) = requested {
+            let (notify, key) = client.state.demand.try_recv().unwrap();
+            assert_eq!(key.type_url, type_url);
+            assert_eq!(key.name, "resource-key");
+            notify.send(()).unwrap();
+            requested.recv().await;
+        } else {
+            assert!(client.state.demand.try_recv().is_err());
+        }
+    }
 }

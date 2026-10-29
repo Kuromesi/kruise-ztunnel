@@ -88,8 +88,8 @@ async fn check_policies(
     state
         .assert_rbac(&ProxyRbacContext {
             conn: conn.clone(),
+            sandbox: state.fetch_sandbox(&f.workload),
             workload: f.workload,
-            sandbox: None,
         })
         .await
 }
@@ -405,7 +405,7 @@ async fn sandbox_rbac_tracks_current_policies_and_binding() {
     assert!(state.assert_rbac(&ctx).await.is_ok());
     assert!(state.assert_rbac(&before_discovery).await.is_ok());
 
-    // Updating policy changes authorization of the same context, including pre-discovery ones.
+    // Selected connections follow policy updates; unselected outbound connections stay on platform policy.
     resource.resource.traffic_policy = Some(policy(Some(vec![rule(proto::Action::Deny)])));
     f.state
         .write()
@@ -414,7 +414,7 @@ async fn sandbox_rbac_tracks_current_policies_and_binding() {
         .update(resource.clone())
         .unwrap();
     assert!(state.assert_rbac(&ctx).await.is_err());
-    assert!(state.assert_rbac(&before_discovery).await.is_err());
+    assert!(state.assert_rbac(&before_discovery).await.is_ok());
 
     // Keep connection tracking separate for different Sandbox identities, not policy versions.
     let mut updated = ctx.clone();
@@ -485,15 +485,65 @@ async fn sandbox_rbac_tracks_current_policies_and_binding() {
     f.state.write().unwrap().sandboxes.update(resource).unwrap();
     assert!(state.assert_rbac(&ctx).await.is_ok());
 
-    // A connection bound to a removed Sandbox must not become ordinary Workload traffic.
+    // Missing Sandbox configuration falls back to Workload policies for existing connections.
     f.state
         .write()
         .unwrap()
         .sandboxes
         .remove(&"sandbox-a".into());
     ctx.conn.direction = Direction::Outbound;
+    assert!(state.assert_rbac(&ctx).await.is_ok());
+    assert!(state.assert_rbac(&before_discovery).await.is_ok());
+
+    // The fallback still enforces platform policy, including its denial decisions.
+    f.bind_policies(&["trafficPolicies/unreferenced-deny"]);
+    assert!(state.assert_rbac(&ctx).await.is_err());
+    assert!(state.assert_rbac(&before_discovery).await.is_err());
+    f.bind_policies(&[]);
+    assert!(state.assert_rbac(&ctx).await.is_ok());
+
+    // Recovery reapplies inline policy only to connections that selected this Sandbox.
+    let recovered = XdsResource {
+        name: "sandbox-a".into(),
+        resource: Sandbox {
+            uid: "sandbox-a".into(),
+            attester: Some(Attester {
+                workload_uid: f.workload.uid.to_string(),
+            }),
+            traffic_policy: Some(policy(Some(vec![rule(proto::Action::Deny)]))),
+            ..Default::default()
+        },
+    };
+    f.state
+        .write()
+        .unwrap()
+        .sandboxes
+        .update(recovered)
+        .unwrap();
     assert!(state.assert_rbac(&ctx).await.is_err());
     assert!(state.assert_rbac(&before_discovery).await.is_ok());
+
+    // A known binding mismatch is not temporary unavailability.
+    let mut rebound = XdsResource {
+        name: "sandbox-a".into(),
+        resource: Sandbox {
+            uid: "sandbox-a".into(),
+            attester: Some(Attester {
+                workload_uid: "different-workload".into(),
+            }),
+            ..Default::default()
+        },
+    };
+    f.state
+        .write()
+        .unwrap()
+        .sandboxes
+        .update(rebound.clone())
+        .unwrap();
+    assert!(state.assert_rbac(&ctx).await.is_err());
+    rebound.resource.attester = None;
+    f.state.write().unwrap().sandboxes.update(rebound).unwrap();
+    assert!(state.assert_rbac(&ctx).await.is_ok());
 }
 
 #[test]
