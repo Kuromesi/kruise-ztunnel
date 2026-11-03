@@ -64,4 +64,6 @@ logged as ordinary metadata.
 
 The previous `x-agentio-sandbox-token` header containing Base64-encoded JSON is
 no longer emitted. EPE must support the new header before deploying this change.
-The token file format and the existing `x-agentio-sandbox-id` header are unchanged.
+The token file format is unchanged. The Sandbox discovery UID is sent in
+`x-agentio-sandbox-uid`; the gateway captures it as `agentio.sandbox.uid`.
+Upgrade the sending ztunnel and receiving gateway together.
