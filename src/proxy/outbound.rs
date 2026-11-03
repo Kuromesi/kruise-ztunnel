@@ -351,7 +351,7 @@ impl OutboundConnection {
             .header(TRACEPARENT_HEADER, self.id.header());
 
         if let Some(sandbox) = &req.sandbox {
-            builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox.uid.as_str());
+            builder = builder.header(sandbox::SANDBOX_UID_HEADER, sandbox.uid.as_str());
         }
         let mut metadata = SandboxMetadata::default();
         if let Some(manager) = &self.pi.sandbox_manager
@@ -867,7 +867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hbone_request_carries_sandbox_id_without_sni() {
+    async fn hbone_request_carries_sandbox_uid_without_sni() {
         initialize_telemetry();
 
         // Create a test config with a specific network
@@ -985,10 +985,11 @@ mod tests {
             assert_eq!(
                 request
                     .headers()
-                    .get(sandbox::SANDBOX_ID_HEADER)
+                    .get(sandbox::SANDBOX_UID_HEADER)
                     .map(|v| v.to_str().unwrap()),
                 req.sandbox.as_ref().map(|s| s.uid.as_str())
             );
+            assert!(!request.headers().contains_key("x-agentio-sandbox-id"));
         }
         let directory = tempfile::tempdir().unwrap();
         for case in ["disabled", "empty", "ready"] {
@@ -1018,7 +1019,7 @@ mod tests {
                     .map(|v| v.to_str().unwrap()),
                 (case == "ready").then_some("agent-identity.access-token=eyJ.test.signature,agent-identity.sandbox-client-id=client+/="),
             );
-            assert_eq!(request.headers()[sandbox::SANDBOX_ID_HEADER], "sandbox-a");
+            assert_eq!(request.headers()[sandbox::SANDBOX_UID_HEADER], "sandbox-a");
             assert!(!request.headers().contains_key("x-agentio-sandbox-token"));
             if case == "ready" {
                 assert!(request.headers()[SANDBOX_METADATA_HEADER].is_sensitive());

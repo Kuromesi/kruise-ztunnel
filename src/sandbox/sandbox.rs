@@ -68,7 +68,7 @@ struct Registration {
 #[path = "sandbox/registration_tests.rs"]
 mod registration_tests;
 
-pub static SANDBOX_ID_HEADER: &str = "x-agentio-sandbox-id";
+pub static SANDBOX_UID_HEADER: &str = "x-agentio-sandbox-uid";
 pub static SANDBOX_LABELS_HEADER: &str = "x-agentio-sandbox-labels";
 
 /// Manages one workload proxy's Sandbox identity, token and policy readiness.
