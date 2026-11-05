@@ -28,7 +28,6 @@ use crate::extensions::extensions::{EgressPolicies, EgressPolicy, EgressPolicyAc
 use crate::identity::Identity;
 use crate::proxy::connection_manager::{ConnectionAttributes, ConnectionContext};
 use crate::rbac::{Connection, Direction};
-use crate::sandbox::discovery::Sandbox;
 use crate::sandbox::metadata::SANDBOX_METADATA_HEADER;
 use crate::sandbox::sandbox::{self, SandboxContext};
 
@@ -177,7 +176,11 @@ impl OutboundConnection {
         let pool_key = WorkloadKey {
             src_id: req.source.identity(),
             dst_id: req.upstream_sans.clone(),
-            sandbox_id: req.sandbox.as_ref().map(|sandbox| sandbox.uid.clone()),
+            sandbox_id: req
+                .sandbox_context
+                .sandbox
+                .as_ref()
+                .map(|sandbox| sandbox.uid.clone()),
             src: source_addr.ip(),
             dst: req.actual_destination,
         };
@@ -253,7 +256,7 @@ impl OutboundConnection {
                 direction: Direction::Outbound,
             },
             workload: req.source.clone(),
-            sandbox: req.sandbox.clone(),
+            sandbox: req.sandbox_context.sandbox.clone(),
         };
         let conn = ConnectionAttributes::Outbound(proxy::connection_manager::OutboundAttributes {
             actual_dst: req.actual_destination,
@@ -346,10 +349,10 @@ impl OutboundConnection {
             .header(FORWARDED, build_forwarded(remote_addr))
             .header(TRACEPARENT_HEADER, self.id.header());
 
-        if let Some(sandbox) = &req.sandbox {
+        if let Some(sandbox) = &req.sandbox_context.sandbox {
             builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox.uid.as_str());
         }
-        if let Some(header) = &req.sandbox_metadata {
+        if let Some(header) = &req.sandbox_context.metadata {
             builder = builder.header(SANDBOX_METADATA_HEADER, header.clone());
         }
 
@@ -368,7 +371,11 @@ impl OutboundConnection {
         let pool_key = Box::new(WorkloadKey {
             src_id: req.source.identity(),
             dst_id: req.upstream_sans.clone(),
-            sandbox_id: req.sandbox.as_ref().map(|sandbox| sandbox.uid.clone()),
+            sandbox_id: req
+                .sandbox_context
+                .sandbox
+                .as_ref()
+                .map(|sandbox| sandbox.uid.clone()),
             src: remote_addr.ip(),
             dst: req.actual_destination,
         });
@@ -452,8 +459,7 @@ impl OutboundConnection {
         Ok(Request {
             protocol: OutboundProtocol::TCP,
             source: source_workload,
-            sandbox: context.sandbox,
-            sandbox_metadata: context.metadata,
+            sandbox_context: context,
             hbone_target_destination: None,
             actual_destination_workload: None,
             actual_destination: target,
@@ -496,8 +502,7 @@ impl OutboundConnection {
                 Some(Ok(Request {
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload.clone(),
-                    sandbox: context.sandbox.clone(),
-                    sandbox_metadata: context.metadata.clone(),
+                    sandbox_context: context.clone(),
                     hbone_target_destination: Some(HboneAddress::SocketAddr(*target)),
                     actual_destination_workload: Some(waypoint.workload),
                     actual_destination,
@@ -535,8 +540,7 @@ struct Request {
     // Source workload sending the request
     source: Arc<Workload>,
     // Selected before routing; shared by egress policy, CONNECT headers and the pool key.
-    sandbox: Option<Arc<Sandbox>>,
-    sandbox_metadata: Option<http::HeaderValue>,
+    sandbox_context: SandboxContext,
     // The selected egress gateway workload, if any.
     actual_destination_workload: Option<Arc<Workload>>,
     // The address of the next hop, such as a workload or egress gateway.
@@ -603,6 +607,7 @@ mod tests {
     use crate::config::Config;
     use crate::proxy::connection_manager::ConnectionManager;
     use crate::proxy::{LocalWorkloadInformation, pool::WorkloadHBONEPool};
+    use crate::sandbox::discovery::Sandbox;
     use crate::state::WorkloadInfo;
     use crate::test_helpers::helpers::{initialize_telemetry, test_proxy_metrics};
     use crate::test_helpers::new_proxy_state;
@@ -950,8 +955,7 @@ mod tests {
         let mut req = Request {
             protocol: OutboundProtocol::HBONE,
             source: source_workload,
-            sandbox: None,
-            sandbox_metadata: None,
+            sandbox_context: SandboxContext::default(),
             hbone_target_destination: Some(HboneAddress::SocketAddr(
                 "10.0.0.1:8080".parse().unwrap(),
             )),
@@ -993,7 +997,10 @@ mod tests {
         .unwrap();
         let sandbox = Arc::new(sandbox);
         for sandbox in [None, Some(sandbox.clone())] {
-            req.sandbox = sandbox;
+            req.sandbox_context = SandboxContext {
+                sandbox,
+                ..Default::default()
+            };
             let request = outbound.create_hbone_request(remote_addr, &req);
             assert!(!request.headers().contains_key("x-agentio-sni"));
             assert!(!request.headers().contains_key("x-agentio-tls"));
@@ -1002,7 +1009,7 @@ mod tests {
                     .headers()
                     .get(sandbox::SANDBOX_ID_HEADER)
                     .map(|v| v.to_str().unwrap()),
-                req.sandbox.as_ref().map(|s| s.uid.as_str())
+                req.sandbox_context.sandbox.as_ref().map(|s| s.uid.as_str())
             );
             assert!(!request.headers().contains_key("x-agentio-sandbox-uid"));
         }
@@ -1027,8 +1034,7 @@ mod tests {
         manager.prepare(&id).await.unwrap();
         let context = outbound.pi.sandbox_for_connection().unwrap();
         assert!(directory.path().join("state/sandbox.json").is_file());
-        req.sandbox = context.sandbox;
-        req.sandbox_metadata = context.metadata;
+        req.sandbox_context = context;
         // HBONE construction uses the captured context, without reading the file again.
         std::fs::remove_file(token_dir.join("sandbox.token")).unwrap();
         let request = outbound.create_hbone_request(remote_addr, &req);

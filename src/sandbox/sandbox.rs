@@ -77,7 +77,7 @@ pub static SANDBOX_ID_HEADER: &str = "x-agentio-sandbox-id";
 pub static SANDBOX_LABELS_HEADER: &str = "x-agentio-sandbox-labels";
 
 /// Selected once before routing, shared by policy evaluation and transport.
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SandboxContext {
     pub(crate) sandbox: Option<Arc<Sandbox>>,
     pub(crate) metadata: Option<HeaderValue>,
