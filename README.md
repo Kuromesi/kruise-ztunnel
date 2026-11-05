@@ -72,9 +72,8 @@ rejects controls and non-ASCII values without including credentials in errors.
 Percent signs, commas, `+`, `/`, and `=` retain their literal meaning after SF
 parsing; no percent-decoding or Base64 decoding is required.
 
-The sender emits one header, omits it for empty metadata, and rejects tunnels
-whose serialized metadata exceeds 8,192 bytes. Recipients combine repeated field
-lines in order using the standard SF rules; duplicate Dictionary keys use the
+The sender emits one header and omits it for empty metadata. Recipients combine
+repeated field lines in order using the standard SF rules; duplicate Dictionary keys use the
 last value, as specified by RFC 9651. A parse failure or an invalid known entry
 invalidates the entire field. Missing or invalid metadata supplies no credentials
 and must not bypass the gateway's authentication requirements.
