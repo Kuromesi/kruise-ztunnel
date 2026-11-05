@@ -146,11 +146,15 @@ impl ProxyFactory {
         #[cfg(any(test, feature = "testing"))]
         let mut resolver = None;
 
-        let local_workload_information = Arc::new(LocalWorkloadInformation::new(
+        let mut local_workload_information = LocalWorkloadInformation::new(
             Arc::new(proxy_workload_info),
             self.state.clone(),
             self.cert_manager.clone(),
-        ));
+        );
+        if self.config.enable_dns_name_tracking && self.config.dns_proxy {
+            local_workload_information.dns_bindings = Some(Arc::new(Default::default()));
+        }
+        let local_workload_information = Arc::new(local_workload_information);
 
         // Optionally create the DNS proxy.
         if self.config.dns_proxy {

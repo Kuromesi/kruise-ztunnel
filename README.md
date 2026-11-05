@@ -77,3 +77,73 @@ The token file format is unchanged. The Sandbox discovery ID is sent in
 `x-agentio-sandbox-id`; the gateway captures it as `agentio.sandbox.id`.
 The previous `x-agentio-sandbox-uid` header is no longer emitted.
 Upgrade the sending ztunnel and receiving gateway together.
+
+## DNS learning and destination FQDNs
+
+DNS name tracking is opt-in: set `ENABLE_DNS_NAME_TRACKING=true` and restart
+ztunnel to enable it. The default is `false`. It requires DNS proxying and supports
+both dedicated and shared/inpod modes. Each workload proxy owns an independent
+binding table; records are never shared across Pods. When disabled, no binding
+table or periodic cleanup is created, local policy checks use IP addresses, and
+the DNS candidates header is omitted. Normal DNS proxying and the resolver's DNS
+response cache are unaffected.
+
+Enabled instances learn the A/AAAA addresses returned to their local Workload.
+Each `(query name, IP)` association is deduplicated
+and retained until its remaining DNS TTL expires, including the shortest TTL in a
+CNAME chain. Resolver cache hits do not reset TTLs. Older answers remain usable until
+their own expiry, even if a later answer contains different addresses.
+
+The learning table holds at most 16,384 associations per workload proxy. In inpod
+mode, total node memory scales with the number of Pods. It removes expired
+entries on subsequent DNS answers and every 60 seconds while idle, releasing the
+HashMap capacity when empty. Matching checks expiry immediately, independently of
+the cleanup interval. At capacity, existing live entries are retained and new
+associations are omitted; `istio_dns_binding_overflow_total` counts these omissions.
+
+`TrafficPolicy.Match.destination_fqdns` (protobuf field 4, local YAML
+`destinationFqdns`) accepts exact DNS names in egress rules. Within each rule,
+learned FQDNs and `destination_ips` are ORed; source and port conditions still apply.
+Policy and rule order are unchanged. A FQDN-only rule without DNS evidence does not
+match every destination. The control plane must retain such rules even when its own
+DNS resolution has no addresses, and must only send them to compatible data planes.
+DNS learning applies to outbound TCP authorization; firewall rules continue to use
+the control-plane IP addresses.
+
+Each outbound TCP connection or CONNECT-UDP session snapshots the valid names for
+its original destination IP before gateway routing. HBONE CONNECT and CONNECT-UDP
+requests carry this snapshot as one Structured Fields List of String Items,
+omitted when empty:
+
+```http
+x-agentio-destination-dns-candidates: "api.example.com", "cdn.example.com"
+```
+
+Names are sorted, lowercase ASCII DNS presentation names without the trailing root
+dot. Receivers use a Structured Fields List parser and then interpret the decoded
+Strings as DNS presentation names, preserving DNS escapes. Inner Lists and other
+bare-item types invalidate the entire field; unknown parameters are ignored.
+Repeated field lines combine in order, and repeated names have the same meaning
+as one occurrence. Invalid or missing fields supply no DNS evidence, so receivers
+continue with their IP-based policy checks. The sender rejects a tunnel whose
+header value would exceed 8,192 bytes;
+it never silently truncates the candidate set. The header is marked sensitive to
+avoid HTTP/2 dynamic-table indexing. It is generated from local DNS observations,
+not forwarded from application headers, and is independent of the pooled HTTP/2
+connection. Local TCP policy checks and the header use the same admission snapshot.
+TTL expiry affects new connections; explicit policy updates still recheck existing
+TCP connections using their captured names.
+
+This header reports candidate names associated with the destination IP. It does
+not establish the application's actual HTTP Host or TLS SNI. Gateways must accept
+it only from authorized ztunnel peers over authenticated HBONE, bind it to the
+CONNECT destination, and evaluate
+their own policies. Shared IPs can have multiple candidate names; a missing header
+means no DNS evidence, not permission to bypass policy. Gateway-side consumption
+is a separate change in the gateway repository.
+
+For a Linux/glibc learning-table resource probe, run
+`cargo run --release --example dns_bindings -- 1000 8`. For a running-sidecar probe,
+run `cargo test --test direct test_sidecar_dns_fqdn_resources -- --ignored --nocapture`
+alone. These probes report incremental allocations rather than a total proxy memory
+budget; the latter also includes the runtime and test DNS client.

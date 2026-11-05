@@ -33,7 +33,8 @@ use crate::sandbox::sandbox::{self, SandboxContext};
 
 use crate::proxy::metrics::Reporter;
 use crate::proxy::{
-    BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER, TraceParent, util,
+    BAGGAGE_HEADER, DESTINATION_DNS_CANDIDATES_HEADER, Error, HboneAddress, ProxyInputs,
+    TRACEPARENT_HEADER, TraceParent, util,
 };
 use crate::proxy::{ConnectionOpen, ConnectionResultBuilder, DerivedWorkload, metrics};
 
@@ -45,6 +46,8 @@ use crate::state::ProxyRbacContext;
 use crate::state::workload::OutboundProtocol;
 use crate::state::workload::Workload;
 use crate::{assertions, copy, proxy, socket};
+
+const MAX_DESTINATION_DNS_CANDIDATES_HEADER_BYTES: usize = 8192;
 
 pub struct Outbound {
     pi: Arc<ProxyInputs>,
@@ -199,7 +202,7 @@ impl OutboundConnection {
     ) -> Result<http::Request<()>, Error> {
         let path = connect_udp_masque_path(req.hbone_target_destination.as_ref())?;
         // Reuse the current HBONE source and Sandbox headers for UDP as well.
-        let mut request = self.create_hbone_request(source_addr, req);
+        let mut request = self.create_hbone_request(source_addr, req)?;
         *request.uri_mut() = format!("https://{}{path}", req.actual_destination)
             .parse()
             .expect("CONNECT-UDP request uses validated addresses");
@@ -245,6 +248,7 @@ impl OutboundConnection {
 
         let rbac_ctx = ProxyRbacContext {
             conn: Connection {
+                destination_fqdns: req.destination_fqdns.clone(),
                 src: source_addr,
                 dst: dest_addr,
                 src_identity: Some(req.source.identity()),
@@ -335,7 +339,11 @@ impl OutboundConnection {
         connection_stats.record(res);
     }
 
-    fn create_hbone_request(&self, remote_addr: SocketAddr, req: &Request) -> http::Request<()> {
+    fn create_hbone_request(
+        &self,
+        remote_addr: SocketAddr,
+        req: &Request,
+    ) -> Result<http::Request<()>, Error> {
         let mut builder = http::Request::builder()
             .uri(
                 req.hbone_target_destination
@@ -355,10 +363,26 @@ impl OutboundConnection {
         if let Some(header) = &req.sandbox_context.metadata {
             builder = builder.header(SANDBOX_METADATA_HEADER, header.clone());
         }
+        if !req.destination_fqdns.is_empty() {
+            let mut serializer = sfv::ListSerializer::new();
+            for name in &req.destination_fqdns {
+                let _ = serializer.bare_item(
+                    sfv::StringRef::from_str(name).expect("DNS presentation names are ASCII"),
+                );
+            }
+            let value = serializer.finish().expect("nonempty DNS candidate list");
+            if value.len() > MAX_DESTINATION_DNS_CANDIDATES_HEADER_BYTES {
+                return Err(Error::DestinationDnsCandidatesHeaderTooLarge(value.len()));
+            }
+            let mut header =
+                http::HeaderValue::from_str(&value).expect("Structured Fields are ASCII");
+            header.set_sensitive(true);
+            builder = builder.header(DESTINATION_DNS_CANDIDATES_HEADER, header);
+        }
 
-        builder
+        Ok(builder
             .body(())
-            .expect("builder with known status code should not fail")
+            .expect("builder with known status code should not fail"))
     }
 
     /// returns upgraded stream and peer's baggage
@@ -367,7 +391,7 @@ impl OutboundConnection {
         remote_addr: SocketAddr,
         req: &Request,
     ) -> Result<(H2Stream, Option<Baggage>), Error> {
-        let request = self.create_hbone_request(remote_addr, req);
+        let request = self.create_hbone_request(remote_addr, req)?;
         let pool_key = Box::new(WorkloadKey {
             src_id: req.source.identity(),
             dst_id: req.upstream_sans.clone(),
@@ -448,8 +472,15 @@ impl OutboundConnection {
             return Err(Error::SelfCall);
         }
 
+        let destination_fqdns = self
+            .pi
+            .local_workload_information
+            .dns_bindings
+            .as_ref()
+            .map(|bindings| bindings.lookup(target.ip(), tokio::time::Instant::now()))
+            .unwrap_or_default();
         if let Some(result) = self
-            .apply_egress_policy(&source_workload, &context, &target)
+            .apply_egress_policy(&source_workload, &context, &target, &destination_fqdns)
             .await
         {
             return result;
@@ -457,6 +488,7 @@ impl OutboundConnection {
 
         debug!("built request as passthrough");
         Ok(Request {
+            destination_fqdns,
             protocol: OutboundProtocol::TCP,
             source: source_workload,
             sandbox_context: context,
@@ -472,6 +504,7 @@ impl OutboundConnection {
         source_workload: &Arc<Workload>,
         context: &SandboxContext,
         target: &SocketAddr,
+        destination_fqdns: &[crate::strng::Strng],
     ) -> Option<Result<Request, Error>> {
         let matched = match_source_egress_policy(source_workload, target)
             .map(|policy| (policy.policy, policy.gateway.clone()));
@@ -500,6 +533,7 @@ impl OutboundConnection {
                 let actual_destination = waypoint.workload_socket_addr();
                 let upstream_sans = waypoint.workload_and_services_san();
                 Some(Ok(Request {
+                    destination_fqdns: destination_fqdns.to_vec(),
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload.clone(),
                     sandbox_context: context.clone(),
@@ -536,6 +570,8 @@ fn baggage(r: &Request) -> String {
 
 #[derive(Debug)]
 struct Request {
+    // Shared admission snapshot for local policy and HBONE metadata, before gateway routing.
+    destination_fqdns: Vec<crate::strng::Strng>,
     protocol: OutboundProtocol,
     // Source workload sending the request
     source: Arc<Workload>,
@@ -652,11 +688,13 @@ mod tests {
             namespace: "ns".to_string(),
             service_account: "default".to_string(),
         };
-        let local_workload_information = Arc::new(LocalWorkloadInformation::new(
+        let mut local_workload_information = LocalWorkloadInformation::new(
             Arc::new(wi.clone()),
             state.clone(),
             identity::mock::new_secret_manager(Duration::from_secs(10)),
-        ));
+        );
+        local_workload_information.dns_bindings = Some(Arc::new(Default::default()));
+        let local_workload_information = Arc::new(local_workload_information);
         OutboundConnection {
             pi: Arc::new(ProxyInputs {
                 state: state.clone(),
@@ -873,6 +911,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_dns_bindings_are_isolated_per_workload() {
+        use crate::dns::resolver::Answer;
+        use hickory_proto::rr::{Name, RData, Record, rdata::A};
+
+        let seed = outbound_with_resources(vec![]);
+        let mut config = crate::test_helpers::test_config();
+        config.proxy_mode = crate::config::ProxyMode::Shared;
+        config.enable_dns_name_tracking = true;
+        let (_drain, watch) = crate::drain::new();
+        let factory = crate::proxyfactory::ProxyFactory::new(
+            Arc::new(config),
+            seed.pi.state.clone(),
+            seed.pi.local_workload_information.full_cert_manager.clone(),
+            test_proxy_metrics(),
+            Some(crate::dns::Metrics::new(
+                &mut prometheus_client::registry::Registry::default(),
+            )),
+            watch,
+            None,
+        )
+        .unwrap();
+        let mut proxies = Vec::new();
+        for pod in ["pod-a", "pod-b"] {
+            proxies.push(
+                factory
+                    .new_proxies_from_factory(
+                        None,
+                        Some(pod),
+                        WorkloadInfo::new(pod.into(), "ns".into(), "default".into()),
+                        seed.pi.socket_factory.clone(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let bindings: Vec<_> = proxies
+            .iter()
+            .map(|proxy| {
+                assert!(proxy.dns_proxy.is_some());
+                proxy
+                    .proxy
+                    .as_ref()
+                    .unwrap()
+                    .outbound
+                    .pi
+                    .local_workload_information
+                    .dns_bindings
+                    .as_ref()
+                    .unwrap()
+            })
+            .collect();
+        assert!(!Arc::ptr_eq(bindings[0], bindings[1]));
+        let ip = "203.0.113.7".parse().unwrap();
+        let now = tokio::time::Instant::now();
+        for (binding, name) in bindings.iter().zip(["a.example.com", "b.example.com"]) {
+            let name = Name::from_ascii(name).unwrap();
+            binding.observe(
+                &name,
+                &Answer::new(
+                    vec![Record::from_rdata(name.clone(), 60, RData::A(A(ip)))],
+                    false,
+                ),
+                now,
+            );
+        }
+        assert_eq!(bindings[0].lookup(ip.into(), now), ["a.example.com"]);
+        assert_eq!(bindings[1].lookup(ip.into(), now), ["b.example.com"]);
+    }
+
+    #[tokio::test]
+    async fn hbone_dns_header_uses_original_destination_snapshot() {
+        use crate::dns::resolver::Answer;
+        use crate::state::workload::{GatewayAddress, NetworkAddress, gatewayaddress::Destination};
+        use hickory_proto::rr::{Name, RData, Record, rdata::A};
+
+        let outbound = outbound_with_resources(vec![XdsAddressType::Workload(XdsWorkload {
+            uid: "egress-gateway".into(),
+            namespace: "ns".into(),
+            addresses: vec![Bytes::from_static(&[127, 0, 0, 10])],
+            ..Default::default()
+        })]);
+        let source = outbound
+            .pi
+            .local_workload_information
+            .get_workload()
+            .await
+            .unwrap();
+        let source = Arc::new(Workload {
+            egress_policies: Some(EgressPolicies {
+                policies: vec![EgressPolicy {
+                    namespaces: Default::default(),
+                    match_cidrs: vec![],
+                    match_ports: vec![],
+                    policy: EgressPolicyAction::Gateway,
+                    gateway: Some(GatewayAddress {
+                        destination: Destination::Address(NetworkAddress {
+                            network: "".into(),
+                            address: "127.0.0.10".parse().unwrap(),
+                        }),
+                        hbone_mtls_port: 15008,
+                    }),
+                }],
+            }),
+            ..(*source).clone()
+        });
+        let bindings = outbound
+            .pi
+            .local_workload_information
+            .dns_bindings
+            .as_ref()
+            .unwrap();
+        let target: SocketAddr = "203.0.113.7:443".parse().unwrap();
+        for (host, ip) in [
+            ("B.Example.COM.", "203.0.113.7"),
+            ("a.example.com", "203.0.113.7"),
+            ("gateway.example.com", "127.0.0.10"),
+        ] {
+            let name = Name::from_ascii(host).unwrap();
+            bindings.observe(
+                &name,
+                &Answer::new(
+                    vec![Record::from_rdata(
+                        name.clone(),
+                        10,
+                        RData::A(A(ip.parse().unwrap())),
+                    )],
+                    false,
+                ),
+                tokio::time::Instant::now(),
+            );
+        }
+        let mut req = outbound
+            .build_request(source.clone(), Default::default(), target)
+            .await
+            .unwrap();
+        assert_eq!(req.actual_destination, "127.0.0.10:15008".parse().unwrap());
+        assert_eq!(req.destination_fqdns, ["a.example.com", "b.example.com"]);
+        // Expiration after admission must not change either local evidence or wire metadata.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::time::resume();
+        assert!(
+            bindings
+                .lookup(target.ip(), tokio::time::Instant::now())
+                .is_empty()
+        );
+        let remote = "127.0.0.1:12345".parse().unwrap();
+        let request = outbound.create_hbone_request(remote, &req).unwrap();
+        assert_eq!(
+            request.headers()[DESTINATION_DNS_CANDIDATES_HEADER],
+            r#""a.example.com", "b.example.com""#
+        );
+        assert!(request.headers()[DESTINATION_DNS_CANDIDATES_HEADER].is_sensitive());
+        let udp = outbound
+            .create_connect_udp_request(remote, &req)
+            .await
+            .unwrap();
+        assert_eq!(
+            udp.headers()[DESTINATION_DNS_CANDIDATES_HEADER],
+            request.headers()[DESTINATION_DNS_CANDIDATES_HEADER]
+        );
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (request, mut response) = connection.accept().await.unwrap().unwrap();
+            headers_tx.send(request.headers().clone()).unwrap();
+            response
+                .send_response(http::Response::new(()), true)
+                .unwrap();
+            while let Some(stream) = connection.accept().await {
+                stream.unwrap();
+            }
+        });
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let (response, _) = client.send_request(request, true).unwrap();
+        assert_eq!(response.await.unwrap().status(), http::StatusCode::OK);
+        let received = headers_rx.await.unwrap();
+        assert_eq!(
+            received["x-agentio-destination-dns-candidates"],
+            r#""a.example.com", "b.example.com""#
+        );
+        assert!(!received.contains_key("x-agentio-destination-dns-names"));
+        let received_names: sfv::List =
+            sfv::Parser::new(received[DESTINATION_DNS_CANDIDATES_HEADER].as_bytes())
+                .parse()
+                .unwrap();
+        assert_eq!(
+            received_names,
+            vec![
+                sfv::Item::new(sfv::StringRef::constant("a.example.com")).into(),
+                sfv::Item::new(sfv::StringRef::constant("b.example.com")).into(),
+            ]
+        );
+        server.abort();
+        driver.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        assert!(driver.await.unwrap_err().is_cancelled());
+        drop(client);
+
+        let fresh = outbound
+            .build_request(source, Default::default(), target)
+            .await
+            .unwrap();
+        assert!(
+            !outbound
+                .create_hbone_request(remote, &fresh)
+                .unwrap()
+                .headers()
+                .contains_key(DESTINATION_DNS_CANDIDATES_HEADER)
+        );
+        req.destination_fqdns = (0..1000)
+            .map(|i| crate::strng::format!("{i}.example.com"))
+            .collect();
+        assert!(matches!(
+            outbound.create_hbone_request(remote, &req),
+            Err(Error::DestinationDnsCandidatesHeaderTooLarge(_))
+        ));
+        assert!(matches!(
+            outbound.create_connect_udp_request(remote, &req).await,
+            Err(Error::DestinationDnsCandidatesHeaderTooLarge(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn hbone_request_carries_sandbox_id_without_sni() {
         const TEST_SANDBOX_TOKEN: &str =
             r#"{"accessToken":"opaque-token","sandboxClientId":"client+/="}"#;
@@ -953,6 +1218,7 @@ mod tests {
 
         // Create a minimal test request with required fields
         let mut req = Request {
+            destination_fqdns: vec![],
             protocol: OutboundProtocol::HBONE,
             source: source_workload,
             sandbox_context: SandboxContext::default(),
@@ -966,7 +1232,7 @@ mod tests {
 
         let remote_addr = "127.0.0.1:12345".parse().unwrap();
 
-        let request = outbound.create_hbone_request(remote_addr, &req);
+        let request = outbound.create_hbone_request(remote_addr, &req).unwrap();
         assert!(!request.headers().contains_key("x-agentio-sni"));
         let udp = outbound
             .create_connect_udp_request(remote_addr, &req)
@@ -1001,7 +1267,7 @@ mod tests {
                 sandbox,
                 ..Default::default()
             };
-            let request = outbound.create_hbone_request(remote_addr, &req);
+            let request = outbound.create_hbone_request(remote_addr, &req).unwrap();
             assert!(!request.headers().contains_key("x-agentio-sni"));
             assert!(!request.headers().contains_key("x-agentio-tls"));
             assert_eq!(
@@ -1037,7 +1303,7 @@ mod tests {
         req.sandbox_context = context;
         // HBONE construction uses the captured context, without reading the file again.
         std::fs::remove_file(token_dir.join("sandbox.token")).unwrap();
-        let request = outbound.create_hbone_request(remote_addr, &req);
+        let request = outbound.create_hbone_request(remote_addr, &req).unwrap();
         assert_eq!(request.headers()[sandbox::SANDBOX_ID_HEADER], id.as_str());
         assert_eq!(
             request.headers()[SANDBOX_METADATA_HEADER],
@@ -1266,7 +1532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_policy_updates_recheck_tcp() {
+    async fn sidecar_dns_learning_and_policy_updates_recheck_tcp() {
         use crate::sandbox::discovery::tests::Fixture;
         use crate::state::DemandProxyState;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1282,7 +1548,7 @@ mod tests {
             Default::default(),
             test_proxy_metrics(),
         );
-        let local = Arc::new(LocalWorkloadInformation::new(
+        let mut local = LocalWorkloadInformation::new(
             Arc::new(WorkloadInfo::new(
                 "pod".into(),
                 "ns".into(),
@@ -1290,14 +1556,16 @@ mod tests {
             )),
             state.clone(),
             identity::mock::new_secret_manager(Duration::from_secs(10)),
-        ));
+        );
+        local.dns_bindings = Some(Arc::new(Default::default()));
+        let local = Arc::new(local);
         let sockets = Arc::new(crate::proxy::DefaultSocketFactory::default());
         let connection_manager = ConnectionManager::default();
         let (stop, watch) = crate::drain::new();
         let watcher = tokio::spawn(
             crate::proxy::connection_manager::PolicyWatcher::new(
                 state.clone(),
-                watch,
+                watch.clone(),
                 connection_manager.clone(),
             )
             .run(),
@@ -1316,6 +1584,26 @@ mod tests {
                 ))))
                 .unwrap();
         };
+        let allow_fqdn = TrafficPolicy {
+            egress: Some(traffic_policy::RuleSet {
+                rules: vec![traffic_policy::Rule {
+                    action: traffic_policy::Action::Allow.into(),
+                    r#match: Some(traffic_policy::Match {
+                        destination_fqdns: vec!["api.example.com".into()],
+                        ..Default::default()
+                    }),
+                }],
+            }),
+            ..Default::default()
+        };
+        publish(Sandbox {
+            uid: "sandbox-a".into(),
+            attester: Some(Attester {
+                workload_uid: fixture.workload.uid.to_string(),
+            }),
+            traffic_policy: Some(allow_fqdn.clone()),
+            ..Default::default()
+        });
         let mut outbound = OutboundConnection {
             pi: Arc::new(ProxyInputs {
                 state,
@@ -1336,7 +1624,71 @@ mod tests {
         };
         let inputs = outbound.pi.clone();
         let pool = outbound.pool.clone();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        struct TestForwarder(crate::dns::forwarder::Forwarder);
+        #[async_trait::async_trait]
+        impl crate::dns::Forwarder for TestForwarder {
+            fn search_domains(
+                &self,
+                _: &crate::state::workload::Workload,
+            ) -> Vec<hickory_proto::rr::Name> {
+                vec![]
+            }
+            async fn forward(
+                &self,
+                _: Option<&crate::state::workload::Workload>,
+                request: &hickory_server::server::Request,
+            ) -> Result<crate::dns::resolver::Answer, hickory_server::zone_handler::LookupError>
+            {
+                crate::dns::resolver::Resolver::lookup(&self.0, request).await
+            }
+        }
+        let upstream_dns = crate::test_helpers::dns::run_dns(std::collections::HashMap::from([(
+            crate::test_helpers::dns::n("api.example.com."),
+            vec!["127.0.0.1".parse().unwrap()],
+        )]))
+        .await
+        .unwrap();
+        let dns = crate::dns::Server::new(
+            "cluster.local".into(),
+            crate::config::Address::Localhost(false, 0),
+            inputs.state.clone(),
+            Arc::new(TestForwarder(
+                crate::dns::forwarder::Forwarder::new(
+                    upstream_dns.resolver_config(),
+                    inputs.socket_factory.clone(),
+                    Default::default(),
+                )
+                .unwrap(),
+            )),
+            Arc::new(crate::dns::Metrics::new(
+                &mut prometheus_client::registry::Registry::default(),
+            )),
+            watch,
+            inputs.socket_factory.as_ref(),
+            inputs.local_workload_information.as_fetcher(),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let dns_addr = dns.udp_address();
+        let dns_task = tokio::spawn(dns.run());
+        for _ in 0..2 {
+            let response =
+                crate::test_helpers::app::dns_request(dns_addr, "api.example.com.", true, false)
+                    .await;
+            assert_eq!(response.answers.len(), 1);
+        }
+        assert_eq!(
+            inputs
+                .local_workload_information
+                .dns_bindings
+                .as_ref()
+                .unwrap()
+                .lookup("127.0.0.1".parse().unwrap(), tokio::time::Instant::now()),
+            ["api.example.com"]
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
             let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let destination = upstream.local_addr().unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1359,6 +1711,7 @@ mod tests {
                 attester: Some(Attester {
                     workload_uid: fixture.workload.uid.to_string(),
                 }),
+                traffic_policy: Some(allow_fqdn.clone()),
                 ..Default::default()
             });
             // The existing stream still forwards in both directions.
@@ -1389,6 +1742,26 @@ mod tests {
             drop(next_client);
             drop(next_server);
             next_forwarding.await.unwrap();
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(6)).await;
+            tokio::time::resume();
+            assert!(
+                inputs
+                    .local_workload_information
+                    .dns_bindings
+                    .as_ref()
+                    .unwrap()
+                    .lookup(destination.ip(), tokio::time::Instant::now())
+                    .is_empty()
+            );
+            let established = connection_manager.connections().pop().unwrap();
+            assert!(
+                inputs
+                    .state
+                    .assert_rbac(&established.rbac_ctx)
+                    .await
+                    .is_ok()
+            );
             // An accepted xDS policy update rechecks and closes the existing TCP stream.
             publish(Sandbox {
                 uid: "sandbox-a".into(),
@@ -1430,5 +1803,6 @@ mod tests {
         stop.start_drain_and_wait(crate::drain::DrainMode::Immediate)
             .await;
         watcher.await.unwrap();
+        dns_task.await.unwrap();
     }
 }

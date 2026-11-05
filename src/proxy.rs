@@ -228,6 +228,7 @@ pub struct Proxy {
 pub struct LocalWorkloadInformation {
     wi: Arc<WorkloadInfo>,
     state: DemandProxyState,
+    pub(crate) dns_bindings: Option<Arc<crate::dns::bindings::DnsBindings>>,
     // full_cert_manager gives access to the full SecretManager. This MUST only be given restricted
     // access to the appropriate certificates
     full_cert_manager: Arc<SecretManager>,
@@ -243,6 +244,7 @@ impl LocalWorkloadInformation {
             wi,
             state,
             full_cert_manager: cert_manager,
+            dns_bindings: None,
         }
     }
 
@@ -271,7 +273,11 @@ impl LocalWorkloadInformation {
     }
 
     pub fn as_fetcher(&self) -> Arc<LocalWorkloadFetcher> {
-        LocalWorkloadFetcher::new(self.wi.clone(), self.state.clone())
+        Arc::new(LocalWorkloadFetcher {
+            wi: self.wi.clone(),
+            state: self.state.clone(),
+            dns_bindings: self.dns_bindings.clone(),
+        })
     }
 }
 
@@ -281,11 +287,16 @@ impl LocalWorkloadInformation {
 pub struct LocalWorkloadFetcher {
     wi: Arc<WorkloadInfo>,
     state: DemandProxyState,
+    pub(crate) dns_bindings: Option<Arc<crate::dns::bindings::DnsBindings>>,
 }
 
 impl LocalWorkloadFetcher {
     pub fn new(wi: Arc<WorkloadInfo>, state: DemandProxyState) -> Arc<Self> {
-        Arc::new(LocalWorkloadFetcher { wi, state })
+        Arc::new(LocalWorkloadFetcher {
+            wi,
+            state,
+            dns_bindings: None,
+        })
     }
     pub async fn get_workload(&self) -> Result<Arc<Workload>, Error> {
         get_workload(&self.state, self.wi.clone()).await
@@ -664,6 +675,8 @@ pub enum Error {
     EgressPolicyDenied(SocketAddr),
     #[error("egress policy requires gateway but none configured")]
     EgressPolicyGatewayMissing(SocketAddr),
+    #[error("destination DNS candidates header exceeds 8192 bytes ({0} bytes)")]
+    DestinationDnsCandidatesHeaderTooLarge(usize),
 }
 
 // Custom TLV for proxy protocol for the identity of the source
@@ -707,6 +720,8 @@ pub struct TraceParent {
 
 pub const BAGGAGE_HEADER: &str = "baggage";
 pub const TRACEPARENT_HEADER: &str = "traceparent";
+/// JSON array of DNS names observed for the original destination IP.
+pub const DESTINATION_DNS_CANDIDATES_HEADER: &str = "x-agentio-destination-dns-candidates";
 
 impl TraceParent {
     pub fn header(&self) -> hyper::header::HeaderValue {

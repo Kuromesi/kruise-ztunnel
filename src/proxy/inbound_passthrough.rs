@@ -161,6 +161,7 @@ impl InboundPassthrough {
         let rbac_ctx = crate::state::ProxyRbacContext {
             sandbox: pi.state.fetch_sandbox(&upstream_workload),
             conn: rbac::Connection {
+                destination_fqdns: Default::default(),
                 src_identity: None,
                 src: source_addr,
                 // inbound request must be on our network since this is passthrough

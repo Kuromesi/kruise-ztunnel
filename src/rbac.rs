@@ -50,6 +50,9 @@ pub struct Connection {
     pub src_identity: Option<Identity>,
     pub dst_network: Strng,
     pub direction: Direction,
+    /// DNS evidence captured at outbound connection admission, retained for policy rechecks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_fqdns: Vec<Strng>,
 }
 
 struct OptionDisplay<'a, T>(&'a Option<T>);
@@ -103,6 +106,8 @@ struct Rule {
     source_ips: Vec<IpNet>,
     #[serde(default)]
     destination_ips: Vec<IpNet>,
+    #[serde(default, deserialize_with = "deserialize_fqdns")]
+    destination_fqdns: Vec<Strng>,
     #[serde(default)]
     ports: Vec<PortMatch>,
 }
@@ -138,7 +143,12 @@ where
 impl Rule {
     fn matches_tcp(&self, conn: &Connection) -> bool {
         (self.source_ips.is_empty() || self.source_ips.iter().any(|ip| ip.contains(&conn.src.ip())))
-            && (self.destination_ips.is_empty()
+            && ((self.destination_ips.is_empty() && self.destination_fqdns.is_empty())
+                || (conn.direction == Direction::Outbound
+                    && self
+                        .destination_fqdns
+                        .iter()
+                        .any(|name| conn.destination_fqdns.contains(name)))
                 || self
                     .destination_ips
                     .iter()
@@ -228,6 +238,13 @@ impl TrafficPolicy {
         for (direction, rules) in [("ingress", &self.ingress), ("egress", &self.egress)] {
             if let Some(rules) = rules {
                 for (index, rule) in rules.rules.iter().enumerate() {
+                    ensure!(
+                        direction == "egress" || rule.destination_fqdns.is_empty(),
+                        "destination FQDNs are supported only in egress rules"
+                    );
+                    for name in &rule.destination_fqdns {
+                        validate_fqdn(name)?;
+                    }
                     for port in &rule.ports {
                         port.validate()
                             .with_context(|| format!("TrafficPolicy {direction} rule {index}"))?;
@@ -326,6 +343,10 @@ pub fn firewall_rulesets<'a>(
             };
             configured = true;
             for (index, rule) in body.rules.iter().enumerate() {
+                // DNS learning applies only to TCP; an unresolved FQDN is never a wildcard.
+                if !rule.destination_fqdns.is_empty() && rule.destination_ips.is_empty() {
+                    continue;
+                }
                 let port_groups: Vec<_> = rule
                     .ports
                     .iter()
@@ -452,6 +473,14 @@ impl TryFrom<proto::Rule> for Rule {
                 .into_iter()
                 .map(parse_address)
                 .collect::<anyhow::Result<_>>()?,
+            destination_fqdns: matches
+                .destination_fqdns
+                .into_iter()
+                .map(|name| {
+                    let name = validate_fqdn(&name)?;
+                    Ok(crate::dns::bindings::canonical_name(&name))
+                })
+                .collect::<anyhow::Result<_>>()?,
             ports: matches
                 .ports
                 .into_iter()
@@ -459,6 +488,30 @@ impl TryFrom<proto::Rule> for Rule {
                 .collect::<anyhow::Result<_>>()?,
         })
     }
+}
+
+fn validate_fqdn(name: &str) -> anyhow::Result<hickory_proto::rr::Name> {
+    let name = hickory_proto::rr::Name::from_ascii(name).context("invalid destination FQDN")?;
+    ensure!(
+        name.num_labels() > 0 && !name.to_ascii().contains('*'),
+        "destination FQDN must be an exact DNS name"
+    );
+    Ok(name)
+}
+
+fn deserialize_fqdns<'de, D>(deserializer: D) -> Result<Vec<Strng>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let names = <Vec<String> as serde::Deserialize>::deserialize(deserializer)?;
+    names
+        .into_iter()
+        .map(|name| {
+            validate_fqdn(&name)
+                .map(|name| crate::dns::bindings::canonical_name(&name))
+                .map_err(serde::de::Error::custom)
+        })
+        .collect()
 }
 
 fn parse_address(address: proto::Address) -> anyhow::Result<IpNet> {

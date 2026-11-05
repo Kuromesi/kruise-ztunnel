@@ -17,6 +17,7 @@ use crate::proxy::AuthorizationRejectionError;
 
 fn connection(src: &str, dst: &str) -> Connection {
     Connection {
+        destination_fqdns: Default::default(),
         src: src.parse().unwrap(),
         dst: dst.parse().unwrap(),
         src_identity: None,
@@ -99,6 +100,129 @@ async fn evaluate(
     conn: &Connection,
 ) -> Result<(), AuthorizationRejectionError> {
     check_policies(Some(policy), &[], conn).await
+}
+
+#[tokio::test]
+async fn fqdn_matches_or_falls_back_to_ip_without_changing_rule_order() {
+    let allow = proto::Rule {
+        action: proto::Action::Allow.into(),
+        r#match: Some(proto::Match {
+            destination_fqdns: vec!["API.Example.COM.".into()],
+            destination_ips: vec![proto::Address {
+                address: vec![192, 0, 2, 1],
+                length: 32,
+            }],
+            ports: vec![proto::PortMatch {
+                protocol: proto::Protocol::Tcp.into(),
+                port: Some(443),
+                end_port: None,
+            }],
+            ..Default::default()
+        }),
+    };
+    let mut learned = connection("10.0.0.1:1234", "192.0.2.2:443");
+    learned.destination_fqdns = vec!["api.example.com".into()];
+    assert!(
+        evaluate(policy(Some(vec![allow.clone()])), &learned)
+            .await
+            .is_ok()
+    );
+    assert!(
+        evaluate(
+            policy(Some(vec![allow.clone()])),
+            &connection("10.0.0.1:1234", "192.0.2.1:443")
+        )
+        .await
+        .is_ok()
+    );
+    assert!(
+        evaluate(
+            policy(Some(vec![allow.clone()])),
+            &connection("10.0.0.1:1234", "192.0.2.2:443")
+        )
+        .await
+        .is_err()
+    );
+    let mut wrong_port = learned.clone();
+    wrong_port.dst.set_port(80);
+    assert!(
+        evaluate(policy(Some(vec![allow.clone()])), &wrong_port)
+            .await
+            .is_err()
+    );
+    assert!(
+        evaluate(
+            policy(Some(vec![rule(proto::Action::Deny), allow.clone()])),
+            &learned
+        )
+        .await
+        .is_err()
+    );
+    let mut deny = allow;
+    deny.action = proto::Action::Deny.into();
+    assert!(
+        evaluate(
+            policy(Some(vec![deny, rule(proto::Action::Allow)])),
+            &learned
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn fqdn_only_rule_is_not_a_destination_wildcard() {
+    let mut rule = rule(proto::Action::Allow);
+    rule.r#match.as_mut().unwrap().destination_fqdns = vec!["api.example.com".into()];
+    let native = TrafficPolicy::try_from(policy(Some(vec![rule.clone()]))).unwrap();
+    let mut conn = connection("10.0.0.1:1234", "192.0.2.1:443");
+    assert!(
+        evaluate(policy(Some(vec![rule.clone()])), &conn)
+            .await
+            .is_err()
+    );
+    conn.destination_fqdns = vec!["other.example.com".into(), "api.example.com".into()];
+    assert!(evaluate(policy(Some(vec![rule])), &conn).await.is_ok());
+    let ruleset = firewall_ruleset(&native);
+    assert!(
+        ruleset
+            .rules
+            .iter()
+            .all(|r| r.action == crate::firewall::RuleAction::Deny)
+    );
+}
+
+#[test]
+fn fqdn_rejects_invalid_names_and_ingress_use() {
+    for name in ["", ".", "*.example.com", "bad..example.com"] {
+        let mut rule = rule(proto::Action::Allow);
+        rule.r#match.as_mut().unwrap().destination_fqdns = vec![name.into()];
+        assert!(
+            TrafficPolicy::try_from(policy(Some(vec![rule]))).is_err(),
+            "{name}"
+        );
+    }
+    let mut rule = rule(proto::Action::Allow);
+    rule.r#match.as_mut().unwrap().destination_fqdns = vec!["api.example.com".into()];
+    assert!(
+        TrafficPolicy::try_from(XdsTrafficPolicy {
+            ingress: Some(proto::RuleSet { rules: vec![rule] }),
+            ..Default::default()
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn local_fqdn_names_are_normalized_like_xds() {
+    let native: TrafficPolicy = serde_json::from_value(serde_json::json!({
+        "egress": { "rules": [{ "action": "Allow", "destinationFqdns": ["API.Example.COM."] }] }
+    }))
+    .unwrap();
+    native.validate().unwrap();
+    let mut conn = connection("10.0.0.1:1234", "192.0.2.1:443");
+    conn.destination_fqdns = vec!["api.example.com".into()];
+    assert!(assert_policies(std::iter::once(("local", Some(&native))), &conn).is_ok());
 }
 
 #[tokio::test]
@@ -220,6 +344,7 @@ async fn native_tcp_matches_addresses_and_port_ranges() {
     let rule = proto::Rule {
         action: proto::Action::Allow.into(),
         r#match: Some(proto::Match {
+            destination_fqdns: vec![],
             source_ips: vec![
                 proto::Address {
                     address: vec![10, 1, 2, 3],

@@ -160,6 +160,7 @@ fn config_dump_includes_sandbox_bindings_and_named_traffic_policies() {
         "action": "Deny",
         "sourceIps": [],
         "destinationIps": ["10.0.0.0/8"],
+        "destinationFqdns": [],
         "ports": [{"protocol": "TCP", "range": {"start": 80, "end": 90}}]
     });
     assert_eq!(sandbox["trafficPolicy"]["egress"]["rules"][0], rule);
