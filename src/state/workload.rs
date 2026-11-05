@@ -519,8 +519,12 @@ impl TryFrom<XdsWorkload> for (Workload, HashMap<String, PortList>) {
                         refs.type_url
                     )));
                 }
-                traffic_policy_refs =
-                    Some(refs.resource_names.into_iter().map(Strng::from).collect());
+                traffic_policy_refs = Some(
+                    refs.resources
+                        .into_iter()
+                        .map(|resource| Strng::from(resource.name))
+                        .collect(),
+                );
                 continue;
             }
             let extension = WorkloadExtension::try_from(extension)?;
@@ -1032,7 +1036,17 @@ mod tests {
                     .into(),
                 value: ext_proto::PolicyReference {
                     type_url: xds::TRAFFIC_POLICY_TYPE.to_string(),
-                    resource_names: names.into_iter().map(String::from).collect(),
+                    resources: names
+                        .into_iter()
+                        .map(|name| ext_proto::PolicyResourceReference {
+                            name: name.into(),
+                            uid: format!("source-{name}"),
+                            extensions: vec![Any {
+                                type_url: "test.example/Metadata".into(),
+                                value: b"metadata".to_vec(),
+                            }],
+                        })
+                        .collect(),
                 }
                 .encode_to_vec(),
             }),
