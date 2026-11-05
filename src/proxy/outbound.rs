@@ -47,13 +47,13 @@ use crate::state::workload::OutboundProtocol;
 use crate::state::workload::Workload;
 use crate::{assertions, copy, proxy, socket};
 
-const MAX_DESTINATION_DNS_CANDIDATES_HEADER_BYTES: usize = 8192;
-
 pub struct Outbound {
     pi: Arc<ProxyInputs>,
     drain: DrainWatcher,
     listener: socket::Listener,
 }
+
+const MAX_DESTINATION_DNS_CANDIDATES_HEADER_BYTES: usize = 8192;
 
 impl Outbound {
     pub(super) async fn new(pi: Arc<ProxyInputs>, drain: DrainWatcher) -> Result<Outbound, Error> {

@@ -665,6 +665,8 @@ pub enum Error {
     #[error("connection closed due to connection drain")]
     ClosedFromDrain,
 
+    #[error("destination DNS candidates header exceeds 8192 bytes ({0} bytes)")]
+    DestinationDnsCandidatesHeaderTooLarge(usize),
     #[error("dns: {0}")]
     Dns(#[from] ProtoError),
     #[error("dns lookup: {0}")]
@@ -675,8 +677,6 @@ pub enum Error {
     EgressPolicyDenied(SocketAddr),
     #[error("egress policy requires gateway but none configured")]
     EgressPolicyGatewayMissing(SocketAddr),
-    #[error("destination DNS candidates header exceeds 8192 bytes ({0} bytes)")]
-    DestinationDnsCandidatesHeaderTooLarge(usize),
 }
 
 // Custom TLV for proxy protocol for the identity of the source
