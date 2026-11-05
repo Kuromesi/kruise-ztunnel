@@ -85,31 +85,25 @@ impl FileSandboxToken {
     }
 
     pub(crate) async fn require_ready(&self) -> Result<(), Error> {
-        self.store
-            .get_or_load()
-            .await
-            .map_err(Error::TokenLoad)?
+        self.get_or_load()
+            .await?
             .filter(|token| !token.is_empty())
-            .ok_or(Error::TokenNotReady)?;
-        Ok(())
+            .map(|_| ())
+            .ok_or(Error::TokenNotReady)
     }
 
-    pub(crate) async fn fill_metadata(&self, metadata: &mut SandboxMetadata) {
-        if let Some(token) = self.get_or_load().await {
+    pub(crate) fn extend_metadata(&self, metadata: &mut SandboxMetadata) {
+        if let Some(token) = self.store.first() {
             metadata.extend(&token);
         }
     }
 
-    /// Return a cached token, or read a file if the watcher has not loaded one yet.
-    pub(crate) async fn get_or_load(&self) -> Option<Arc<SandboxMetadata>> {
-        match self.store.get_or_load().await {
-            Ok(token) => token,
-            Err(err) => {
-                tracing::debug!(error = %err, "sandbox token read-through unavailable");
-                // The watcher may have populated the cache while the read failed.
-                self.store.first()
-            }
-        }
+    /// Read through missing and empty tokens without waiting for a watcher event.
+    pub(crate) async fn get_or_load(&self) -> Result<Option<Arc<SandboxMetadata>>, Error> {
+        self.store
+            .get_or_load(|token| !token.is_empty())
+            .await
+            .map_err(Error::TokenLoad)
     }
 }
 
@@ -182,6 +176,7 @@ mod tests {
             b.get_or_load()
                 .await
                 .unwrap()
+                .unwrap()
                 .to_header_value()
                 .unwrap()
                 .to_str()
@@ -195,14 +190,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("tokens");
         let mgr = unwatched_token(directory.clone());
-        assert!(mgr.get_or_load().await.is_none());
+        assert!(mgr.get_or_load().await.unwrap().is_none());
 
         // Keep recursive discovery and filename keys independent of metadata encoding.
         std::fs::create_dir_all(directory.join("nested")).unwrap();
         let path = directory.join("nested/sandbox");
         let raw = TOKEN.to_string();
         std::fs::write(&path, &raw).unwrap();
-        let token = mgr.get_or_load().await.unwrap();
+        let token = mgr.get_or_load().await.unwrap().unwrap();
         assert_eq!(
             token.to_header_value(),
             sandbox_token_transform(raw).unwrap().to_header_value()
@@ -213,7 +208,10 @@ mod tests {
         ));
 
         std::fs::remove_file(path).unwrap();
-        assert!(Arc::ptr_eq(&mgr.get_or_load().await.unwrap(), &token));
+        assert!(Arc::ptr_eq(
+            &mgr.get_or_load().await.unwrap().unwrap(),
+            &token
+        ));
     }
 
     #[tokio::test]
@@ -221,7 +219,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = unwatched_token(dir.path().to_path_buf());
         std::fs::write(dir.path().join("sandbox.token"), "").unwrap();
-        assert!(mgr.get_or_load().await.unwrap().is_empty());
+        assert!(mgr.get_or_load().await.unwrap().unwrap().is_empty());
+        std::fs::write(dir.path().join("sandbox.token"), TOKEN).unwrap();
+        mgr.require_ready().await.unwrap();
     }
 
     #[tokio::test]
@@ -269,7 +269,8 @@ mod tests {
         std::fs::write(directory.path().join("sandbox.token"), TOKEN).unwrap();
         let mut metadata = SandboxMetadata::default();
         metadata.insert("runtime.name", "test,runtime");
-        source.fill_metadata(&mut metadata).await;
+        source.require_ready().await.unwrap();
+        source.extend_metadata(&mut metadata);
         assert_eq!(
             metadata.to_header_value().unwrap().to_str().unwrap(),
             format!("{METADATA},runtime.name=test%2Cruntime")

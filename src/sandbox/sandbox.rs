@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use http::HeaderValue;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use crate::sandbox::discovery::{Sandbox, validate_id};
@@ -25,6 +26,7 @@ use crate::state::{DemandProxyState, WorkloadInfo};
 use crate::strng::{self, Strng};
 use crate::xds::SANDBOX_TYPE;
 
+use super::metadata::SandboxMetadata;
 use super::token::FileSandboxToken;
 
 pub mod rpc {
@@ -33,6 +35,7 @@ pub mod rpc {
 
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const REGISTRATION_FILE: &str = "sandbox.json";
+const PREPARATION_RETRY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -56,6 +59,8 @@ pub enum Error {
     UnknownWorkload,
     #[error("policy update channel closed: {0}")]
     UpdateChannelClosed(#[from] watch::error::RecvError),
+    #[error("Sandbox registration task failed: {0}")]
+    RegistrationTask(#[from] tokio::task::JoinError),
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -68,8 +73,15 @@ struct Registration {
 #[path = "sandbox/registration_tests.rs"]
 mod registration_tests;
 
-pub static SANDBOX_UID_HEADER: &str = "x-agentio-sandbox-uid";
+pub static SANDBOX_ID_HEADER: &str = "x-agentio-sandbox-id";
 pub static SANDBOX_LABELS_HEADER: &str = "x-agentio-sandbox-labels";
+
+/// Selected once before routing, shared by policy evaluation and transport.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SandboxContext {
+    pub(crate) sandbox: Option<Arc<Sandbox>>,
+    pub(crate) metadata: Option<HeaderValue>,
+}
 
 /// Manages one workload proxy's Sandbox identity, token and policy readiness.
 pub struct SandboxManager {
@@ -112,6 +124,39 @@ impl SandboxManager {
         Ok(self)
     }
 
+    pub(crate) async fn prepare(self: &Arc<Self>, id: &Strng) -> Result<(), Error> {
+        self.check_registration(id)?;
+        self.wait_for_sandbox(id).await?;
+        if let Some(token) = &self.token {
+            token.require_ready().await?;
+        }
+        let manager = self.clone();
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || manager.register(&id)).await?
+    }
+
+    pub(crate) fn connection_metadata(&self) -> Option<HeaderValue> {
+        let mut metadata = SandboxMetadata::default();
+        if let Some(token) = &self.token {
+            token.extend_metadata(&mut metadata);
+        }
+        metadata.to_header_value()
+    }
+
+    /// Runs with the proxy's management listener and is cancelled on drain.
+    pub(crate) async fn run(self: &Arc<Self>) {
+        let id = self.registered_id().await;
+        loop {
+            match self.wait_for_sandbox(&id).await {
+                Ok(_) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "Sandbox restoration pending; traffic uses Workload policies");
+                    tokio::time::sleep(PREPARATION_RETRY).await;
+                }
+            }
+        }
+    }
+
     pub(crate) fn check_registration(&self, id: &str) -> Result<(), Error> {
         validate_id(id).map_err(Error::InvalidIdentity)?;
         if let Some(current) = self.id.borrow().as_ref()
@@ -145,6 +190,7 @@ impl SandboxManager {
         fs::rename(temporary, directory.join(REGISTRATION_FILE))?;
         File::open(directory)?.sync_all()?;
         self.id.send_replace(Some(strng::new(id)));
+        tracing::info!(sandbox_id = %id, "Sandbox registration completed");
         Ok(())
     }
 

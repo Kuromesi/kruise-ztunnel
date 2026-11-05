@@ -21,6 +21,7 @@ use crate::sandbox::token::FileSandboxToken;
 use crate::state::workload::Workload;
 use crate::state::{DemandProxyState, WorkloadInfo};
 use std::path::Path;
+use std::time::Duration;
 
 async fn inputs(
     state: DemandProxyState,
@@ -85,7 +86,12 @@ async fn disabled_manager_preserves_cached_sandbox_lookup() {
     Arc::make_mut(&mut inputs.cfg).enable_sandbox_manager = false;
     inputs.sandbox_manager = None;
     assert_eq!(
-        inputs.sandbox_for_connection().unwrap().unwrap().uid,
+        inputs
+            .sandbox_for_connection()
+            .unwrap()
+            .sandbox
+            .unwrap()
+            .uid,
         "sandbox-a"
     );
 }
@@ -135,7 +141,7 @@ async fn prepare_requires_a_nonempty_token_and_allows_retry() {
         );
         assert!(error.message().contains("token"));
         assert!(!directory.path().join("sandbox.json").exists());
-        assert!(pi.sandbox_for_connection().unwrap().is_none());
+        assert!(pi.sandbox_for_connection().unwrap().sandbox.is_none());
 
         std::fs::write(
             token,
@@ -154,7 +160,7 @@ async fn prepare_requires_a_nonempty_token_and_allows_retry() {
         .await
         .unwrap();
         assert_eq!(
-            pi.sandbox_for_connection().unwrap().unwrap().uid,
+            pi.sandbox_for_connection().unwrap().sandbox.unwrap().uid,
             "sandbox-a"
         );
         assert!(directory.path().join("sandbox.json").exists());
@@ -255,6 +261,7 @@ async fn dedicated_factory_reads_agents_token_layout() {
                 .get_or_load()
                 .await
                 .unwrap()
+                .unwrap()
                 .to_header_value()
                 .unwrap()
                 .to_str()
@@ -279,7 +286,7 @@ async fn sandbox_unavailable_uses_workload_policies_while_prepare_still_waits() 
     )
     .await;
     let manager = pi.sandbox_manager.as_ref().unwrap();
-    assert!(pi.sandbox_for_connection().unwrap().is_none());
+    assert!(pi.sandbox_for_connection().unwrap().sandbox.is_none());
     let service = Service { pi: pi.clone() };
     let preparation = service.prepare_sandbox(Request::new(PrepareSandboxRequest {
         sandbox_id: "sandbox-a".into(),
@@ -289,11 +296,11 @@ async fn sandbox_unavailable_uses_workload_policies_while_prepare_still_waits() 
     assert!(!directory.path().join("sandbox.json").exists());
     fixture.publish("sandbox-a");
     // Receiving a candidate in xDS alone must not publish the registration.
-    assert!(pi.sandbox_for_connection().unwrap().is_none());
+    assert!(pi.sandbox_for_connection().unwrap().sandbox.is_none());
     fixture.state.read().unwrap().policies.send();
     preparation.await.unwrap();
     assert_eq!(
-        pi.sandbox_for_connection().unwrap().unwrap().uid,
+        pi.sandbox_for_connection().unwrap().sandbox.unwrap().uid,
         "sandbox-a"
     );
 
@@ -303,10 +310,10 @@ async fn sandbox_unavailable_uses_workload_policies_while_prepare_still_waits() 
         .unwrap()
         .sandboxes
         .remove(&"sandbox-a".into());
-    assert!(pi.sandbox_for_connection().unwrap().is_none());
+    assert!(pi.sandbox_for_connection().unwrap().sandbox.is_none());
     assert!(matches!(manager.ready_sandbox(), Err(Error::NotReady)));
     fixture.publish("sandbox-a");
-    assert!(pi.sandbox_for_connection().unwrap().is_some());
+    assert!(pi.sandbox_for_connection().unwrap().sandbox.is_some());
     let mut other = (*fixture.workload).clone();
     other.uid = "another-workload".into();
     fixture
@@ -381,7 +388,7 @@ async fn sandbox_rpc_and_outbound_share_per_pod_registration_and_drain() {
             .await
             .unwrap();
         let mut client_b = SandboxNetworkClient::new(channel_b);
-        assert!(pi_a.sandbox_for_connection().unwrap().is_none());
+        assert!(pi_a.sandbox_for_connection().unwrap().sandbox.is_none());
         client_a
             .prepare_sandbox(PrepareSandboxRequest {
                 sandbox_id: "sandbox-a".into(),
@@ -389,11 +396,11 @@ async fn sandbox_rpc_and_outbound_share_per_pod_registration_and_drain() {
             .await
             .unwrap();
         assert_eq!(
-            pi_a.sandbox_for_connection().unwrap().unwrap().uid,
+            pi_a.sandbox_for_connection().unwrap().sandbox.unwrap().uid,
             "sandbox-a"
         );
         // Preparing A must not select A's Sandbox for B.
-        assert!(pi_b.sandbox_for_connection().unwrap().is_none());
+        assert!(pi_b.sandbox_for_connection().unwrap().sandbox.is_none());
         client_b
             .prepare_sandbox(PrepareSandboxRequest {
                 sandbox_id: "sandbox-b".into(),
@@ -401,7 +408,7 @@ async fn sandbox_rpc_and_outbound_share_per_pod_registration_and_drain() {
             .await
             .unwrap();
         assert_eq!(
-            pi_b.sandbox_for_connection().unwrap().unwrap().uid,
+            pi_b.sandbox_for_connection().unwrap().sandbox.unwrap().uid,
             "sandbox-b"
         );
         for (pod, sandbox) in [("pod-a", "sandbox-a"), ("pod-b", "sandbox-b")] {
@@ -469,7 +476,7 @@ async fn failed_prepare_does_not_register_and_allows_corrected_id() {
             !directory.path().join("sandbox.json").exists(),
             "failed {id} was persisted"
         );
-        assert!(pi.sandbox_for_connection().unwrap().is_none());
+        assert!(pi.sandbox_for_connection().unwrap().sandbox.is_none());
 
         service
             .prepare_sandbox(Request::new(PrepareSandboxRequest {
@@ -478,7 +485,7 @@ async fn failed_prepare_does_not_register_and_allows_corrected_id() {
             .await
             .unwrap();
         assert_eq!(
-            pi.sandbox_for_connection().unwrap().unwrap().uid,
+            pi.sandbox_for_connection().unwrap().sandbox.unwrap().uid,
             "sandbox-a"
         );
         let restored = SandboxManager::new(
@@ -528,7 +535,7 @@ async fn cancelled_prepare_does_not_register_and_allows_corrected_id() {
         .await
         .unwrap();
     assert_eq!(
-        pi.sandbox_for_connection().unwrap().unwrap().uid,
+        pi.sandbox_for_connection().unwrap().sandbox.unwrap().uid,
         "sandbox-a"
     );
 }
@@ -562,7 +569,10 @@ async fn concurrent_prepare_commits_only_one_identity() {
         other => panic!("expected exactly one successful registration: {other:?}"),
     };
     assert_eq!(loser.code(), Code::FailedPrecondition);
-    assert_eq!(pi.sandbox_for_connection().unwrap().unwrap().uid, winner);
+    assert_eq!(
+        pi.sandbox_for_connection().unwrap().sandbox.unwrap().uid,
+        winner
+    );
     let restored = SandboxManager::new(
         fixture.demand.clone(),
         pi.local_workload_information.workload_info(),
@@ -758,7 +768,7 @@ async fn sandbox_management_tls_authenticates_before_prepare() {
                 "{case}"
             );
             assert_eq!(
-                pi.sandbox_for_connection().unwrap().is_some(),
+                pi.sandbox_for_connection().unwrap().sandbox.is_some(),
                 case == "allowed",
                 "{case}"
             );

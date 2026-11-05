@@ -173,6 +173,6 @@ fn header_constants_have_expected_values() {
         crate::sandbox::metadata::SANDBOX_METADATA_HEADER,
         "x-agentio-sandbox-metadata"
     );
-    assert_eq!(SANDBOX_UID_HEADER, "x-agentio-sandbox-uid");
+    assert_eq!(SANDBOX_ID_HEADER, "x-agentio-sandbox-id");
     assert_eq!(SANDBOX_LABELS_HEADER, "x-agentio-sandbox-labels");
 }

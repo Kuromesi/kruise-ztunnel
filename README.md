@@ -36,6 +36,15 @@ The configured directory must expose the runtime's token files to ztunnel.
 This preparation flow is validated for dedicated deployment; node-level token
 delivery is outside this scope.
 
+The manager owns the shared preparation operation used by RPC, including binding
+checks and durable registration, and restores registered identities on startup.
+Each outbound TCP connection or UDP session captures its ready Sandbox and cached
+metadata before routing. Policy selection, pooling and HBONE headers use this
+context; HBONE construction does not read token files. Unprepared connections
+continue with Workload policies and carry no Sandbox identity or metadata.
+Token readiness retries both missing files and cached empty files without waiting
+for a watcher update. Token formats and explicit RPC preparation remain unchanged.
+
 ## Sandbox metadata header
 
 Token files are JSON objects with nonempty string fields `accessToken` and
@@ -44,7 +53,7 @@ fields and caches their encoded metadata entries under the existing filename key
 multiple files remain separate Map entries. The token module contributes its
 `agent-identity.*` entries to a shared `SandboxMetadata` collection. Other modules
 can contribute their own namespaced entries to the same collection; outbound
-request construction serializes the combined collection into one header. Values
+connection setup serializes the combined collection into one header. Values
 are encoded at insertion and are not encoded again during merging. Replacing an
 existing key updates its value, so serialization emits each key only once.
 No JWT signature or expiry validation is performed by ztunnel.
@@ -64,6 +73,7 @@ logged as ordinary metadata.
 
 The previous `x-agentio-sandbox-token` header containing Base64-encoded JSON is
 no longer emitted. EPE must support the new header before deploying this change.
-The token file format is unchanged. The Sandbox discovery UID is sent in
-`x-agentio-sandbox-uid`; the gateway captures it as `agentio.sandbox.uid`.
+The token file format is unchanged. The Sandbox discovery ID is sent in
+`x-agentio-sandbox-id`; the gateway captures it as `agentio.sandbox.id`.
+The previous `x-agentio-sandbox-uid` header is no longer emitted.
 Upgrade the sending ztunnel and receiving gateway together.
