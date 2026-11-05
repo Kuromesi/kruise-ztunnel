@@ -1105,10 +1105,19 @@ async fn workload_references_recheck_tcp_and_firewall() {
     let mut notifications = f.state.read().unwrap().policies.subscribe();
     let names = ["trafficPolicies/allow", "trafficPolicies/deny"];
     let publish = |refs: &[&str]| {
+        use crate::xds::kruise::networking::extensions::v1::{
+            PolicyReference, PolicyResourceReference,
+        };
         use prost::Message;
-        let reference = crate::xds::kruise::networking::extensions::v1::PolicyReference {
+        let reference = PolicyReference {
             type_url: TRAFFIC_POLICY_TYPE.to_string(),
-            resource_names: refs.iter().map(|name| name.to_string()).collect(),
+            resources: refs
+                .iter()
+                .map(|name| PolicyResourceReference {
+                    name: name.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
         };
         let resource = XdsUpdate::Update(XdsResource {
             name: f.workload.uid.clone(),

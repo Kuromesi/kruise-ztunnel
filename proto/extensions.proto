@@ -16,6 +16,8 @@ syntax = "proto3";
 
 package kruise.networking.extensions.v1;
 
+import "google/protobuf/any.proto";
+
 message WorkloadMetadata {
   map<string, string> labels = 1;
   reserved 2;
@@ -68,8 +70,17 @@ message GatewayAddress {
   uint32 port = 2;
 }
 
+// PolicyResourceReference identifies one policy and its reference-specific metadata.
+message PolicyResourceReference {
+  string name = 1;
+  // UID is the source object's identity. Consumers currently resolve by name.
+  string uid = 2;
+  // Typed, policy-specific metadata; policy bodies are distributed separately.
+  repeated google.protobuf.Any extensions = 3;
+}
+
 // Workload owns the complete ordered binding, including global and namespace policies.
 message PolicyReference {
   string type_url = 1;
-  repeated string resource_names = 2;
+  repeated PolicyResourceReference resources = 2;
 }
