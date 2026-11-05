@@ -27,7 +27,7 @@ struct AgentIdentityToken {
     sandbox_client_id: String,
 }
 
-/// Parse and encode once per file update, keeping credential contents out of errors.
+/// Parse identity fields once per file update, keeping credential contents out of errors.
 fn sandbox_token_transform(s: String) -> anyhow::Result<SandboxMetadata> {
     if s.is_empty() {
         return Ok(SandboxMetadata::default());
@@ -47,8 +47,14 @@ fn sandbox_token_transform(s: String) -> anyhow::Result<SandboxMetadata> {
         "sandbox token sandboxClientId must not be empty"
     );
     let mut metadata = SandboxMetadata::default();
-    metadata.insert("agent-identity.access-token", &token.access_token);
-    metadata.insert("agent-identity.sandbox-client-id", &token.sandbox_client_id);
+    for (key, value) in [
+        ("agent-identity.access-token", token.access_token),
+        ("agent-identity.sandbox-client-id", token.sandbox_client_id),
+    ] {
+        metadata.insert(key, &value).map_err(|_| {
+            anyhow::anyhow!("sandbox token metadata {key} must contain only printable ASCII")
+        })?;
+    }
     Ok(metadata)
 }
 
@@ -119,8 +125,7 @@ mod tests {
     use std::time::Duration;
 
     const TOKEN: &str = r#"{"accessToken":"eyJ.test.signature","sandboxClientId":"client+/="}"#;
-    const METADATA: &str =
-        "agent-identity.access-token=eyJ.test.signature,agent-identity.sandbox-client-id=client+/=";
+    const METADATA: &str = r#"agent-identity.access-token="eyJ.test.signature", agent-identity.sandbox-client-id="client+/=""#;
 
     fn unwatched_token(token_dir: PathBuf) -> FileSandboxToken {
         FileSandboxToken {
@@ -268,12 +273,12 @@ mod tests {
         let source = unwatched_token(directory.path().into());
         std::fs::write(directory.path().join("sandbox.token"), TOKEN).unwrap();
         let mut metadata = SandboxMetadata::default();
-        metadata.insert("runtime.name", "test,runtime");
+        metadata.insert("runtime.name", "test,runtime").unwrap();
         source.require_ready().await.unwrap();
         source.extend_metadata(&mut metadata);
         assert_eq!(
             metadata.to_header_value().unwrap().to_str().unwrap(),
-            format!("{METADATA},runtime.name=test%2Cruntime")
+            r#"agent-identity.access-token="eyJ.test.signature", agent-identity.sandbox-client-id="client+/=", runtime.name="test,runtime""#
         );
     }
 
@@ -297,6 +302,28 @@ mod tests {
     #[test]
     fn token_transform_handles_empty_input() {
         assert!(sandbox_token_transform(String::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn token_transform_rejects_invalid_sf_strings_without_disclosing_credentials() {
+        for value in [
+            "secret-token\n",
+            "secret-token\t",
+            "secret-token\u{7f}",
+            "secret-token中",
+        ] {
+            for field in ["accessToken", "sandboxClientId"] {
+                let mut raw = serde_json::json!({
+                    "accessToken": "secret-token",
+                    "sandboxClientId": "client",
+                });
+                raw[field] = value.into();
+                let error = sandbox_token_transform(raw.to_string()).err().unwrap();
+                let message = format!("{error:#}");
+                assert!(message.contains("printable ASCII"));
+                assert!(!message.contains("secret-token"));
+            }
+        }
     }
 
     #[test]

@@ -13,21 +13,22 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
-use std::fmt::Write;
 
 use http::HeaderValue;
 
 pub(crate) const SANDBOX_METADATA_HEADER: &str = "x-agentio-sandbox-metadata";
 
-/// Contributions use fixed, namespaced keys; values are encoded at insertion.
+/// Contributions use fixed, namespaced keys and Structured Fields String values.
 #[derive(Default)]
 pub(crate) struct SandboxMetadata {
-    entries: BTreeMap<&'static str, String>,
+    entries: BTreeMap<&'static str, sfv::String>,
 }
 
 impl SandboxMetadata {
-    pub(crate) fn insert(&mut self, key: &'static str, value: &str) {
-        self.entries.insert(key, encode_metadata_value(value));
+    pub(crate) fn insert(&mut self, key: &'static str, value: &str) -> Result<(), sfv::Error> {
+        self.entries
+            .insert(key, sfv::StringRef::from_str(value)?.to_owned());
+        Ok(())
     }
 
     pub(crate) fn extend(&mut self, other: &Self) {
@@ -44,35 +45,18 @@ impl SandboxMetadata {
     }
 
     pub(crate) fn to_header_value(&self) -> Option<HeaderValue> {
-        if self.is_empty() {
-            return None;
+        let mut serializer = sfv::DictSerializer::new();
+        for (key, value) in &self.entries {
+            let _ = serializer.bare_item(
+                sfv::KeyRef::from_str(key).expect("fixed metadata keys are valid SF keys"),
+                value,
+            );
         }
-        let value = self
-            .entries
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut header =
-            HeaderValue::from_str(&value).expect("static keys and encoded ASCII values");
+        let value = serializer.finish()?;
+        let mut header = HeaderValue::from_str(&value).expect("Structured Fields are ASCII");
         header.set_sensitive(true);
         Some(header)
     }
-}
-
-fn encode_metadata_value(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        // W3C baggage value characters, with '%' reserved for percent-encoding.
-        if byte != b'%'
-            && matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e)
-        {
-            encoded.push(char::from(byte));
-        } else {
-            write!(&mut encoded, "%{byte:02X}").unwrap();
-        }
-    }
-    encoded
 }
 
 #[cfg(test)]
@@ -80,30 +64,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contributions_merge_without_double_encoding_or_duplicate_keys() {
+    fn contributions_merge_as_structured_dictionary_without_duplicate_keys() {
         let mut metadata = SandboxMetadata::default();
         assert!(metadata.to_header_value().is_none());
-        metadata.insert("runtime.name", "runtime,one");
+        metadata.insert("runtime.name", "runtime,one").unwrap();
         let mut identity = SandboxMetadata::default();
-        identity.insert("agent-identity.access-token", "eyJ.test.signature");
-        identity.insert("agent-identity.sandbox-client-id", "client+/=");
+        identity
+            .insert("agent-identity.access-token", "eyJ.test.signature")
+            .unwrap();
+        identity
+            .insert("agent-identity.sandbox-client-id", "client+/=")
+            .unwrap();
         metadata.extend(&identity);
-        metadata.insert("runtime.name", "runtime,two");
+        metadata.insert("runtime.name", "runtime,two").unwrap();
         let header = metadata.to_header_value().unwrap();
         assert_eq!(
             header.to_str().unwrap(),
-            "agent-identity.access-token=eyJ.test.signature,agent-identity.sandbox-client-id=client+/=,runtime.name=runtime%2Ctwo"
+            r#"agent-identity.access-token="eyJ.test.signature", agent-identity.sandbox-client-id="client+/=", runtime.name="runtime,two""#
         );
         assert!(header.is_sensitive());
     }
 
     #[test]
-    fn percent_encodes_baggage_delimiters_and_utf8() {
+    fn structured_dictionary_round_trip_preserves_delimiters_and_escapes() {
         let mut metadata = SandboxMetadata::default();
-        metadata.insert("test.value", "a,b;c% d=+/\"\\\r\n中");
-        assert_eq!(
-            metadata.to_header_value().unwrap().to_str().unwrap(),
-            "test.value=a%2Cb%3Bc%25%20d=+/%22%5C%0D%0A%E4%B8%AD"
-        );
+        let value = "a,b;c% d=+/\"\\";
+        metadata.insert("test.value", value).unwrap();
+        let header = metadata.to_header_value().unwrap();
+        let parsed: sfv::Dictionary = sfv::Parser::new(header.as_bytes()).parse().unwrap();
+        let sfv::ListEntry::Item(item) = &parsed["test.value"] else {
+            panic!("expected a String Item");
+        };
+        assert!(item.params.is_empty());
+        assert_eq!(item.bare_item.as_string().unwrap().as_str(), value);
+    }
+
+    #[test]
+    fn rejects_non_ascii_and_control_characters_before_header_construction() {
+        let mut metadata = SandboxMetadata::default();
+        for value in ["中", "x\r", "x\n", "x\t", "x\0", "x\u{7f}"] {
+            assert!(metadata.insert("test.value", value).is_err());
+            assert!(metadata.to_header_value().is_none());
+        }
     }
 }

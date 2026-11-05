@@ -1141,8 +1141,7 @@ mod tests {
     async fn hbone_request_carries_sandbox_id_without_sni() {
         const TEST_SANDBOX_TOKEN: &str =
             r#"{"accessToken":"opaque-token","sandboxClientId":"client+/="}"#;
-        const TEST_SANDBOX_METADATA: &str =
-            "agent-identity.access-token=opaque-token,agent-identity.sandbox-client-id=client+/=";
+        const TEST_SANDBOX_METADATA: &str = r#"agent-identity.access-token="opaque-token", agent-identity.sandbox-client-id="client+/=""#;
         initialize_telemetry();
 
         // Create a test config with a specific network
