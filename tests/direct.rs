@@ -275,8 +275,141 @@ async fn test_tcp_request() {
 }
 
 #[tokio::test]
+async fn test_sidecar_dns_fqdn_policy() {
+    let echo = tcp::TestServer::new(tcp::Mode::ReadWrite, 0).await;
+    let port = echo.address().port();
+    tokio::spawn(echo.run());
+    for enabled in [false, true] {
+        let mut cfg = test_config_with_port(port);
+        cfg.enable_dns_name_tracking = enabled;
+        let mut local: ztunnel::xds::LocalConfig =
+            serde_yaml::from_slice(&local_xds_config(port).unwrap()).unwrap();
+        local
+            .workloads
+            .iter_mut()
+            .find(|w| w.workload.name == "local-source")
+            .unwrap()
+            .workload
+            .traffic_policy_refs = Some(vec!["fqdn-egress".into()]);
+        local.policies.insert(
+            "fqdn-egress".into(),
+            serde_json::from_value(serde_json::json!({
+                "egress": { "rules": [
+                    { "action": "Allow", "destinationFqdns": [TEST_SERVICE_HOST] },
+                    { "action": "Allow", "destinationIps": ["127.0.0.1/32"] }
+                ] }
+            }))
+            .unwrap(),
+        );
+        cfg.local_xds_config = Some(config::ConfigSource::Static(
+            serde_yaml::to_string(&local).unwrap().into(),
+        ));
+        testapp::with_app(cfg, async move |app| {
+            timeout(Duration::from_secs(5), async {
+                let destination = SocketAddr::new(TEST_VIP.parse().unwrap(), port);
+                let mut denied = app
+                    .socks5_connect(
+                        DestinationAddr::Ip(destination),
+                        "127.0.0.1".parse().unwrap(),
+                    )
+                    .await;
+                assert_eq!(denied.read(&mut [0u8; 1]).await.unwrap(), 0);
+                let answer = app.dns_request(TEST_SERVICE_HOST, true, false).await;
+                assert!(!answer.answers.is_empty());
+                let mut allowed = app
+                    .socks5_connect(
+                        DestinationAddr::Ip(destination),
+                        "127.0.0.1".parse().unwrap(),
+                    )
+                    .await;
+                if enabled {
+                    read_write_stream(&mut allowed).await;
+                } else {
+                    assert_eq!(allowed.read(&mut [0u8; 1]).await.unwrap(), 0);
+                }
+                let mut fallback = app
+                    .socks5_connect(
+                        DestinationAddr::Ip(SocketAddr::new("127.0.0.1".parse().unwrap(), port)),
+                        "127.0.0.1".parse().unwrap(),
+                    )
+                    .await;
+                read_write_stream(&mut fallback).await;
+            })
+            .await
+            .expect("DNS name tracking respects the flag and IP fallback");
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn test_local_hbone_capable_destination_uses_tcp() {
     run_request_test(TEST_WORKLOAD_HBONE, "local").await;
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[tokio::test]
+#[ignore = "manual sidecar memory probe; run alone with --ignored --nocapture"]
+async fn test_sidecar_dns_fqdn_resources() {
+    let mut cfg = test_config();
+    cfg.enable_dns_name_tracking = true;
+    let mut local: ztunnel::xds::LocalConfig =
+        serde_yaml::from_slice(&local_xds_config(80).unwrap()).unwrap();
+    for d in 0..1000 {
+        let vips: Vec<_> = (0..8)
+            .map(|i| format!("/{}", std::net::Ipv4Addr::from(0xc6120001u32 + d * 8 + i)))
+            .collect();
+        local.services.push(
+            serde_json::from_value(serde_json::json!({
+                "name": format!("api-{d}"), "namespace": "default",
+                "hostname": format!("api-{d}.example.com"), "vips": vips, "ports": {}
+            }))
+            .unwrap(),
+        );
+    }
+    cfg.local_xds_config = Some(config::ConfigSource::Static(
+        serde_yaml::to_string(&local).unwrap().into(),
+    ));
+    drop(local);
+    testapp::with_app(cfg, async move |app| {
+        let heap = || {
+            let info = unsafe { libc::mallinfo2() };
+            info.uordblks + info.hblkhd
+        };
+        let rss = || -> usize {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("VmRSS:")
+                        .map(|v| v.split_whitespace().next().unwrap().parse().unwrap())
+                })
+                .unwrap()
+        };
+        let mut client =
+            ztunnel::test_helpers::dns::new_udp_client(app.udp_dns_proxy_address.unwrap()).await;
+        let before_rss = rss();
+        let before_heap = heap();
+        for d in 0..1000 {
+            let response = ztunnel::test_helpers::dns::send_request(
+                &mut client,
+                ztunnel::test_helpers::dns::n(format!("api-{d}.example.com.")),
+                hickory_proto::rr::RecordType::A,
+            )
+            .await;
+            assert_eq!(response.answers.len(), 8);
+        }
+        let heap_delta = heap().saturating_sub(before_heap);
+        let rss_delta = rss().saturating_sub(before_rss);
+        println!(
+            "SIDECAR_DNS_RESOURCES {}",
+            serde_json::json!({
+                "domains": 1000, "ips_per_domain": 8, "queries": 1000,
+                "live_heap_delta_bytes": heap_delta, "rss_delta_kib": rss_delta,
+            })
+        );
+    })
+    .await;
 }
 
 #[tokio::test]

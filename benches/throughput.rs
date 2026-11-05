@@ -395,6 +395,7 @@ pub fn rbac(c: &mut Criterion) {
     );
     let rc = ProxyRbacContext {
         conn: rbac::Connection {
+            destination_fqdns: Default::default(),
             src: "127.0.0.1:12345".parse().unwrap(),
             dst: "127.0.0.2:12345".parse().unwrap(),
             src_identity: None,

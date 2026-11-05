@@ -15,6 +15,7 @@
 use std::io;
 use std::net::SocketAddr;
 
+pub mod bindings;
 pub mod forwarder;
 pub mod handler;
 pub mod metrics;

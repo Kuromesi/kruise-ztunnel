@@ -42,6 +42,7 @@ fn proxy_state(client: &LocalClient) -> DemandProxyState {
 fn context(client: &LocalClient, port: u16) -> ProxyRbacContext {
     ProxyRbacContext {
         conn: Connection {
+            destination_fqdns: Default::default(),
             src: "127.0.0.1:1234".parse().unwrap(),
             dst: std::net::SocketAddr::from(([192, 0, 2, 1], port)),
             src_identity: None,

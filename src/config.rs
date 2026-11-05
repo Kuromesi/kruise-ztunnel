@@ -41,6 +41,7 @@ const ADMIN_UNIX_SOCKET_PATH: &str = "ADMIN_UNIX_SOCKET_PATH";
 const DEFAULT_ADMIN_UNIX_SOCKET_PATH: &str = "/var/run/ztunnel/admin.sock";
 
 const ENABLE_PROXY: &str = "ENABLE_PROXY";
+const ENABLE_DNS_NAME_TRACKING: &str = "ENABLE_DNS_NAME_TRACKING";
 const KUBERNETES_SERVICE_HOST: &str = "KUBERNETES_SERVICE_HOST";
 const NETWORK: &str = "NETWORK";
 const NODE_NAME: &str = "NODE_NAME";
@@ -258,6 +259,8 @@ pub struct Config {
     pub proxy: bool,
     /// If true, a DNS proxy will be used.
     pub dns_proxy: bool,
+    /// Learn per-workload DNS name/IP bindings for policy matching and HBONE candidate headers.
+    pub enable_dns_name_tracking: bool,
 
     pub window_size: u32,
     pub connection_window_size: u32,
@@ -872,6 +875,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             .proxy_metadata
             .get(DNS_CAPTURE_METADATA)
             .is_none_or(|value| value.to_lowercase() == "true"),
+        enable_dns_name_tracking: parse_default(ENABLE_DNS_NAME_TRACKING, false)?,
 
         pool_max_streams_per_conn: parse_default(
             POOL_MAX_STREAMS_PER_CONNECTION,
@@ -1356,6 +1360,41 @@ pub mod tests {
     use super::*;
 
     static SANDBOX_WATCHER_DEBOUNCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn dns_name_tracking_environment() {
+        const CASE: &str = "ZTUNNEL_TEST_DNS_NAME_TRACKING";
+        if let Ok(case) = env::var(CASE) {
+            let result = construct_config(ProxyConfig::default());
+            if case == "invalid" {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap().enable_dns_name_tracking, case == "true");
+            }
+            return;
+        }
+        for case in ["unset", "false", "true", "invalid"] {
+            let mut command = std::process::Command::new(env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "config::tests::dns_name_tracking_environment",
+                    "--nocapture",
+                ])
+                .env(CASE, case)
+                .env_remove(ENABLE_DNS_NAME_TRACKING);
+            if case != "unset" {
+                command.env(ENABLE_DNS_NAME_TRACKING, case);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "case {case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn sandbox_preparation_accepts_shared_and_dedicated_modes() {

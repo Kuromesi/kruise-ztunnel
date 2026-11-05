@@ -372,6 +372,7 @@ mod tests {
             rbac_ctx: crate::state::ProxyRbacContext {
                 sandbox: None,
                 conn: Connection {
+                    destination_fqdns: Default::default(),
                     src_identity: None,
                     src: std::net::SocketAddr::new(
                         std::net::Ipv4Addr::new(192, 168, 0, 1).into(),
@@ -408,6 +409,7 @@ mod tests {
             rbac_ctx: crate::state::ProxyRbacContext {
                 sandbox: None,
                 conn: Connection {
+                    destination_fqdns: Default::default(),
                     src_identity: None,
                     src: std::net::SocketAddr::new(
                         std::net::Ipv4Addr::new(192, 168, 0, 3).into(),
@@ -478,6 +480,7 @@ mod tests {
             rbac_ctx: crate::state::ProxyRbacContext {
                 sandbox: None,
                 conn: Connection {
+                    destination_fqdns: Default::default(),
                     src_identity: None,
                     src: std::net::SocketAddr::new(
                         std::net::Ipv4Addr::new(192, 168, 0, 1).into(),
@@ -500,6 +503,7 @@ mod tests {
             rbac_ctx: crate::state::ProxyRbacContext {
                 sandbox: None,
                 conn: Connection {
+                    destination_fqdns: Default::default(),
                     src_identity: None,
                     src: std::net::SocketAddr::new(
                         std::net::Ipv4Addr::new(192, 168, 0, 3).into(),
@@ -636,6 +640,7 @@ mod tests {
             rbac_ctx: crate::state::ProxyRbacContext {
                 sandbox: dstate.fetch_sandbox(&workload),
                 conn: Connection {
+                    destination_fqdns: Default::default(),
                     src_identity: None,
                     src: "192.168.0.1:80".parse().unwrap(),
                     dst_network: "".into(),

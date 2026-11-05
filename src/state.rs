@@ -1178,6 +1178,7 @@ mod tests {
         crate::state::ProxyRbacContext {
             sandbox: None,
             conn: rbac::Connection {
+                destination_fqdns: Default::default(),
                 src_identity: Some(Identity::Spiffe {
                     trust_domain: "cluster.local".into(),
                     namespace: "default".into(),

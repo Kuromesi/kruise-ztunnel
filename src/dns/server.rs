@@ -168,7 +168,14 @@ impl Server {
 
     /// Runs this DNS server to completion.
     pub async fn run(mut self) {
+        let bindings = self.store.local_workload.dns_bindings.clone();
         tokio::select! {
+            _ = async {
+                match bindings {
+                    Some(bindings) => bindings.run_cleanup().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
             res = self.server.block_until_done() =>{
                 if let Err(e) = res {
                     warn!("DNS server shutdown error: {e}");
@@ -512,7 +519,13 @@ impl Store {
         });
 
         match self.forwarder.forward(client, request).await {
-            Ok(answer) => Ok(answer),
+            Ok(answer) => {
+                let query = request.request_info()?.query;
+                if is_record_type_supported(query.query_type()) {
+                    self.observe_answer(&Name::from(query.name().clone()), &answer);
+                }
+                Ok(answer)
+            }
             Err(e) => {
                 // Increment counter for forwarding failures.
                 self.metrics.increment(&ForwardedFailure {
@@ -522,6 +535,13 @@ impl Store {
 
                 Err(e)
             }
+        }
+    }
+
+    fn observe_answer(&self, query: &Name, answer: &Answer) {
+        if let Some(bindings) = &self.local_workload.dns_bindings {
+            let omitted = bindings.observe(query, answer, tokio::time::Instant::now());
+            self.metrics.binding_overflow.inc_by(omitted as u64);
         }
     }
 }
@@ -677,7 +697,9 @@ impl Resolver for Store {
         // Add the IP records.
         ip_records(ip_record_name, addresses, &mut records);
 
-        Ok(Answer::new(records, is_authoritative))
+        let answer = Answer::new(records, is_authoritative);
+        self.observe_answer(&requested_name, &answer);
+        Ok(answer)
     }
 }
 

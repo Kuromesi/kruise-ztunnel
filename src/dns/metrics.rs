@@ -31,6 +31,7 @@ pub struct Metrics {
     pub forwarded_requests: Family<DnsLabels, Counter>,
     pub forwarded_failures: Family<DnsLabels, Counter>,
     pub forwarded_duration: Family<DnsLabels, Histogram>,
+    pub binding_overflow: Counter,
 }
 
 impl Metrics {
@@ -66,11 +67,18 @@ impl Metrics {
             forwarded_duration.clone(),
         );
 
+        let binding_overflow = Counter::default();
+        registry.register(
+            "dns_binding_overflow",
+            "DNS associations omitted because the workload learning store is full (unstable)",
+            binding_overflow.clone(),
+        );
         Self {
             requests,
             forwarded_requests,
             forwarded_failures,
             forwarded_duration,
+            binding_overflow,
         }
     }
 }

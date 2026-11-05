@@ -143,6 +143,7 @@ impl Inbound {
                     let (_, ssl) = tls.get_ref();
                     let src_identity: Option<Identity> = tls::identity_from_connection(ssl);
                     let conn = Connection {
+                        destination_fqdns: Default::default(),
                         src_identity,
                         src,
                         dst_network: network.clone(), // inbound request must be on our network
@@ -866,6 +867,7 @@ mod tests {
         let state = test_state(target_waypoint).expect("state setup");
         let cfg = config::parse_config().unwrap();
         let conn = Connection {
+            destination_fqdns: Default::default(),
             src_identity: None,
             src: format!("{CLIENT_POD_IP}:1234").parse().unwrap(),
             dst_network: "".into(),
@@ -931,6 +933,7 @@ mod tests {
         let state = test_state(target_waypoint).expect("state setup");
         let cfg = config::parse_config().unwrap();
         let conn = Connection {
+            destination_fqdns: Default::default(),
             src_identity: None,
             src: format!("{CLIENT_POD_IP}:1234").parse().unwrap(),
             dst_network: "".into(),

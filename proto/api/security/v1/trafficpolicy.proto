@@ -68,15 +68,20 @@ message TrafficPolicy {
 
   message Match {
     // Dimensions are ANDed; values within each dimension are ORed.
-    // Empty address list = unconstrained.
-    // Resolve peers in the control plane. If an explicitly configured source
-    // or destination peer list resolves to no addresses, omit the entire Rule
-    // while retaining the configured direction, even if no rules remain.
+    // Empty source list = unconstrained. Destination is unconstrained only
+    // when both destination_ips and destination_fqdns are empty.
+    // Resolve peers in the control plane. Omit a Rule whose configured source
+    // resolves to no addresses, or whose configured destination resolves to no
+    // addresses and has no FQDNs. Retain the configured direction even if empty.
     // Validate Address byte/prefix lengths and normalize host bits.
     repeated Address source_ips = 1;
     repeated Address destination_ips = 2;
     // Empty = any protocol/port. Entries are ORed.
     repeated PortMatch ports = 3;
+    // Exact DNS names for outbound TCP. ORed with destination_ips.
+    // Keep FQDN rules even when control-plane DNS resolution has no addresses.
+    // Requires a data plane supporting this field; older readers ignore it.
+    repeated string destination_fqdns = 4;
   }
 
   message PortMatch {
