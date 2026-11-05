@@ -46,6 +46,8 @@ use crate::state::workload::OutboundProtocol;
 use crate::state::workload::Workload;
 use crate::{assertions, copy, proxy, socket};
 
+const MAX_SANDBOX_METADATA_HEADER_BYTES: usize = 8192;
+
 pub struct Outbound {
     pi: Arc<ProxyInputs>,
     drain: DrainWatcher,
@@ -199,7 +201,7 @@ impl OutboundConnection {
     ) -> Result<http::Request<()>, Error> {
         let path = connect_udp_masque_path(req.hbone_target_destination.as_ref())?;
         // Reuse the current HBONE source and Sandbox headers for UDP as well.
-        let mut request = self.create_hbone_request(source_addr, req);
+        let mut request = self.create_hbone_request(source_addr, req)?;
         *request.uri_mut() = format!("https://{}{path}", req.actual_destination)
             .parse()
             .expect("CONNECT-UDP request uses validated addresses");
@@ -335,7 +337,11 @@ impl OutboundConnection {
         connection_stats.record(res);
     }
 
-    fn create_hbone_request(&self, remote_addr: SocketAddr, req: &Request) -> http::Request<()> {
+    fn create_hbone_request(
+        &self,
+        remote_addr: SocketAddr,
+        req: &Request,
+    ) -> Result<http::Request<()>, Error> {
         let mut builder = http::Request::builder()
             .uri(
                 req.hbone_target_destination
@@ -353,12 +359,15 @@ impl OutboundConnection {
             builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox.uid.as_str());
         }
         if let Some(header) = &req.sandbox_context.metadata {
+            if header.len() > MAX_SANDBOX_METADATA_HEADER_BYTES {
+                return Err(Error::SandboxMetadataHeaderTooLarge(header.len()));
+            }
             builder = builder.header(SANDBOX_METADATA_HEADER, header.clone());
         }
 
-        builder
+        Ok(builder
             .body(())
-            .expect("builder with known status code should not fail")
+            .expect("builder with known status code should not fail"))
     }
 
     /// returns upgraded stream and peer's baggage
@@ -367,7 +376,7 @@ impl OutboundConnection {
         remote_addr: SocketAddr,
         req: &Request,
     ) -> Result<(H2Stream, Option<Baggage>), Error> {
-        let request = self.create_hbone_request(remote_addr, req);
+        let request = self.create_hbone_request(remote_addr, req)?;
         let pool_key = Box::new(WorkloadKey {
             src_id: req.source.identity(),
             dst_id: req.upstream_sans.clone(),
@@ -876,8 +885,7 @@ mod tests {
     async fn hbone_request_carries_sandbox_id_without_sni() {
         const TEST_SANDBOX_TOKEN: &str =
             r#"{"accessToken":"opaque-token","sandboxClientId":"client+/="}"#;
-        const TEST_SANDBOX_METADATA: &str =
-            "agent-identity.access-token=opaque-token,agent-identity.sandbox-client-id=client+/=";
+        const TEST_SANDBOX_METADATA: &str = r#"agent-identity.access-token="opaque-token", agent-identity.sandbox-client-id="client+/=""#;
         initialize_telemetry();
 
         // Create a test config with a specific network
@@ -966,7 +974,7 @@ mod tests {
 
         let remote_addr = "127.0.0.1:12345".parse().unwrap();
 
-        let request = outbound.create_hbone_request(remote_addr, &req);
+        let request = outbound.create_hbone_request(remote_addr, &req).unwrap();
         assert!(!request.headers().contains_key("x-agentio-sni"));
         let udp = outbound
             .create_connect_udp_request(remote_addr, &req)
@@ -1001,7 +1009,7 @@ mod tests {
                 sandbox,
                 ..Default::default()
             };
-            let request = outbound.create_hbone_request(remote_addr, &req);
+            let request = outbound.create_hbone_request(remote_addr, &req).unwrap();
             assert!(!request.headers().contains_key("x-agentio-sni"));
             assert!(!request.headers().contains_key("x-agentio-tls"));
             assert_eq!(
@@ -1037,7 +1045,7 @@ mod tests {
         req.sandbox_context = context;
         // HBONE construction uses the captured context, without reading the file again.
         std::fs::remove_file(token_dir.join("sandbox.token")).unwrap();
-        let request = outbound.create_hbone_request(remote_addr, &req);
+        let request = outbound.create_hbone_request(remote_addr, &req).unwrap();
         assert_eq!(request.headers()[sandbox::SANDBOX_ID_HEADER], id.as_str());
         assert_eq!(
             request.headers()[SANDBOX_METADATA_HEADER],
@@ -1055,6 +1063,17 @@ mod tests {
             udp.headers()[SANDBOX_METADATA_HEADER],
             TEST_SANDBOX_METADATA
         );
+        let mut oversized = crate::sandbox::metadata::SandboxMetadata::default();
+        oversized.insert("runtime.name", &"x".repeat(8192)).unwrap();
+        req.sandbox_context.metadata = oversized.to_header_value();
+        assert!(matches!(
+            outbound.create_hbone_request(remote_addr, &req),
+            Err(Error::SandboxMetadataHeaderTooLarge(_))
+        ));
+        assert!(matches!(
+            outbound.create_connect_udp_request(remote_addr, &req).await,
+            Err(Error::SandboxMetadataHeaderTooLarge(_))
+        ));
     }
 
     mod match_egress_policy_tests {

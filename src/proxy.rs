@@ -664,6 +664,8 @@ pub enum Error {
     EgressPolicyDenied(SocketAddr),
     #[error("egress policy requires gateway but none configured")]
     EgressPolicyGatewayMissing(SocketAddr),
+    #[error("sandbox metadata header exceeds 8192 bytes ({0} bytes)")]
+    SandboxMetadataHeaderTooLarge(usize),
 }
 
 // Custom TLV for proxy protocol for the identity of the source

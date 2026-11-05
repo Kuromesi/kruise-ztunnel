@@ -266,7 +266,7 @@ async fn dedicated_factory_reads_agents_token_layout() {
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "agent-identity.access-token=test-access-token,agent-identity.sandbox-client-id=client+/=",
+            r#"agent-identity.access-token="test-access-token", agent-identity.sandbox-client-id="client+/=""#,
         );
     }
 }

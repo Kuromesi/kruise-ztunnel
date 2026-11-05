@@ -49,27 +49,41 @@ for a watcher update. Token formats and explicit RPC preparation remain unchange
 
 Token files are JSON objects with nonempty string fields `accessToken` and
 `sandboxClientId`. Other response fields are ignored. File loading parses these
-fields and caches their encoded metadata entries under the existing filename key;
+fields and caches their metadata entries under the existing filename key;
 multiple files remain separate Map entries. The token module contributes its
 `agent-identity.*` entries to a shared `SandboxMetadata` collection. Other modules
 can contribute their own namespaced entries to the same collection; outbound
-connection setup serializes the combined collection into one header. Values
-are encoded at insertion and are not encoded again during merging. Replacing an
-existing key updates its value, so serialization emits each key only once.
+connection setup serializes the combined collection as a Structured Fields
+Dictionary with String values, defined by [RFC 9651](https://www.rfc-editor.org/rfc/rfc9651.html).
+Replacing an existing key updates its value, so serialization emits each key only
+once, in key order.
 No JWT signature or expiry validation is performed by ztunnel.
 
 ```http
-x-agentio-sandbox-metadata: agent-identity.access-token=eyJ...abc.def,agent-identity.sandbox-client-id=AbC+/xyz=
+x-agentio-sandbox-metadata: agent-identity.access-token="eyJ...abc.def", agent-identity.sandbox-client-id="AbC+/xyz="
 ```
 
-Values follow [W3C baggage value encoding](https://www.w3.org/TR/baggage/#value):
-percent-encode `%`, whitespace, comma, semicolon, double quote, backslash, control
-bytes, and UTF-8 bytes outside ASCII. Literal `+`, `/`, and `=` are preserved.
-Consumers split entries at commas, split each entry at the first `=`, then
-percent-decode values once; `+` must not be decoded as a space. Keys are unique;
-consumers should reject duplicate keys and may ignore unknown keys. The header is
-an internal credential header, separate from tracing `baggage`, and must not be
-logged as ordinary metadata.
+Consumers use a Structured Fields Dictionary parser, not comma splitting or a
+JSON parser. Known entries must be String Items with nonempty values; Inner Lists
+and other bare-item types are not accepted for those entries. Unknown keys and
+parameters are ignored. Strings contain only printable ASCII (`0x20..=0x7e`);
+quotes and backslashes are escaped by the standard serializer. Token loading
+rejects controls and non-ASCII values without including credentials in errors.
+Percent signs, commas, `+`, `/`, and `=` retain their literal meaning after SF
+parsing; no percent-decoding or Base64 decoding is required.
+
+The sender emits one header, omits it for empty metadata, and rejects tunnels
+whose serialized metadata exceeds 8,192 bytes. Recipients combine repeated field
+lines in order using the standard SF rules; duplicate Dictionary keys use the
+last value, as specified by RFC 9651. A parse failure or an invalid known entry
+invalidates the entire field. Missing or invalid metadata supplies no credentials
+and must not bypass the gateway's authentication requirements.
+
+The header is marked sensitive to avoid HTTP/2 dynamic-table indexing. It is an
+internal credential header, separate from tracing `baggage`, and must not be
+logged as ordinary metadata. The receiving gateway must support Structured Fields
+before this change is deployed; neither the previous unquoted KV encoding nor
+JSON is emitted.
 
 The previous `x-agentio-sandbox-token` header containing Base64-encoded JSON is
 no longer emitted. EPE must support the new header before deploying this change.
