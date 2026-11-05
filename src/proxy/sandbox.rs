@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
@@ -58,7 +57,13 @@ impl Server {
         let deadline = self.pi.cfg.self_termination_deadline;
         let tls = self.pi.sandbox_management_tls.clone();
         let service = Service { pi: self.pi };
-        let recovery = service.clone().recover();
+        let manager = service
+            .pi
+            .sandbox_manager
+            .as_ref()
+            .expect("preparation configured")
+            .clone();
+        let recovery = manager.run();
         let (shutdown, stopped) = oneshot::channel::<()>();
         let server = async move {
             let shutdown = async move {
@@ -124,30 +129,6 @@ struct Service {
     pi: Arc<ProxyInputs>,
 }
 
-impl Service {
-    async fn recover(self) {
-        // Only confirmed registrations survive a restart or caller disconnect.
-        let manager = self
-            .pi
-            .sandbox_manager
-            .as_ref()
-            .expect("preparation configured");
-        let id = manager.registered_id().await;
-        loop {
-            match manager.wait_for_sandbox(&id).await {
-                Ok(_) => {
-                    info!("registered Sandbox configuration restored");
-                    return;
-                }
-                Err(error) => {
-                    warn!(%error, "Sandbox restoration pending; traffic uses Workload policies");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-            }
-        }
-    }
-}
-
 #[tonic::async_trait]
 impl SandboxNetwork for Service {
     async fn prepare_sandbox(
@@ -163,14 +144,7 @@ impl SandboxNetwork for Service {
             .sandbox_manager
             .clone()
             .expect("preparation configured");
-        manager.check_registration(&id)?;
-        manager.wait_for_sandbox(&id).await?;
-        if let Some(token) = &manager.token {
-            token.require_ready().await?;
-        }
-        tokio::task::spawn_blocking(move || manager.register(&id))
-            .await
-            .map_err(|e| Status::internal(format!("registration task failed: {e}")))??;
+        manager.prepare(&id).await?;
         Ok(Response::new(PrepareSandboxResponse {}))
     }
 }
@@ -185,7 +159,9 @@ impl From<Error> for Status {
             }
             Error::NotReady => Code::DeadlineExceeded,
             Error::UnknownWorkload | Error::UpdateChannelClosed(_) => Code::Unavailable,
-            Error::Io(_) | Error::Json(_) | Error::TokenLoad(_) => Code::Internal,
+            Error::Io(_) | Error::Json(_) | Error::TokenLoad(_) | Error::RegistrationTask(_) => {
+                Code::Internal
+            }
         };
         Status::new(code, error.to_string())
     }

@@ -29,8 +29,8 @@ use crate::identity::Identity;
 use crate::proxy::connection_manager::{ConnectionAttributes, ConnectionContext};
 use crate::rbac::{Connection, Direction};
 use crate::sandbox::discovery::Sandbox;
-use crate::sandbox::metadata::{SANDBOX_METADATA_HEADER, SandboxMetadata};
-use crate::sandbox::sandbox;
+use crate::sandbox::metadata::SANDBOX_METADATA_HEADER;
+use crate::sandbox::sandbox::{self, SandboxContext};
 
 use crate::proxy::metrics::Reporter;
 use crate::proxy::{
@@ -196,7 +196,7 @@ impl OutboundConnection {
     ) -> Result<http::Request<()>, Error> {
         let path = connect_udp_masque_path(req.hbone_target_destination.as_ref())?;
         // Reuse the current HBONE source and Sandbox headers for UDP as well.
-        let mut request = self.create_hbone_request(source_addr, req).await;
+        let mut request = self.create_hbone_request(source_addr, req);
         *request.uri_mut() = format!("https://{}{path}", req.actual_destination)
             .parse()
             .expect("CONNECT-UDP request uses validated addresses");
@@ -332,11 +332,7 @@ impl OutboundConnection {
         connection_stats.record(res);
     }
 
-    async fn create_hbone_request(
-        &self,
-        remote_addr: SocketAddr,
-        req: &Request,
-    ) -> http::Request<()> {
+    fn create_hbone_request(&self, remote_addr: SocketAddr, req: &Request) -> http::Request<()> {
         let mut builder = http::Request::builder()
             .uri(
                 req.hbone_target_destination
@@ -351,16 +347,10 @@ impl OutboundConnection {
             .header(TRACEPARENT_HEADER, self.id.header());
 
         if let Some(sandbox) = &req.sandbox {
-            builder = builder.header(sandbox::SANDBOX_UID_HEADER, sandbox.uid.as_str());
+            builder = builder.header(sandbox::SANDBOX_ID_HEADER, sandbox.uid.as_str());
         }
-        let mut metadata = SandboxMetadata::default();
-        if let Some(manager) = &self.pi.sandbox_manager
-            && let Some(source) = &manager.token
-        {
-            source.fill_metadata(&mut metadata).await;
-        }
-        if let Some(header) = metadata.to_header_value() {
-            builder = builder.header(SANDBOX_METADATA_HEADER, header);
+        if let Some(header) = &req.sandbox_metadata {
+            builder = builder.header(SANDBOX_METADATA_HEADER, header.clone());
         }
 
         builder
@@ -374,7 +364,7 @@ impl OutboundConnection {
         remote_addr: SocketAddr,
         req: &Request,
     ) -> Result<(H2Stream, Option<Baggage>), Error> {
-        let request = self.create_hbone_request(remote_addr, req).await;
+        let request = self.create_hbone_request(remote_addr, req);
         let pool_key = Box::new(WorkloadKey {
             src_id: req.source.identity(),
             dst_id: req.upstream_sans.clone(),
@@ -442,7 +432,7 @@ impl OutboundConnection {
     async fn build_request(
         &self,
         source_workload: Arc<Workload>,
-        sandbox: Option<Arc<Sandbox>>,
+        context: SandboxContext,
         target: SocketAddr,
     ) -> Result<Request, Error> {
         if self.pi.cfg.illegal_ports.contains(&target.port())
@@ -452,7 +442,7 @@ impl OutboundConnection {
         }
 
         if let Some(result) = self
-            .apply_egress_policy(&source_workload, &sandbox, &target)
+            .apply_egress_policy(&source_workload, &context, &target)
             .await
         {
             return result;
@@ -462,7 +452,8 @@ impl OutboundConnection {
         Ok(Request {
             protocol: OutboundProtocol::TCP,
             source: source_workload,
-            sandbox,
+            sandbox: context.sandbox,
+            sandbox_metadata: context.metadata,
             hbone_target_destination: None,
             actual_destination_workload: None,
             actual_destination: target,
@@ -473,7 +464,7 @@ impl OutboundConnection {
     async fn apply_egress_policy(
         &self,
         source_workload: &Arc<Workload>,
-        sandbox: &Option<Arc<Sandbox>>,
+        context: &SandboxContext,
         target: &SocketAddr,
     ) -> Option<Result<Request, Error>> {
         let matched = match_source_egress_policy(source_workload, target)
@@ -505,7 +496,8 @@ impl OutboundConnection {
                 Some(Ok(Request {
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload.clone(),
-                    sandbox: sandbox.clone(),
+                    sandbox: context.sandbox.clone(),
+                    sandbox_metadata: context.metadata.clone(),
                     hbone_target_destination: Some(HboneAddress::SocketAddr(*target)),
                     actual_destination_workload: Some(waypoint.workload),
                     actual_destination,
@@ -544,6 +536,7 @@ struct Request {
     source: Arc<Workload>,
     // Selected before routing; shared by egress policy, CONNECT headers and the pool key.
     sandbox: Option<Arc<Sandbox>>,
+    sandbox_metadata: Option<http::HeaderValue>,
     // The selected egress gateway workload, if any.
     actual_destination_workload: Option<Arc<Workload>>,
     // The address of the next hop, such as a workload or egress gateway.
@@ -743,7 +736,7 @@ mod tests {
         for target in ["127.0.0.2:80", "127.0.0.3:80", "203.0.113.1:80"] {
             let target: SocketAddr = target.parse().unwrap();
             let direct = outbound
-                .build_request(source.clone(), None, target)
+                .build_request(source.clone(), Default::default(), target)
                 .await
                 .unwrap();
             assert_eq!(direct.protocol, OutboundProtocol::TCP);
@@ -774,7 +767,9 @@ mod tests {
                     }),
                     ..(*source).clone()
                 });
-                let result = outbound.build_request(source, None, target).await;
+                let result = outbound
+                    .build_request(source, Default::default(), target)
+                    .await;
                 match action {
                     EgressPolicyAction::Deny => {
                         assert!(matches!(result, Err(Error::EgressPolicyDenied(_))))
@@ -812,21 +807,27 @@ mod tests {
             for ip in ["127.0.0.1", "::1", "192.0.2.1", "2001:db8::1"] {
                 let target = SocketAddr::new(ip.parse().unwrap(), port);
                 assert!(matches!(
-                    outbound.build_request(source.clone(), None, target).await,
+                    outbound
+                        .build_request(source.clone(), Default::default(), target)
+                        .await,
                     Err(Error::SelfCall)
                 ));
             }
             let target = SocketAddr::new("192.0.2.2".parse().unwrap(), port);
             assert!(
                 outbound
-                    .build_request(source.clone(), None, target)
+                    .build_request(source.clone(), Default::default(), target)
                     .await
                     .is_ok()
             );
         }
         assert!(
             outbound
-                .build_request(source, None, "192.0.2.1:8080".parse().unwrap())
+                .build_request(
+                    source,
+                    Default::default(),
+                    "192.0.2.1:8080".parse().unwrap()
+                )
                 .await
                 .is_ok()
         );
@@ -867,7 +868,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hbone_request_carries_sandbox_uid_without_sni() {
+    async fn hbone_request_carries_sandbox_id_without_sni() {
+        const TEST_SANDBOX_TOKEN: &str =
+            r#"{"accessToken":"opaque-token","sandboxClientId":"client+/="}"#;
+        const TEST_SANDBOX_METADATA: &str =
+            "agent-identity.access-token=opaque-token,agent-identity.sandbox-client-id=client+/=";
         initialize_telemetry();
 
         // Create a test config with a specific network
@@ -888,7 +893,15 @@ mod tests {
             ..Default::default()
         };
 
-        let state = new_proxy_state(&[source], &[], &[]);
+        let id: crate::strng::Strng = "sandbox-a".into();
+        let sandbox = crate::xds::agentio::sandbox::Sandbox {
+            uid: id.to_string(),
+            attester: Some(crate::xds::agentio::sandbox::sandbox::Attester {
+                workload_uid: source.uid.clone(),
+            }),
+            ..Default::default()
+        };
+        let state = new_proxy_state(&[source], &[], &[sandbox]);
         let sock_fact = Arc::new(crate::proxy::DefaultSocketFactory::default());
 
         let wi = WorkloadInfo {
@@ -938,6 +951,7 @@ mod tests {
             protocol: OutboundProtocol::HBONE,
             source: source_workload,
             sandbox: None,
+            sandbox_metadata: None,
             hbone_target_destination: Some(HboneAddress::SocketAddr(
                 "10.0.0.1:8080".parse().unwrap(),
             )),
@@ -948,7 +962,7 @@ mod tests {
 
         let remote_addr = "127.0.0.1:12345".parse().unwrap();
 
-        let request = outbound.create_hbone_request(remote_addr, &req).await;
+        let request = outbound.create_hbone_request(remote_addr, &req);
         assert!(!request.headers().contains_key("x-agentio-sni"));
         let udp = outbound
             .create_connect_udp_request(remote_addr, &req)
@@ -977,54 +991,64 @@ mod tests {
         }
         .try_into()
         .unwrap();
-        for sandbox in [None, Some(Arc::new(sandbox))] {
+        let sandbox = Arc::new(sandbox);
+        for sandbox in [None, Some(sandbox.clone())] {
             req.sandbox = sandbox;
-            let request = outbound.create_hbone_request(remote_addr, &req).await;
+            let request = outbound.create_hbone_request(remote_addr, &req);
             assert!(!request.headers().contains_key("x-agentio-sni"));
             assert!(!request.headers().contains_key("x-agentio-tls"));
             assert_eq!(
                 request
                     .headers()
-                    .get(sandbox::SANDBOX_UID_HEADER)
+                    .get(sandbox::SANDBOX_ID_HEADER)
                     .map(|v| v.to_str().unwrap()),
                 req.sandbox.as_ref().map(|s| s.uid.as_str())
             );
-            assert!(!request.headers().contains_key("x-agentio-sandbox-id"));
+            assert!(!request.headers().contains_key("x-agentio-sandbox-uid"));
         }
         let directory = tempfile::tempdir().unwrap();
-        for case in ["disabled", "empty", "ready"] {
-            std::fs::write(
-                directory.path().join("sandbox.token"),
-                if case == "empty" {
-                    ""
-                } else {
-                    r#"{"accessToken":"eyJ.test.signature","sandboxClientId":"client+/="}"#
-                },
-            )
+        let token_dir = directory.path().join("tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+        std::fs::write(token_dir.join("sandbox.token"), TEST_SANDBOX_TOKEN).unwrap();
+        let mut manager = sandbox::SandboxManager::new(state.clone(), Arc::new(wi));
+        manager = manager
+            .with_registration(directory.path().join("state"))
             .unwrap();
-            let mut manager = sandbox::SandboxManager::new(state.clone(), Arc::new(wi.clone()));
-            if case != "disabled" {
-                manager.token = Some(
-                    crate::sandbox::token::FileSandboxToken::start(directory.path().into(), 10)
-                        .await
-                        .unwrap(),
-                );
-            }
-            Arc::get_mut(&mut outbound.pi).unwrap().sandbox_manager = Some(Arc::new(manager));
-            let request = outbound.create_hbone_request(remote_addr, &req).await;
-            assert_eq!(
-                request
-                    .headers()
-                    .get(SANDBOX_METADATA_HEADER)
-                    .map(|v| v.to_str().unwrap()),
-                (case == "ready").then_some("agent-identity.access-token=eyJ.test.signature,agent-identity.sandbox-client-id=client+/="),
-            );
-            assert_eq!(request.headers()[sandbox::SANDBOX_UID_HEADER], "sandbox-a");
-            assert!(!request.headers().contains_key("x-agentio-sandbox-token"));
-            if case == "ready" {
-                assert!(request.headers()[SANDBOX_METADATA_HEADER].is_sensitive());
-            }
-        }
+        manager.token = Some(
+            crate::sandbox::token::FileSandboxToken::start(token_dir.clone(), 10)
+                .await
+                .unwrap(),
+        );
+        let manager = Arc::new(manager);
+        Arc::get_mut(&mut outbound.pi).unwrap().sandbox_manager = Some(manager.clone());
+        let unprepared = outbound.pi.sandbox_for_connection().unwrap();
+        assert!(unprepared.sandbox.is_none());
+        assert!(unprepared.metadata.is_none());
+        manager.prepare(&id).await.unwrap();
+        let context = outbound.pi.sandbox_for_connection().unwrap();
+        assert!(directory.path().join("state/sandbox.json").is_file());
+        req.sandbox = context.sandbox;
+        req.sandbox_metadata = context.metadata;
+        // HBONE construction uses the captured context, without reading the file again.
+        std::fs::remove_file(token_dir.join("sandbox.token")).unwrap();
+        let request = outbound.create_hbone_request(remote_addr, &req);
+        assert_eq!(request.headers()[sandbox::SANDBOX_ID_HEADER], id.as_str());
+        assert_eq!(
+            request.headers()[SANDBOX_METADATA_HEADER],
+            TEST_SANDBOX_METADATA
+        );
+        assert!(request.headers()[SANDBOX_METADATA_HEADER].is_sensitive());
+        assert!(!request.headers().contains_key("x-agentio-sandbox-uid"));
+        assert!(!request.headers().contains_key("x-agentio-sandbox-token"));
+        let udp = outbound
+            .create_connect_udp_request(remote_addr, &req)
+            .await
+            .unwrap();
+        assert_eq!(udp.headers()[sandbox::SANDBOX_ID_HEADER], id.as_str());
+        assert_eq!(
+            udp.headers()[SANDBOX_METADATA_HEADER],
+            TEST_SANDBOX_METADATA
+        );
     }
 
     mod match_egress_policy_tests {

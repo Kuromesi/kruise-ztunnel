@@ -69,13 +69,16 @@ where
         self.snapshot.load().values().cloned().collect()
     }
 
-    /// Retry an empty snapshot on demand, using the same refresh path as the watcher.
-    pub async fn get_or_load(self: &Arc<Self>) -> anyhow::Result<Option<Arc<V>>> {
-        if let Some(value) = self.first() {
+    /// Retry a missing or unusable value, using the watcher's serialized refresh path.
+    pub async fn get_or_load(
+        self: &Arc<Self>,
+        is_ready: impl Fn(&V) -> bool,
+    ) -> anyhow::Result<Option<Arc<V>>> {
+        if let Some(value) = self.first().filter(|value| is_ready(value)) {
             return Ok(Some(value));
         }
         let _guard = self.refresh_lock.lock().await;
-        if let Some(value) = self.first() {
+        if let Some(value) = self.first().filter(|value| is_ready(value)) {
             return Ok(Some(value));
         }
         self.load().await?;
@@ -306,7 +309,7 @@ mod tests {
         std::fs::remove_dir_all(dir.path()).unwrap();
         assert!(Arc::ptr_eq(
             &cached,
-            &store.get_or_load().await.unwrap().unwrap()
+            &store.get_or_load(|_| true).await.unwrap().unwrap()
         ));
     }
 

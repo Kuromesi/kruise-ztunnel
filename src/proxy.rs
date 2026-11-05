@@ -23,7 +23,6 @@ use std::{fmt, io};
 
 use hickory_proto::ProtoError;
 
-use crate::sandbox::discovery::Sandbox;
 use crate::sandbox::sandbox::SandboxManager;
 use crate::socket::is_self_addr;
 use crate::strng::Strng;
@@ -354,10 +353,9 @@ impl ProxyInputs {
         })
     }
 
-    /// System and Sandbox traffic share the Pod. Until Sandbox configuration is
-    /// ready, use only the existing Workload policies without waiting or demanding.
-    fn sandbox_for_connection(&self) -> Result<Option<Arc<Sandbox>>, Error> {
-        match &self.sandbox_manager {
+    /// Select Sandbox and credential metadata once before routing.
+    fn sandbox_for_connection(&self) -> Result<crate::sandbox::sandbox::SandboxContext, Error> {
+        let sandbox = match &self.sandbox_manager {
             Some(manager) => match manager.ready_sandbox() {
                 Ok(sandbox) => Ok(Some(sandbox)),
                 Err(crate::sandbox::sandbox::Error::NotReady) => Ok(None),
@@ -376,7 +374,15 @@ impl ProxyInputs {
                             .cloned()
                     }))
             }
-        }
+        }?;
+        let metadata = if sandbox.is_some() {
+            self.sandbox_manager
+                .as_ref()
+                .and_then(|manager| manager.connection_metadata())
+        } else {
+            None
+        };
+        Ok(crate::sandbox::sandbox::SandboxContext { sandbox, metadata })
     }
 }
 
