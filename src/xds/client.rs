@@ -22,6 +22,7 @@ use std::{fmt, mem};
 use prost::{DecodeError, EncodeError};
 use prost_types::value::Kind;
 use prost_types::{Struct, Value};
+use rand::Rng;
 use serde_json;
 use split_iter::Splittable;
 use thiserror::Error;
@@ -454,6 +455,7 @@ pub struct AdsClient {
 
     connection_id: u32,
     types_to_expect: HashSet<String>,
+    received_response: bool,
 }
 
 /// Demanded allows awaiting for an on-demand XDS resource
@@ -514,6 +516,7 @@ impl Demander {
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(15);
+const OVERLOAD_BACKOFF: Duration = Duration::from_secs(1);
 
 impl AdsClient {
     fn is_initial_request_on_demand(r: &DeltaDiscoveryRequest) -> bool {
@@ -543,6 +546,7 @@ impl AdsClient {
             block_ready: Some(block_ready),
             connection_id: 0,
             types_to_expect,
+            received_response: false,
         }
     }
 
@@ -565,17 +569,28 @@ impl AdsClient {
     }
 
     async fn run_loop(&mut self, backoff: Duration) -> Duration {
-        match self.run_internal().await {
-            Err(e @ Error::Connection(_, _)) => {
+        self.received_response = false;
+        let result = self.run_internal().await;
+        let backoff = if self.received_response {
+            INITIAL_BACKOFF
+        } else {
+            backoff
+        };
+        let backoff = match result {
+            Err(ref e @ Error::Connection(_, ref status)) => {
                 // For connection errors, we add backoff
                 let backoff = std::cmp::min(MAX_BACKOFF, backoff * 2);
+                let backoff = if status.code() == tonic::Code::ResourceExhausted {
+                    std::cmp::max(OVERLOAD_BACKOFF, backoff)
+                } else {
+                    backoff
+                };
                 warn!(
                     "XDS client connection error: {}, retrying in {:?}",
                     e, backoff
                 );
                 self.metrics
                     .increment(&ConnectionTerminationReason::ConnectionError);
-                tokio::time::sleep(backoff).await;
                 backoff
             }
             Err(ref e @ Error::GrpcStatus(ref status)) => {
@@ -594,7 +609,11 @@ impl AdsClient {
                     );
                     self.metrics
                         .increment(&ConnectionTerminationReason::Reconnect);
-                    INITIAL_BACKOFF
+                    if self.received_response {
+                        INITIAL_BACKOFF
+                    } else {
+                        std::cmp::min(MAX_BACKOFF, backoff * 2)
+                    }
                 } else {
                     warn!(
                         "XDS client error: {}, retrying in {:?}",
@@ -602,28 +621,37 @@ impl AdsClient {
                     );
                     self.metrics.increment(&ConnectionTerminationReason::Error);
                     // For gRPC errors, we add backoff
-                    std::cmp::min(MAX_BACKOFF, backoff * 2)
+                    let backoff = std::cmp::min(MAX_BACKOFF, backoff * 2);
+                    if status.code() == tonic::Code::ResourceExhausted {
+                        std::cmp::max(OVERLOAD_BACKOFF, backoff)
+                    } else {
+                        backoff
+                    }
                 };
-                tokio::time::sleep(backoff).await;
                 backoff
             }
             Err(e) => {
-                // For other errors, we connect immediately
-                // TODO: we may need more nuance here; if we fail due to invalid initial request we may overload
-                // But we want to reconnect from MaxConnectionAge immediately.
                 warn!("XDS client error: {}, retrying", e);
                 self.metrics.increment(&ConnectionTerminationReason::Error);
-                // Reset backoff
-                INITIAL_BACKOFF
+                std::cmp::min(MAX_BACKOFF, backoff * 2)
             }
             Ok(_) => {
                 self.metrics
                     .increment(&ConnectionTerminationReason::Complete);
                 warn!("XDS client complete");
-                // Reset backoff
-                INITIAL_BACKOFF
+                if self.received_response {
+                    INITIAL_BACKOFF
+                } else {
+                    std::cmp::min(MAX_BACKOFF, backoff * 2)
+                }
             }
-        }
+        };
+        // Spread reconnects while retaining the cap and fast recovery of healthy streams.
+        let delay = backoff
+            .mul_f64(rand::rng().random_range(0.8..1.2))
+            .min(MAX_BACKOFF);
+        tokio::time::sleep(delay).await;
+        backoff
     }
 
     pub async fn run(mut self) -> Result<(), Error> {
@@ -778,6 +806,9 @@ impl AdsClient {
             }
             _ => (XdsSignal::Ack, None),
         };
+        if let XdsSignal::Ack = response_type {
+            self.received_response = true;
+        }
 
         match response_type {
             XdsSignal::Nack => error!(
@@ -911,6 +942,69 @@ mod tests {
 
     const POLL_RATE: Duration = Duration::from_millis(2);
     const TEST_TIMEOUT: Duration = Duration::from_millis(100);
+
+    #[tokio::test]
+    async fn test_reconnect_backoff_for_overload_and_early_eof() {
+        let (mut connections, mut client, _, _) = AdsServer::spawn(false).await;
+        for (previous, status, expected) in [
+            (
+                INITIAL_BACKOFF,
+                Some(tonic::Status::resource_exhausted("busy")),
+                OVERLOAD_BACKOFF,
+            ),
+            (
+                OVERLOAD_BACKOFF,
+                Some(tonic::Status::resource_exhausted("busy")),
+                OVERLOAD_BACKOFF * 2,
+            ),
+            (OVERLOAD_BACKOFF, None, OVERLOAD_BACKOFF * 2),
+        ] {
+            let task = tokio::spawn(async move {
+                let backoff = client.run_loop(previous).await;
+                (client, backoff)
+            });
+            let connection = connections.recv().await.unwrap();
+            let started = tokio::time::Instant::now();
+            if let Some(status) = status {
+                connection.tx.send(Err(status)).await.unwrap();
+            }
+            drop(connection);
+            let (returned, backoff) = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            client = returned;
+            assert_eq!(backoff, expected);
+            assert!(started.elapsed() >= expected.mul_f64(0.8));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_accepted_response_resets_reconnect_backoff() {
+        let (mut connections, mut client, _, _) = AdsServer::spawn(false).await;
+        let task = tokio::spawn(async move { client.run_loop(MAX_BACKOFF).await });
+        let mut connection = connections.recv().await.unwrap();
+        connection
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: ADDRESS_TYPE.to_string(),
+                nonce: "accepted".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        while connection.rx.recv().await.unwrap().response_nonce != "accepted" {}
+        connection
+            .tx
+            .send(Err(tonic::Status::unavailable("server restarting")))
+            .await
+            .unwrap();
+        let backoff = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(backoff, INITIAL_BACKOFF * 2);
+    }
 
     async fn verify_address(
         ip: IpAddr,

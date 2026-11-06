@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http::HeaderValue;
+use rand::Rng;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
 use crate::sandbox::discovery::{Sandbox, validate_id};
@@ -151,7 +152,8 @@ impl SandboxManager {
                 Ok(_) => return,
                 Err(error) => {
                     tracing::warn!(%error, "Sandbox restoration pending; traffic uses Workload policies");
-                    tokio::time::sleep(PREPARATION_RETRY).await;
+                    let retry = PREPARATION_RETRY.mul_f64(rand::rng().random_range(0.8..1.2));
+                    tokio::time::sleep(retry).await;
                 }
             }
         }
