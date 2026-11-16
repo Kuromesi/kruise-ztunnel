@@ -215,6 +215,7 @@ pub struct Config {
     address: String,
     tls_builder: Box<dyn tls::ControlPlaneClientCertProvider>,
     auth: identity::AuthSource,
+    certificate_manager: Option<Arc<identity::SecretManager>>,
     proxy_metadata: HashMap<String, String>,
     handlers: HashMap<Strng, Box<dyn RawHandler>>,
     initial_requests: Vec<DeltaDiscoveryRequest>,
@@ -270,6 +271,7 @@ impl Config {
                 .expect("xds_address must be set to use xds"),
             tls_builder,
             auth: config.auth.clone(),
+            certificate_manager: None,
             handlers: HashMap::new(),
             initial_requests: Vec::new(),
             on_demand: config.xds_on_demand,
@@ -287,6 +289,14 @@ impl Config {
         let no_on_demand = f.no_on_demand();
         self.with_handler(type_url.clone(), f)
             .watch(type_url, no_on_demand)
+    }
+
+    pub(crate) fn with_certificate_manager(
+        mut self,
+        manager: Arc<identity::SecretManager>,
+    ) -> Self {
+        self.certificate_manager = Some(manager);
+        self
     }
 
     /// Demand only this resource type, independently of Workload discovery mode.
@@ -681,9 +691,21 @@ impl AdsClient {
         };
 
         let addr = self.config.address.clone();
+        let auth = if let Some(manager) = &self.config.certificate_manager {
+            let (auth, pod_uid) = self
+                .config
+                .auth
+                .snapshot()
+                .await
+                .map_err(Error::WorkloadCredential)?;
+            manager.set_pod_uid(pod_uid).await;
+            auth
+        } else {
+            self.config.auth.clone()
+        };
         let tls_grpc_channel = tls::grpc_connector(
             self.config.address.clone(),
-            self.config.auth.clone(),
+            auth,
             self.config
                 .tls_builder
                 .fetch_cert(self.config.alt_hostname.clone())

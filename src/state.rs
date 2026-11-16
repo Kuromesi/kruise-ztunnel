@@ -804,7 +804,7 @@ impl ProxyStateManager {
         awaiting_ready: tokio::sync::watch::Sender<()>,
         cert_manager: Arc<SecretManager>,
     ) -> anyhow::Result<ProxyStateManager> {
-        let cert_fetcher = cert_fetcher::new(&config, cert_manager);
+        let cert_fetcher = cert_fetcher::new(&config, cert_manager.clone());
         let state: Arc<RwLock<ProxyState>> = Arc::new(RwLock::new(ProxyState::new(
             config.local_node.as_ref().map(strng::new),
         )));
@@ -819,6 +819,9 @@ impl ProxyStateManager {
                     xds::TRAFFIC_POLICY_TYPE,
                     updater.clone(),
                 );
+            if config.proxy_mode == config::ProxyMode::Dedicated {
+                builder = builder.with_certificate_manager(cert_manager);
+            }
             if config.enable_sandbox_manager || config.sandbox_mode {
                 builder = if config.enable_sandbox_manager {
                     builder.with_on_demand_handler::<xds::agentio::sandbox::Sandbox>(

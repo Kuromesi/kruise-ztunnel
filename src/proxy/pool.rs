@@ -83,6 +83,11 @@ impl ConnSpawner {
         debug!("spawning new pool conn for {}", key);
 
         let cert = self.local_workload.fetch_certificate().await?;
+        if self.local_workload.pod_uid() != key.source_pod_uid {
+            return Err(Error::Generic(
+                "workload credential identity changed".into(),
+            ));
+        }
         let connector = cert.outbound_connector(key.dst_id.clone())?;
         let tcp_stream = super::freebind_connect(None, key.dst, self.socket_factory.as_ref())
             .await
@@ -593,6 +598,28 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pod_identity_change_creates_a_new_hbone_connection() {
+        let (pool, mut srv) = setup_test(3).await;
+        let manager = &pool.state.spawner.local_workload.full_cert_manager;
+        let mut source = key(&srv, 2);
+        source.source_pod_uid = Some("pod-a".into());
+        manager.set_pod_uid(source.source_pod_uid.clone()).await;
+        test_client(pool.clone(), source.clone(), srv.addr).await;
+        assert_opens_drops!(srv, 1, 0);
+        manager.set_pod_uid(source.source_pod_uid.clone()).await;
+        test_client(pool.clone(), source.clone(), srv.addr).await;
+        assert_opens_drops!(srv, 1, 0);
+        manager.set_pod_uid(Some("pod-b".into())).await;
+        assert!(matches!(
+            pool.state.spawner.new_pool_conn(source.clone()).await,
+            Err(Error::Generic(_))
+        ));
+        source.source_pod_uid = Some("pod-b".into());
+        test_client(pool.clone(), source, srv.addr).await;
+        assert_opens_drops!(srv, 2, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unique_keys_have_unique_connections() {
         let (pool, mut srv) = setup_test(3).await;
 
@@ -1029,6 +1056,7 @@ mod test {
 
     fn key(srv: &TestServer, ip: u8) -> WorkloadKey {
         WorkloadKey {
+            source_pod_uid: None,
             src_id: Identity::default(),
             dst_id: vec![Identity::default()],
             sandbox_id: None,

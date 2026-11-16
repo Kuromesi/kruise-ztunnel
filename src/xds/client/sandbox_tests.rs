@@ -20,6 +20,74 @@ use crate::xds::{ADDRESS_TYPE, ProxyStateUpdater, SANDBOX_TYPE, TRAFFIC_POLICY_T
 use prost::Message;
 use test_case::test_case;
 
+#[tokio::test]
+async fn ads_reconnect_tracks_pod_identity_without_invalidating_normal_token_renewals() {
+    use base64::Engine;
+
+    let (mut connections, mut config) = AdsServer::spawn_config(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("token");
+    config.auth = identity::AuthSource::Token(path.clone(), "cluster".into());
+    config.proxy_mode = crate::config::ProxyMode::Dedicated;
+    let mut registry = prometheus_client::registry::Registry::default();
+    let (awaiting_ready, _ready) = tokio::sync::watch::channel(());
+    let certificates = identity::mock::new_secret_manager(Duration::from_secs(3600));
+    let manager = crate::state::ProxyStateManager::new(
+        Arc::new(config),
+        crate::xds::Metrics::new(&mut registry),
+        Arc::new(crate::proxy::Metrics::new(&mut registry)),
+        awaiting_ready,
+        certificates.clone(),
+    )
+    .await
+    .unwrap();
+    let mut manager = Some(manager);
+    let mut task = None;
+    let mut previous = None;
+    let mut connection: Option<AdsConnection> = None;
+    for (sequence, uid) in ["pod-a", "pod-a", "pod-b"].into_iter().enumerate() {
+        let claims = serde_json::json!({"kubernetes.io": {"pod": {"uid": uid}}, "jti": sequence});
+        let token = format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string())
+        );
+        std::fs::write(&path, &token).unwrap();
+        if let Some(connection) = connection.take() {
+            connection
+                .tx
+                .send(Err(tonic::Status::unavailable("reconnect")))
+                .await
+                .unwrap();
+        } else {
+            // The production state manager wires the certificate cache into ADS.
+            task = Some(tokio::spawn(manager.take().unwrap().run()));
+        }
+        let next = tokio::time::timeout(Duration::from_secs(5), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.metadata
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("Bearer {token}")
+        );
+        assert_eq!(certificates.pod_uid().as_deref(), Some(uid));
+        let cert = certificates
+            .fetch_certificate(&identity::Identity::default())
+            .await
+            .unwrap();
+        if let Some(old) = &previous {
+            assert_eq!(Arc::ptr_eq(old, &cert), sequence == 1);
+        }
+        previous = Some(cert);
+        connection = Some(next);
+    }
+    task.unwrap().abort();
+}
+
 async fn next_matching(
     conn: &mut AdsConnection,
     predicate: impl Fn(&DeltaDiscoveryRequest) -> bool,

@@ -345,6 +345,7 @@ async fn h2_pair(window: u32) -> (H2Stream, Peer) {
         drain_rx,
         WorkloadKey {
             src_id: crate::identity::Identity::default(),
+            source_pod_uid: None,
             dst_id: vec![crate::identity::Identity::default()],
             sandbox_id: None,
             src: "127.0.0.1".parse().unwrap(),

@@ -46,6 +46,7 @@ pub struct H2ConnectClient {
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct WorkloadKey {
     pub src_id: Identity,
+    pub source_pod_uid: Option<Strng>,
     pub dst_id: Vec<Identity>,
     /// Separate pool entries for each Sandbox label; None is its own partition.
     pub sandbox_id: Option<Strng>,
@@ -273,6 +274,7 @@ mod tests {
             drain_rx,
             WorkloadKey {
                 src_id: Identity::default(),
+                source_pod_uid: None,
                 dst_id: vec![Identity::default()],
                 sandbox_id: None,
                 src: "127.0.0.1".parse().unwrap(),

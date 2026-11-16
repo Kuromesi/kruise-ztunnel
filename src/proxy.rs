@@ -234,6 +234,10 @@ pub struct LocalWorkloadInformation {
 }
 
 impl LocalWorkloadInformation {
+    pub fn pod_uid(&self) -> Option<Strng> {
+        self.full_cert_manager.pod_uid()
+    }
+
     pub fn new(
         wi: Arc<WorkloadInfo>,
         state: DemandProxyState,

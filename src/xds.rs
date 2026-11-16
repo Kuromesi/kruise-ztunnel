@@ -83,6 +83,8 @@ impl fmt::Display for DisplayStatus<'_> {
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("workload credential: {0}")]
+    WorkloadCredential(#[source] anyhow::Error),
     #[error("gRPC error {}", DisplayStatus(.0))]
     GrpcStatus(#[from] tonic::Status),
     #[error("gRPC connection error connecting to {}: {}", .0, DisplayStatus(.1))]

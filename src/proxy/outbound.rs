@@ -175,6 +175,7 @@ impl OutboundConnection {
 
         let pool_key = WorkloadKey {
             src_id: req.source.identity(),
+            source_pod_uid: self.pi.local_workload_information.pod_uid(),
             dst_id: req.upstream_sans.clone(),
             sandbox_id: req
                 .sandbox_context
@@ -370,6 +371,7 @@ impl OutboundConnection {
         let request = self.create_hbone_request(remote_addr, req);
         let pool_key = Box::new(WorkloadKey {
             src_id: req.source.identity(),
+            source_pod_uid: self.pi.local_workload_information.pod_uid(),
             dst_id: req.upstream_sans.clone(),
             sandbox_id: req
                 .sandbox_context

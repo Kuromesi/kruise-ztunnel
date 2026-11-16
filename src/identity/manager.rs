@@ -1,4 +1,5 @@
 // Copyright Istio Authors
+// Modifications Copyright 2026 The Kruise Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -206,6 +207,23 @@ impl PartialOrd for PendingPriority {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CertificateKey {
+    identity: Identity,
+    pod_uid: Option<Strng>,
+}
+
+impl fmt::Display for CertificateKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.identity, f)
+    }
+}
+
+enum WorkerRequest {
+    Fetch(CertificateKey, Priority),
+    Forget(CertificateKey),
+}
+
 // Implements the actual logic behind SecretManager.
 struct Worker {
     client: Box<dyn CaClientTrait>,
@@ -216,7 +234,7 @@ struct Worker {
     // TODO: Change tls::Certs to use Instant instead of SystemTime.
     time_conv: crate::time::Converter,
     // Maps Identity to the certificate state.
-    certs: Mutex<HashMap<Identity, CertChannel>>,
+    certs: Mutex<HashMap<CertificateKey, CertChannel>>,
     // How many concurrent fetch_certificate calls can be pending at a time.
     concurrency: u16,
 }
@@ -224,7 +242,7 @@ struct Worker {
 impl Worker {
     fn new(
         client: Box<dyn CaClientTrait>,
-        requests: mpsc::Receiver<Request>,
+        requests: mpsc::Receiver<WorkerRequest>,
         cfg: SecretManagerConfig,
     ) -> (Arc<Self>, tokio::task::JoinHandle<()>) {
         if cfg.concurrency == 0 {
@@ -243,13 +261,13 @@ impl Worker {
         (worker, tokio::spawn(async move { w.run(requests).await }))
     }
 
-    async fn has_id(&self, id: &Identity) -> bool {
+    async fn has_id(&self, id: &CertificateKey) -> bool {
         self.certs.lock().await.contains_key(id)
     }
 
     // Manages certificate updates. Since all the work is done in a single task, the code is
     // lock-free. This is OK as the code is I/O bound so we don't need the extra parallelism.
-    async fn run(&self, mut requests: mpsc::Receiver<Request>) {
+    async fn run(&self, mut requests: mpsc::Receiver<WorkerRequest>) {
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
 
@@ -264,7 +282,7 @@ impl Worker {
         let mut fetches = FuturesUnordered::new();
         // The set of identities for which there are pending fetches. Elements of `fetches` and
         // `processing` correspond to each other.
-        let mut processing: HashMap<Identity, Fetch> = HashMap::new();
+        let mut processing: HashMap<CertificateKey, Fetch> = HashMap::new();
         // Identities for which we will need to refresh certificates in the future, ordered by the
         // priority and time at which the refresh needs to happen.
         //
@@ -273,12 +291,14 @@ impl Worker {
         // the future, for all other priorities Instant::now() is used as the scheduled time of the
         // refresh. In other words, at any point in time, there are no high-priority
         // (not Background) items scheduled to run in the future.
-        let mut pending: KeyedPriorityQueue<Identity, PendingPriority> = KeyedPriorityQueue::new();
+        let mut pending: KeyedPriorityQueue<CertificateKey, PendingPriority> =
+            KeyedPriorityQueue::new();
         // The set of pending Identity requests with backoffs (i.e. pending requests that have already failed at least once).
         // Basically, each cert fetch attempt gets its own backoff.
         // This avoids delays where a fetch of identity A for pod A needlessly stalls the refetch of
         // identity B for pod B. Kept separate from the `pending` KeyedPriorityKey for convenience.
-        let mut pending_backoffs_by_id: HashMap<Identity, ExponentialBackoff> = HashMap::new();
+        let mut pending_backoffs_by_id: HashMap<CertificateKey, ExponentialBackoff> =
+            HashMap::new();
 
         'main: loop {
             let next = pending.peek().map(|(_, PendingPriority(_, ts))| *ts);
@@ -298,7 +318,7 @@ impl Worker {
                 // call made later by the client would result in another request being delivered to
                 // the worker.
                 res = requests.recv() => match res {
-                    Some(Request::Fetch(id, pri)) => {
+                    Some(WorkerRequest::Fetch(id, pri)) => {
                         if !self.has_id(&id).await {
                             // Nobody interested in the Identity anymore, do nothing.
                             continue 'main;
@@ -316,12 +336,13 @@ impl Worker {
                             Some(Fetch::Processing) => (),
                         }
                     },
-                    Some(Request::Forget(id)) => {
+                    Some(WorkerRequest::Forget(id)) => {
                         if self.has_id(&id).await {
                             // After the forget was queued, there was another request to start
                             // managing the Identity. Do nothing.
                             continue 'main;
                         }
+                        pending_backoffs_by_id.remove(&id);
                         match processing.get(&id) {
                             None => {
                                 pending.remove(&id);
@@ -436,7 +457,7 @@ impl Worker {
                     let (id, _) = pending.pop().expect("pending should always have an element at this point");
                     processing.insert(id.to_owned(), Fetch::Processing);
                     fetches.push(async move {
-                        let res = self.client.fetch_certificate(&id).await;
+                        let res = self.client.fetch_certificate(&id.identity).await;
                         (id, res)
                     });
                 },
@@ -447,7 +468,7 @@ impl Worker {
     }
 
     // Returns whether the Identity is still managed.
-    async fn update_certs(&self, id: &Identity, certs: CertState) -> bool {
+    async fn update_certs(&self, id: &CertificateKey, certs: CertState) -> bool {
         // Both errors (lack of entry in the `certs` map and a send error) are handled the same way
         // (by returning false): either (a) there was no entry in the `certs` map due to a
         // forget_certificate call some time ago or (b) a forget_certificate call was made and
@@ -464,7 +485,7 @@ impl Worker {
     /// Returns existing valid certificate and its expiry time, or None if unavailable/expired
     async fn get_existing_cert_info(
         &self,
-        id: &Identity,
+        id: &CertificateKey,
     ) -> Option<(Arc<tls::WorkloadCertificate>, Instant)> {
         if let Some(cert_channel) = self.certs.lock().await.get(id) {
             match &*cert_channel.rx.borrow() {
@@ -537,7 +558,8 @@ pub struct SecretManager {
     // Channel to which certificate requests are sent to. The Identity for which request is being
     // sent for must have a corresponding entry in the worker's certs map (which is where the
     // result can be read from).
-    requests: mpsc::Sender<Request>,
+    requests: mpsc::Sender<WorkerRequest>,
+    pod_uid: watch::Sender<Option<Strng>>,
 }
 
 impl fmt::Debug for SecretManager {
@@ -585,12 +607,13 @@ impl SecretManager {
             Self {
                 worker,
                 requests: tx,
+                pod_uid: watch::channel(None).0,
             },
             handle,
         )
     }
 
-    async fn post(&self, req: Request) {
+    async fn post(&self, req: WorkerRequest) {
         if let Err(e) = self.requests.send(req).await {
             unreachable!("SecretManager worker died: {e}");
         }
@@ -602,7 +625,11 @@ impl SecretManager {
         pri: Priority,
     ) -> Result<watch::Receiver<CertState>, Error> {
         let mut certs = self.worker.certs.lock().await;
-        match certs.get(id) {
+        let key = CertificateKey {
+            identity: id.clone(),
+            pod_uid: self.pod_uid(),
+        };
+        match certs.get(&key) {
             // Identity found in cache and is already being refreshed. Bump the priority if needed.
             Some(st) => {
                 let rx = st.rx.clone();
@@ -611,17 +638,17 @@ impl SecretManager {
                 if let Some(existing_pri) = init_pri(&rx)
                     && pri > existing_pri
                 {
-                    self.post(Request::Fetch(id.clone(), pri)).await;
+                    self.post(WorkerRequest::Fetch(key, pri)).await;
                 }
                 Ok(rx)
             }
             // New identity, start managing it and return the newly created channel.
             None => {
                 let (tx, rx) = watch::channel(CertState::Initializing(pri));
-                certs.insert(id.to_owned(), CertChannel { rx: rx.clone(), tx });
+                certs.insert(key.clone(), CertChannel { rx: rx.clone(), tx });
                 drop(certs);
                 // Notify the background worker to start refreshing the certificate.
-                self.post(Request::Fetch(id.to_owned(), pri)).await;
+                self.post(WorkerRequest::Fetch(key, pri)).await;
                 Ok(rx)
             }
         }
@@ -670,11 +697,35 @@ impl SecretManager {
         self.fetch_certificate_pri(id, Priority::RealTime).await
     }
 
+    pub fn pod_uid(&self) -> Option<Strng> {
+        self.pod_uid.borrow().clone()
+    }
+
+    /// A restored Pod must not reuse certificates or in-flight signing results from its predecessor.
+    pub(crate) async fn set_pod_uid(&self, pod_uid: Option<Strng>) {
+        let mut certs = self.worker.certs.lock().await;
+        if *self.pod_uid.borrow() == pod_uid {
+            return;
+        }
+        let previous: Vec<_> = certs.keys().cloned().collect();
+        certs.clear();
+        self.pod_uid.send_replace(pod_uid);
+        drop(certs);
+        for key in previous {
+            self.post(WorkerRequest::Forget(key)).await;
+        }
+    }
+
     pub async fn forget_certificate(&self, id: &Identity) {
-        // TODO: consider keeping the cert around for a minute or so to avoid churn
-        // We would ideally drop any pending or new requests to rotate.
-        if self.worker.certs.lock().await.remove(id).is_some() {
-            self.post(Request::Forget(id.clone())).await;
+        let mut certs = self.worker.certs.lock().await;
+        let key = CertificateKey {
+            identity: id.clone(),
+            pod_uid: self.pod_uid(),
+        };
+        let removed = certs.remove(&key).is_some();
+        drop(certs);
+        if removed {
+            self.post(WorkerRequest::Forget(key)).await;
         }
     }
 
@@ -683,7 +734,7 @@ impl SecretManager {
     pub async fn collect_certs<R>(&self, f: impl Fn(&Identity, &CertState) -> R) -> Vec<R> {
         let mut ret = Vec::new();
         for (id, chan) in self.worker.certs.lock().await.iter() {
-            ret.push(f(id, &chan.rx.borrow()));
+            ret.push(f(&id.identity, &chan.rx.borrow()));
         }
         ret
     }
@@ -754,6 +805,75 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use std::time;
+
+    #[tokio::test]
+    async fn pod_replacement_reissues_certificates_but_same_pod_renewal_reuses_them() {
+        let manager = super::mock::new_secret_manager(std::time::Duration::from_secs(3600));
+        let identity = super::Identity::default();
+        manager.set_pod_uid(Some("pod-a".into())).await;
+        let first = manager.fetch_certificate(&identity).await.unwrap();
+        manager.set_pod_uid(Some("pod-a".into())).await;
+        let renewed_token = manager.fetch_certificate(&identity).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &renewed_token));
+        manager.set_pod_uid(Some("pod-b".into())).await;
+        let replacement = manager.fetch_certificate(&identity).await.unwrap();
+        assert_ne!(first.cert.serial(), replacement.cert.serial());
+        assert_eq!(manager.cache_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn pod_replacement_does_not_reuse_an_inflight_certificate_request() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        struct BlockFirst {
+            client: MockCaClient,
+            calls: AtomicUsize,
+            started: Notify,
+            release: Notify,
+        }
+        #[async_trait]
+        impl CaClientTrait for Arc<BlockFirst> {
+            async fn fetch_certificate(
+                &self,
+                id: &Identity,
+            ) -> Result<tls::WorkloadCertificate, Error> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                CaClientTrait::fetch_certificate(&self.client, id).await
+            }
+        }
+        let client = Arc::new(BlockFirst {
+            client: MockCaClient::new(Default::default()),
+            calls: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let manager = SecretManager::new_with_client(client.clone());
+        let id = Identity::default();
+        manager.set_pod_uid(Some("pod-a".into())).await;
+        let previous = manager.start_fetch(&id, Priority::RealTime).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), client.started.notified())
+            .await
+            .unwrap();
+        manager.set_pod_uid(Some("pod-b".into())).await;
+        let current = tokio::time::timeout(Duration::from_secs(5), manager.fetch_certificate(&id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        client.release.notify_one();
+        assert!(matches!(
+            manager.wait(previous).await,
+            Err(Error::Forgotten)
+        ));
+        let cached = manager.fetch_certificate(&id).await.unwrap();
+        assert!(Arc::ptr_eq(&current, &cached));
+        assert_eq!(manager.cache_len().await, 1);
+    }
 
     use matches::assert_matches;
 
@@ -1161,7 +1281,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_get_existing_cert_info_basic() {
         let test = setup(1);
-        let id = identity("basic-test");
+        let id = CertificateKey {
+            identity: identity("basic-test"),
+            pod_uid: None,
+        };
         let info = test.secret_manager.worker.get_existing_cert_info(&id).await;
         assert!(info.is_none());
 

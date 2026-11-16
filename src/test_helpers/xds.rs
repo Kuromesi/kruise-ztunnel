@@ -51,6 +51,7 @@ pub struct AdsServer {
 }
 
 pub struct AdsConnection {
+    pub metadata: tonic::metadata::MetadataMap,
     pub tx: mpsc::Sender<Result<DeltaDiscoveryResponse, tonic::Status>>,
     pub rx: mpsc::Receiver<DeltaDiscoveryRequest>,
 }
@@ -154,6 +155,7 @@ impl AggregatedDiscoveryService for AdsServer {
         &self,
         request: tonic::Request<tonic::Streaming<DeltaDiscoveryRequest>>,
     ) -> Result<tonic::Response<Self::DeltaAggregatedResourcesStream>, tonic::Status> {
+        let metadata = request.metadata().clone();
         let mut in_stream = request.into_inner();
         let (resp_tx, mut resp_rx) = mpsc::channel(128);
         let (req_tx, req_rx) = mpsc::channel(128);
@@ -161,6 +163,7 @@ impl AggregatedDiscoveryService for AdsServer {
         let (tx, rx) = mpsc::channel(128);
 
         let conn = AdsConnection {
+            metadata,
             rx: req_rx,
             tx: resp_tx,
         };
